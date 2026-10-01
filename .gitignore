@@ -1,0 +1,24 @@
+# 构建产物
+.gradle/
+build/
+**/build/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 本机配置与密钥 —— 绝不提交
+local.properties
+*.jks
+*.keystore
+*.p12
+
+# 安装包：仅通过 GitHub Releases 分发，不进源码树
+*.apk
+*.ap_
+*.aab
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+*.log

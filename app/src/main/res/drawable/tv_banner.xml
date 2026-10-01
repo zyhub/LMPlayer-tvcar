@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+    <!-- 深邃客厅毛玻璃底色 -->
+    <path
+        android:fillColor="#121318"
+        android:pathData="M0,0h320v180h-320z" />
+    <!-- 苹果红光晕装饰 -->
+    <path
+        android:fillColor="#26FA243C"
+        android:pathData="M0,0h160v180h-160z" />
+    <!-- 居中黑胶圆盘与音符标志 -->
+    <path
+        android:fillColor="#FA243C"
+        android:pathData="M160,90m-36,0a36,36 0,1 1,72 0a36,36 0,1 1,-72 0" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M152,74v22.5c-1.8,-1.1 -4,-1.5 -6.2,-0.8 -3.3,1 -5.6,4.2 -5.2,7.7 0.4,3.8 3.8,6.6 7.6,6.6 4.1,0 7.3,-3.3 7.3,-7.4V83h14v-9h-17.5z" />
+</vector>

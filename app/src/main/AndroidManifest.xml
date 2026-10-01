@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Android TV Leanback 与非触屏设备兼容声明 (同时支持电视盒子、智能电视与横屏平板) -->
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+
+    <!-- 基础网络权限 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- 前台服务权限与多版本适配 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+
+    <!-- 开机自启动 (默认关闭，需用户在设置里显式开启后才生效) -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- 存储权限适配 (API 23~32，支持电视外接 U 盘与移动硬盘扫描) -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28"
+        tools:ignore="ScopedStorage" />
+
+    <application
+        android:name=".LMApplication"
+        android:allowBackup="true"
+        android:banner="@drawable/tv_banner"
+        android:hardwareAccelerated="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.LMPlayer"
+        android:usesCleartextTraffic="true"
+        android:enableOnBackInvokedCallback="true"
+        tools:targetApi="34">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:screenOrientation="sensorLandscape"
+            android:windowSoftInputMode="adjustPan"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|fontScale|locale|density|smallestScreenSize|layoutDirection">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Media3 后台播放服务
+             stopWithTask="false"：任务栈被移除 (回到电视桌面/进入屏保) 时不销毁服务。
+             这是"电视出屏保就暂停播放"修复的关键开关之一，必须与 PlaybackService.onTaskRemoved
+             的重写配套 —— 二者缺一，播放仍会被拆掉。 -->
+        <service
+            android:name=".core.media.PlaybackService"
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback"
+            android:stopWithTask="false"
+            tools:ignore="ExportedService">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService" />
+                <action android:name="androidx.media3.session.MediaLibraryService" />
+                <action android:name="android.media.browse.MediaBrowserService" />
+            </intent-filter>
+        </service>
+
+        <!-- 开机自启动接收器：默认关闭，用户在「设置 → 播放与启动行为」开启后才实际拉起。
+             directBootAware=true 是为了能收到 Android 7+ 的 LOCKED_BOOT_COMPLETED，
+             配合设备保护存储读取开关 (否则开机早期读回默认 false，开关形同虚设)。 -->
+        <receiver
+            android:name=".core.media.BootCompletedReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:directBootAware="true"
+            tools:ignore="ExportedReceiver">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 移除 AndroidX ProfileInstaller 注入的受系统 DUMP 权限保护的导出广播接收器，防止电视安全中心误报系统级组件风险 -->
+        <receiver
+            android:name="androidx.profileinstaller.ProfileInstallReceiver"
+            android:exported="false"
+            tools:node="remove" />
+
+        <!-- 不再移除 androidx.profileinstaller.ProfileInstallerInitializer：
+             APK 里一直带着 assets/dexopt/baseline.prof，但只有这个 Initializer 会在启动时
+             把它写进 ART。删掉它等于让 baseline profile 全程不生效，冷启动首会话只能解释/JIT 执行。
+             安全中心误报的是上面那个导出且受 DUMP 权限保护的广播，已单独移除，不受此改动影响。 -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge" />
+
+    </application>
+
+</manifest>
