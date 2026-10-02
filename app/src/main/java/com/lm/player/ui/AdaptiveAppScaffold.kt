@@ -6,6 +6,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
@@ -30,6 +31,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -40,8 +42,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.lm.player.R
 import com.lm.player.core.designsystem.component.AlbumArtworkImage
+import com.lm.player.core.designsystem.component.LocalPlatformMode
 import com.lm.player.core.designsystem.component.ServerSwitchDropdownButton
 import com.lm.player.core.designsystem.component.tvFocusable
+import com.lm.player.core.model.PlatformMode
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
 import com.lm.player.core.designsystem.theme.SpecBadgeBitrateColor
@@ -180,14 +184,17 @@ fun AdaptiveAppScaffold(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            // 左上角：程序原生图标 +「柠檬音乐」标题 +「TV车机版」标识
+            // 左上角：程序原生图标 +「柠檬音乐」标题 + 平台版本标识。
+            // 标识随「设置 → 使用平台模式」切换：车机模式显示「车机版」，电视模式显示「TV版」。
+            // 读的是 LocalPlatformMode，切模式后立即重组，无需重启。
+            val isCarPlatformMode = LocalPlatformMode.current == PlatformMode.CAR
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Image(
                     painter = painterResource(id = R.drawable.app_logo),
-                    contentDescription = "柠檬音乐 TV车机版",
+                    contentDescription = if (isCarPlatformMode) "柠檬音乐 车机版" else "柠檬音乐 TV版",
                     modifier = Modifier
                         .size(38.dp)
                         .clip(RoundedCornerShape(10.dp))
@@ -204,7 +211,7 @@ fun AdaptiveAppScaffold(
                     border = BorderStroke(0.8.dp, AppleRed.copy(alpha = 0.40f))
                 ) {
                     Text(
-                        text = "TV车机版",
+                        text = if (isCarPlatformMode) "车机版" else "TV版",
                         fontSize = dimensions.badgeSize,
                         fontWeight = FontWeight.Bold,
                         color = AppleRed,
@@ -307,13 +314,35 @@ private fun KuwoTopTabButton(
         MaterialTheme.colorScheme.onBackground.copy(alpha = 0.72f)
     }
 
+    // 触屏点按与「焦点即切换」会各触发一次 onClick —— 手指点一下顶部导航会切换两次
+    // （重复入栈、重复触发同步）。用指针按压标记区分来源：手指按下 → 本次焦点变化不执行切换，
+    // 交给点击本身处理；遥控器方向键不产生按压事件 → 焦点变化照常切换。
+    // 抬手即复位，避免标记残留把下一次遥控器切换误吞。
+    var switchSuppressedByTouch by remember { mutableStateOf(false) }
+
     Surface(
         shape = RoundedCornerShape(16.dp),
         color = if (isSelected) Color.White.copy(alpha = 0.08f) else Color.Transparent,
         modifier = modifier
+            // 用 Initial 阶段：父节点先于内部 focusable 的求焦处理收到事件，标记一定先置位
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                        switchSuppressedByTouch = true
+                        // 持续到本次手势抬手为止：手指移出组件后指针仍由本节点持有，一定能收到 UP
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            if (event.changes.none { it.pressed }) break
+                        }
+                        switchSuppressedByTouch = false
+                    }
+                }
+            }
             .onFocusChanged { focusState ->
                 if (focusState.isFocused && !isSelected) {
-                    onClick()
+                    // 手指按压引起的焦点变化不执行切换，交给点击自身触发，避免一次点击切换两次
+                    if (!switchSuppressedByTouch) onClick()
                 }
             }
             .tvFocusable(

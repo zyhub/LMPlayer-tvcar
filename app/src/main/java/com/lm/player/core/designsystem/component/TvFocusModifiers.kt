@@ -49,6 +49,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.zIndex
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
+import com.lm.player.core.model.PlatformMode
 import com.lm.player.core.model.UnifiedSong
 
 /**
@@ -56,6 +57,15 @@ import com.lm.player.core.model.UnifiedSong
  * 将底层 AdaptiveAppScaffold 的此开关设为 false，彻底阻断底层隐藏页面抢夺 2D 方向键焦点导致光标消失。
  */
 val LocalTvBackgroundFocusEnabled = compositionLocalOf { true }
+
+/**
+ * 当前运行平台模式（电视 / 车机）。
+ *
+ * 仅供 [tvFocusable] / [tvButtonFocusable] 判定是否启用遥控器焦点体系使用；
+ * 车机模式下这两个修饰符只关闭**焦点**相关行为（光环绘制、弹簧缩放、canFocus、方向键进入），
+ * **不关闭触控** —— pointerInput 的 onTap / onLongPress 一律照常工作。
+ */
+val LocalPlatformMode = compositionLocalOf { PlatformMode.TV }
 
 /**
  * 安卓 TV 遥控器（D-Pad）专属高对比度双层焦点光环与按键交互修饰符
@@ -82,6 +92,9 @@ fun Modifier.tvFocusable(
 ): Modifier = composed {
     val backgroundFocusEnabled = LocalTvBackgroundFocusEnabled.current
     val effectiveEnabled = enabled && backgroundFocusEnabled
+    // 车机模式：只关「焦点」，不关「触控」。焦点相关行为一律改用 focusEnabled；
+    // 末尾 pointerInput(effectiveEnabled) 的 onTap / onLongPress 继续沿用 effectiveEnabled，保持触控可用。
+    val focusEnabled = effectiveEnabled && LocalPlatformMode.current != PlatformMode.CAR
 
     var isFocused by remember { mutableStateOf(false) }
     val currentOnClick by rememberUpdatedState(onClick)
@@ -97,7 +110,7 @@ fun Modifier.tvFocusable(
     // 放进 graphicsLayer 的 lambda 后，读取发生在布局/绘制阶段，失效范围收敛到这一个图层，
     // 动画期间不再触发任何重组 (与工程内 VinylRotation 已采用的写法一致)。
     val scale = animateFloatAsState(
-        targetValue = if (isFocused && effectiveEnabled) focusedScale else 1f,
+        targetValue = if (isFocused && focusEnabled) focusedScale else 1f,
         animationSpec = spring(
             dampingRatio = Spring.DampingRatioNoBouncy,
             stiffness = Spring.StiffnessMediumLow
@@ -107,16 +120,16 @@ fun Modifier.tvFocusable(
 
     this
         .focusProperties {
-            canFocus = effectiveEnabled
+            canFocus = focusEnabled
         }
-        .zIndex(if (isFocused && effectiveEnabled) 2f else 0f)
+        .zIndex(if (isFocused && focusEnabled) 2f else 0f)
         .graphicsLayer {
             val s = scale.value
             scaleX = s
             scaleY = s
         }
         .onFocusChanged { state ->
-            val focused = (state.isFocused || state.hasFocus) && effectiveEnabled
+            val focused = (state.isFocused || state.hasFocus) && focusEnabled
             if (isFocused != focused) {
                 isFocused = focused
                 if (!focused) {
@@ -206,7 +219,7 @@ fun Modifier.tvFocusable(
         }
         .drawWithContent {
             drawContent()
-            if (isFocused && effectiveEnabled) {
+            if (isFocused && focusEnabled) {
                 val outline = shape.createOutline(size, layoutDirection, this)
                 if (focusedBackgroundAlpha > 0f) {
                     drawOutline(
@@ -230,7 +243,7 @@ fun Modifier.tvFocusable(
             }
         }
         .clip(shape)
-        .focusable(enabled = effectiveEnabled)
+        .focusable(enabled = focusEnabled)
         .pointerInput(effectiveEnabled) {
             detectTapGestures(
                 onLongPress = {
@@ -266,10 +279,12 @@ fun Modifier.tvButtonFocusable(
     onFocusChange: (Boolean) -> Unit = {}
 ): Modifier = composed {
     val backgroundFocusEnabled = LocalTvBackgroundFocusEnabled.current
+    // 车机模式：本修饰符只负责焦点视觉强化，车机下整条链一并失效（按钮自身的 clickable 触控不受影响）。
+    val focusEnabled = backgroundFocusEnabled && LocalPlatformMode.current != PlatformMode.CAR
     var isFocused by remember { mutableStateOf(false) }
     // 同 tvFocusable：动画值放进 graphicsLayer 读取，避免聚焦弹簧动画期间每帧重组调用方
     val scale = animateFloatAsState(
-        targetValue = if (isFocused && backgroundFocusEnabled) focusedScale else 1f,
+        targetValue = if (isFocused && focusEnabled) focusedScale else 1f,
         animationSpec = spring(
             dampingRatio = Spring.DampingRatioNoBouncy,
             stiffness = Spring.StiffnessMediumLow
@@ -278,15 +293,15 @@ fun Modifier.tvButtonFocusable(
     )
 
     this
-        .focusProperties { canFocus = backgroundFocusEnabled }
-        .zIndex(if (isFocused && backgroundFocusEnabled) 2f else 0f)
+        .focusProperties { canFocus = focusEnabled }
+        .zIndex(if (isFocused && focusEnabled) 2f else 0f)
         .graphicsLayer {
             val s = scale.value
             scaleX = s
             scaleY = s
         }
         .onFocusChanged { state ->
-            val focused = (state.isFocused || state.hasFocus) && backgroundFocusEnabled
+            val focused = (state.isFocused || state.hasFocus) && focusEnabled
             if (isFocused != focused) {
                 isFocused = focused
                 onFocusChange(focused)
@@ -294,7 +309,7 @@ fun Modifier.tvButtonFocusable(
         }
         .drawWithContent {
             drawContent()
-            if (isFocused && backgroundFocusEnabled) {
+            if (isFocused && focusEnabled) {
                 val outline = shape.createOutline(size, layoutDirection, this)
                 drawOutline(
                     outline = outline,

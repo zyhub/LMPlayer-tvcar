@@ -1,11 +1,16 @@
 package com.lm.player.core.media
 
+import android.Manifest
 import android.content.ContentUris
 import android.content.Context
+import android.content.pm.PackageManager
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.lm.player.core.database.ZdsDatabase
 import com.lm.player.core.database.entity.DownloadEntity
 import com.lm.player.core.database.entity.SongEntity
@@ -1010,21 +1015,64 @@ object LocalMediaScanner {
     }
 
     /**
+     * 存储可读性判定：**外置存储已挂载 且 音频读取权限已授予**。
+     *
+     * 两个条件缺一不可，因为 [java.io.File.exists] 在下面两种情况都会对
+     * U 盘 / SD 卡 / 外置音乐目录下的**所有**路径返回 `false`：
+     * 1. 外置存储未挂载（车机上最常见的场景 —— U 盘拔了、SD 卡接触不良）；
+     * 2. Android 13+ 未授予 `READ_MEDIA_AUDIO` / Android 12- 未授予 `READ_EXTERNAL_STORAGE`。
+     *
+     * 用它给「物理文件是否丢失」的校验加闸，避免把整库曲目误判成"文件已删除"批量清掉。
+     */
+    fun isLocalStorageReadable(context: Context): Boolean = try {
+        val state = Environment.getExternalStorageState()
+        val mounted = state == Environment.MEDIA_MOUNTED ||
+            state == Environment.MEDIA_MOUNTED_READ_ONLY
+        val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) ==
+                PackageManager.PERMISSION_GRANTED
+        }
+        mounted && granted
+    } catch (_: Exception) {
+        false
+    }
+
+    /**
      * 清理资料库中的遗留/无效数据
      * 1. 清理本地物理文件已丢失的纯本地歌曲记录；
      * 2. 清除失效服务器残留的未下载歌曲；
      * 3. 清理残留的发现/推荐临时歌单；
      * 4. 校验下载物理文件是否存在。
+     *
+     * @param context 传入后才会执行第 1、4 项的物理文件校验；为 null 或存储不可读时
+     *                只做服务端侧的孤立记录清理，**绝不**因为"读不到文件"而删任何曲目。
      */
-    suspend fun purgeLegacyResidualData(database: ZdsDatabase, validServerIds: List<String> = emptyList()): Int = withContext(Dispatchers.IO) {
+    suspend fun purgeLegacyResidualData(
+        database: ZdsDatabase,
+        validServerIds: List<String> = emptyList(),
+        context: Context? = null
+    ): Int = withContext(Dispatchers.IO) {
         var purgedCount = 0
         try {
             // 清除残留的发现推荐歌单
             database.playlistDao().clearDiscoverPlaylists()
 
-            // 清除不存在服务器的未下载孤立歌曲
+            // 清除不存在服务器的未下载歌曲
             if (validServerIds.isNotEmpty()) {
                 database.songDao().deleteOrphanSongs(validServerIds)
+            }
+
+            // 校验物理文件前先确认存储真的可读，否则"文件不存在"这一判断本身就是假的
+            val canVerifyFiles = context != null && isLocalStorageReadable(context)
+            if (!canVerifyFiles) {
+                Log.w(
+                    TAG,
+                    "跳过物理文件校验：存储未挂载或未授予音频读取权限（避免把 U 盘/外置目录曲目误删）"
+                )
+                return@withContext purgedCount
             }
 
             // 校验本地歌曲的实际物理文件是否存在

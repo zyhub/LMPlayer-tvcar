@@ -31,6 +31,16 @@
         android:maxSdkVersion="28"
         tools:ignore="ScopedStorage" />
 
+    <!--
+        Android 13 (API 33) 起 READ_EXTERNAL_STORAGE 对媒体文件**完全失效**，
+        改用按类型划分的 READ_MEDIA_AUDIO。缺这条会导致新系统车机 / 电视上
+        「一键全盘扫描」与 U 盘扫描全部返回 0 首 —— 装了却扫不到本地音乐。
+    -->
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+
+    <!-- Android 13+ 前台播放服务的媒体通知需要该权限才会显示，缺它会静默不出通知 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:name=".LMApplication"
         android:allowBackup="true"

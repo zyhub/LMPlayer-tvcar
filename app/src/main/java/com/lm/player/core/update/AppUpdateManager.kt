@@ -26,8 +26,8 @@ data class UpdateInfo(
 object AppUpdateManager {
 
     private const val TAG = "AppUpdateManager"
-    const val CURRENT_VERSION_NAME = "1.10.3"
-    const val CURRENT_VERSION_CODE = 50
+    const val CURRENT_VERSION_NAME = "1.10.6"
+    const val CURRENT_VERSION_CODE = 53
     const val AUTHOR_NAME = "Zhou"
     const val AUTHOR_EMAIL = "1390999045@qq.com"
     const val APP_DESCRIPTION = "本软件为 TV车机版，专为智能电视、机顶盒与车载中控横屏大屏量身打造的高保真无损音乐播放器。专属接入柠檬音乐服务端，支持5大音源全网融合搜索与无损畅听、全盘本地音频深度扫描、智能歌词联动以及电视遥控器与车机触控双栖深度适配。"
@@ -196,10 +196,13 @@ object AppUpdateManager {
                     latestVersion = currentVersionName,
                     latestVersionCode = currentVersionCode.toInt(),
                     releaseNotes = "当前已是最新 TV车机版 (v$currentVersionName)。\n\n" +
-                        "• 修复服务器曲库歌曲选低音质仍下到无损源文件的问题，下载严格按所选音质取流\n" +
-                        "• 曲库默认按「加入时间」排序：在线取服务器添加时间，本地取下载完成时间\n" +
-                        "• 批量下载与单首下载统一同一套音质决策，已在服务器/本地的歌曲不再重复下载\n" +
-                        "• 「最近播放」按真实播放时间排序，暂停续播不再打乱顺序",
+                        "• 修复方向盘/遥控器按一次切歌连跳 2~3 首：DOWN 与 UP 成对消费，不再漏给媒体会话重复执行\n" +
+                        "• 修复方向盘「按了没反应」：防抖改为按键级计时，切歌后立刻按上一首/调音量不再被吞掉\n" +
+                        "• 按住切歌键不再连跳；按住音量键仍可连续调节\n" +
+                        "• 车机模式下不再把频道/翻页键当作切歌键，避免旋钮、模式键引发\"莫名跳歌\"\n" +
+                        "• 修复方向盘连按切歌时的掉帧：播放进度落盘不再阻塞 UI 线程\n" +
+                        "• 启用音频焦点：导航播报、倒车雷达、来电时自动暂停或压低，拔耳机/断蓝牙自动暂停\n" +
+                        "• 熄火/关机时同步落盘播放进度，下次上车继续听",
                     downloadUrl = ""
                 )
             )

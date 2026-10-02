@@ -249,9 +249,14 @@ object Media3Factory {
             .setRenderersFactory(renderersFactory)
             .setLoadControl(loadControl)
             .setMediaSourceFactory(DefaultMediaSourceFactory(appContext).setDataSourceFactory(dataSourceFactory))
-            .setAudioAttributes(audioAttributes, false)
+            // handleAudioFocus = true：**车机上必须参与音频焦点仲裁**。
+            // 此前为 false，导致导航播报 / 倒车雷达 / 来电时音乐既不暂停也不压低音量，
+            // 与车机自带的其它音源直接叠着放（车机场景下这是最容易被投诉的一条）。
+            // 打开后由 ExoPlayer 内部 AudioFocusManager 处理 LOSS / LOSS_TRANSIENT / DUCK。
+            .setAudioAttributes(audioAttributes, true)
             .setWakeMode(C.WAKE_MODE_NETWORK) // 同时持有 CPU WakeLock 与 WifiLock，防止休眠断流
-            .setHandleAudioBecomingNoisy(false)
+            // 拔耳机 / 断开车机蓝牙时自动暂停（否则声音切到外放，车内体验很差）
+            .setHandleAudioBecomingNoisy(true)
             .build()
             .apply {
                 volume = 1.0f

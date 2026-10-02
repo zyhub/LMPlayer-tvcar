@@ -196,7 +196,11 @@ class PlaybackService : MediaSessionService() {
             )
 
             val sessionCallback = object : MediaSession.Callback {
-                private var lastKeyTimestamp = 0L
+                /** 按键级防抖时间戳：全局单时间戳会把 250ms 内的第二颗不同按键静默吞掉。 */
+                private val lastKeyTimestampByCode = HashMap<Int, Long>()
+
+                /** 已在 ACTION_DOWN 上执行过动作、正在等待配对 UP 的按键码（集合以容忍交叠按键）。 */
+                private val pendingDownKeyCodes = HashSet<Int>()
 
                 override fun onConnect(
                     session: MediaSession,
@@ -275,11 +279,25 @@ class PlaybackService : MediaSessionService() {
 
                     if (keyEvent != null) {
                         val now = System.currentTimeMillis()
-                        if (now - lastKeyTimestamp < 250) {
-                            return true
-                        }
-                        if (keyEvent.action == KeyEvent.ACTION_DOWN || (keyEvent.action == KeyEvent.ACTION_UP && keyEvent.repeatCount == 0)) {
-                            lastKeyTimestamp = now
+                        val isDown = keyEvent.action == KeyEvent.ACTION_DOWN
+                        val isUp = keyEvent.action == KeyEvent.ACTION_UP && keyEvent.repeatCount == 0
+                        if (isDown || isUp) {
+                            // 一次按下只执行一次动作：
+                            // ① 该键的 DOWN 已经执行过 → 配对的 UP 直接吞掉不再执行，
+                            //    否则一次按下会切两首歌（与 Activity 侧的 UP 泄漏叠加时实测连跳 3 首）；
+                            // ② 仅当**从未收到该键的 DOWN** 时才在 UP 上执行，
+                            //    兼容个别只上报 ACTION_UP 的车机 / 蓝牙设备。
+                            if (isUp && pendingDownKeyCodes.remove(keyEvent.keyCode)) {
+                                return true
+                            }
+                            // 长按重复：媒体键压掉，音量键不在本分支内。仍需 return true 消费，
+                            // 否则会被后续逻辑当作首次按下而执行。
+                            if (keyEvent.repeatCount > 0) return true
+                            if (now - (lastKeyTimestampByCode[keyEvent.keyCode] ?: 0L) < 250) {
+                                return true
+                            }
+                            lastKeyTimestampByCode[keyEvent.keyCode] = now
+                            if (isDown) pendingDownKeyCodes.add(keyEvent.keyCode)
                             Log.i(TAG, "Received MediaButton KeyEvent: ${keyEvent.keyCode}, action: ${keyEvent.action}")
                             when (keyEvent.keyCode) {
                                 KeyEvent.KEYCODE_MEDIA_NEXT,
@@ -578,7 +596,7 @@ class PlaybackService : MediaSessionService() {
     /**
      * 动态注册熄屏/亮屏广播。
      *
-     * `ACTION_SCREEN_OFF` / `ACTION_SCREEN_ON` **不能**在 manifest 中静态注册，
+     * `ACTION_SCREEN_OFF` / `ACTION_SCREEN_ON` / `ACTION_SHUTDOWN` **不能**在 manifest 中静态注册，
      * 必须由活着的组件动态注册才收得到。这里收到熄屏时只做两件事：确保前台状态在位、
      * 确保唤醒锁在位。**绝不主动起播** —— 用户没按播放键时不该因为熄屏而开始出声。
      */
@@ -604,12 +622,31 @@ class PlaybackService : MediaSessionService() {
                             Log.i(TAG, "屏幕点亮, isPlaying=${exoPlayer?.isPlaying}")
                             updateForegroundNotification(exoPlayer?.isPlaying == true)
                         }
+
+                        Intent.ACTION_SHUTDOWN -> {
+                            // 车机熄火 / 中控断电走的是系统有序关机流程，会广播 ACTION_SHUTDOWN，
+                            // 但通常只留几秒就直接断电。onPause/onStop 依赖 Activity 走完生命周期，
+                            // 熄火瞬间经常来不及执行 → 最后几秒进度丢失。
+                            //
+                            // 这里必须**同步**落盘：savePlaybackState(commitSync = true) 是普通函数、
+                            // 内部直接 prefs.edit().commit()，不经过协程调度，onReceive 返回前就已写完。
+                            // 广播线程上做一次小文件 commit 在关机路径上是可以接受的代价。
+                            val player = exoPlayer
+                            val pos = player?.currentPosition?.takeIf { it > 0L }
+                            Log.i(TAG, "系统关机/熄火, 同步落盘播放进度 positionMs=$pos")
+                            PlaybackQueueManager.savePlaybackState(
+                                applicationContext,
+                                positionMs = pos,
+                                commitSync = true
+                            )
+                        }
                     }
                 }
             }
             val filter = IntentFilter().apply {
                 addAction(Intent.ACTION_SCREEN_OFF)
                 addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SHUTDOWN)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)

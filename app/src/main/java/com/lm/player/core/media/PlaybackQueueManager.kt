@@ -3,6 +3,7 @@ package com.lm.player.core.media
 import android.content.Context
 import android.content.SharedPreferences
 import android.media.MediaCodec
+import android.os.Looper
 import android.util.Log
 import android.widget.Toast
 import androidx.annotation.OptIn
@@ -413,6 +414,24 @@ object PlaybackQueueManager {
     ) {
         val ctx = context ?: appContext ?: return
         val target = song ?: _currentSongFlow.value ?: return
+
+        // ⚠️ 方向盘 / 遥控器切歌是**主线程调用链**：
+        // Activity.dispatchKeyEvent → handleMediaKeyEvent → playNext → playSong → 这里。
+        // 而 playSong 传的是 commitSync = true，等于每按一次切歌键就在 UI 线程上同步 commit
+        // 一份最多 120 首的队列 JSON（序列化 + 写盘 + fsync，车机 eMMC 上可达几十毫秒）。
+        // 连按切歌即出现明显掉帧，曲库大时甚至 ANR —— 这与 persistPlaybackStateSync 刻意把
+        // commit 挪出主线程、以及本文件 ioExecutor 的既有约定是同一个理由，此处属于漏网。
+        //
+        // 处理：主线程上请求同步提交时改投串行 IO 线程执行。语义仍是 commit()（不丢写），
+        // 只是不再阻塞 UI；随后到来的方向盘连按也就不会互相排队等待磁盘。
+        if (commitSync && Looper.myLooper() == Looper.getMainLooper()) {
+            ioExecutor.execute { writePlaybackState(ctx, target, positionMs, true) }
+        } else {
+            writePlaybackState(ctx, target, positionMs, commitSync)
+        }
+    }
+
+    private fun writePlaybackState(ctx: Context, target: UnifiedSong, positionMs: Long?, commitSync: Boolean) {
         try {
             val prefs = ctx.getSharedPreferences(AUTO_PLAY_PREFS, Context.MODE_PRIVATE)
             val editor = prefs.edit()

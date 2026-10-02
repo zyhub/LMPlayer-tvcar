@@ -45,6 +45,7 @@ import com.lm.player.core.database.entity.ServerEntity
 import com.lm.player.core.database.entity.SongEntity
 import com.lm.player.core.designsystem.theme.AppThemeMode
 import com.lm.player.core.designsystem.component.CrashReportDialog
+import com.lm.player.core.designsystem.component.LocalPlatformMode
 import com.lm.player.core.designsystem.component.LocalTvBackgroundFocusEnabled
 import com.lm.player.core.designsystem.component.isSongOnLemonServer
 import com.lm.player.core.designsystem.theme.DefaultUiScalePercent
@@ -78,6 +79,7 @@ import com.lm.player.feature.search.LibrarySearchDialog
 import com.lm.player.feature.settings.AppUpdateDialog
 import com.lm.player.feature.settings.SettingsScreen
 import com.lm.player.ui.AdaptiveAppScaffold
+import com.lm.player.ui.PlatformModeWizard
 import com.lm.player.ui.SplashScreenView
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -222,6 +224,15 @@ class MainActivity : ComponentActivity() {
                 mutableStateOf(try { AppThemeMode.valueOf(savedThemeName) } catch (_: Exception) { AppThemeMode.FOLLOW_SYSTEM })
             }
             var enableBottomBarAnimation by remember { mutableStateOf(uiPrefs.getBoolean("enable_bottom_bar_anim", true)) }
+
+            // 运行平台模式：首次启动由不可跳过的向导强制选择，之后可在设置中切换。
+            // null = 尚未选择 → 弹出向导；向导期间按 TV 模式渲染（见 effectivePlatformMode），
+            // 保证没有触屏的设备也能用遥控器方向键完成选择。
+            var platformMode by remember {
+                mutableStateOf(PlatformMode.fromKey(uiPrefs.getString(PLATFORM_MODE_PREF_KEY, null)))
+            }
+            val effectivePlatformMode = platformMode ?: PlatformMode.TV
+            val isCarPlatform = effectivePlatformMode == PlatformMode.CAR
 
             // 启动自动播放与在线容灾配置
             val autoPlayPrefs = remember { getSharedPreferences("zds_auto_play_prefs", Context.MODE_PRIVATE) }
@@ -828,7 +839,7 @@ class MainActivity : ComponentActivity() {
                 withContext(Dispatchers.IO) {
                     try {
                         val validServers = database.serverDao().getAllServers().map { it.id }.toList()
-                        val purged = LocalMediaScanner.purgeLegacyResidualData(database, validServers)
+                        val purged = LocalMediaScanner.purgeLegacyResidualData(database, validServers, this@MainActivity)
                         if (purged > 0) {
                             Log.i("MainActivity", "Startup purged $purged residual legacy records")
                         }
@@ -1766,6 +1777,8 @@ class MainActivity : ComponentActivity() {
 
             // 启动自动播放与断点恢复逻辑 (启动时精准恢复并继续播放上一次关闭前的那一首歌曲与进度)
             LaunchedEffect(songList, completedDownloadedSongs, autoPlayOnStartup) {
+                // 首次启动的平台向导尚未完成时不自动播放：向导是模态的，此间不应擅自出声
+                if (platformMode == null) return@LaunchedEffect
                 if (!autoPlayOnStartup || hasAutoPlayedOnStartup) return@LaunchedEffect
                 if (exoPlayer?.isPlaying == true && currentSong != null) {
                     hasAutoPlayedOnStartup = true
@@ -1935,7 +1948,13 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            CompositionLocalProvider(LocalAppDimensions provides appDimensions) {
+            // ⚠️ LocalPlatformMode 必须挂在这一层（而不是下面只包住 AdaptiveAppScaffold 的
+            // 第二层 provider）：全屏播放页 FullscreenPlayerSheet 在该层之外，
+            // 挂低了它内部的焦点修饰符就读不到车机模式。
+            CompositionLocalProvider(
+                LocalAppDimensions provides appDimensions,
+                LocalPlatformMode provides effectivePlatformMode
+            ) {
                 ZDSPlayerTheme(themeMode = currentThemeMode) {
                     // 全局触屏边缘向右滑动返回手势监听 (适配现代全面屏返回手势)
                     Box(
@@ -1945,14 +1964,25 @@ class MainActivity : ComponentActivity() {
                                 awaitPointerEventScope {
                                     val edgeThreshold = 44.dp.toPx()
                                     while (true) {
-                                        val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                        // 用 Main 阶段（而不是 Initial）：Main 阶段是**子节点先处理、父节点后处理**，
+                                        // 因此这里读到的是子节点处理完之后的消费状态 —— 这是判断
+                                        // "这次拖动是否已被子节点认领" 的唯一可靠时机。
+                                        // Initial 阶段父节点先收到，isConsumed 恒为 false，判断会完全失效。
+                                        val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Main)
                                         if (down.position.x <= edgeThreshold) {
                                             var totalDx = 0f
                                             var totalDy = 0f
                                             var triggered = false
                                             while (true) {
-                                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                                val event = awaitPointerEvent(PointerEventPass.Main)
                                                 val drag = event.changes.firstOrNull { it.id == down.id } ?: break
+
+                                                // 子节点（进度条 / 横向滚动区）已经认领了这次拖动 → 放弃返回手势。
+                                                // 否则在屏幕左缘按住播放进度条往右拖，会被判成"边缘右滑返回"而直接退出页面。
+                                                // 消费标记在同一次事件内对命中路径上的所有节点可见，所以这里立刻就能读到，
+                                                // 远早于 totalDx 累计到 65dp 的触发阈值。
+                                                if (drag.isConsumed) break
+
                                                 totalDx += (drag.position.x - drag.previousPosition.x)
                                                 totalDy += (drag.position.y - drag.previousPosition.y)
 
@@ -2729,6 +2759,12 @@ class MainActivity : ComponentActivity() {
                                             autoFallbackToLocal = isFallback
                                             autoPlayPrefs.edit().putBoolean("auto_fallback_to_local", isFallback).apply()
                                         },
+                                        onPlatformModeChange = { mode ->
+                                            // 写 prefs 后更新状态：LocalPlatformMode 变更会让两个焦点修饰符重算，
+                                            // 以及 dispatchKeyEvent 的按键闸门立即生效，无需重启。
+                                            uiPrefs.edit().putString(PLATFORM_MODE_PREF_KEY, mode.key).apply()
+                                            platformMode = mode
+                                        },
                                         onStreamQualityChanged = {
                                             LemonMusicProtocol.notifyStreamQualityConfigChanged()
                                             val activeSong = currentSong
@@ -3056,6 +3092,19 @@ class MainActivity : ComponentActivity() {
                             }
                         )
                     }
+
+                    // 首次启动的平台模式向导（不可跳过）。
+                    // 放在根 Box 内容区的最后一个子节点，确保盖住脚手架与全屏播放页；
+                    // 选择后写入偏好 → 状态更新 → 进入「我的」页。
+                    if (platformMode == null) {
+                        PlatformModeWizard(
+                            onSelect = { mode ->
+                                uiPrefs.edit().putString(PLATFORM_MODE_PREF_KEY, mode.key).apply()
+                                platformMode = mode
+                                navigateToScreen(Screen.MINE)
+                            }
+                        )
+                    }
                 }
             }
         }
@@ -3083,13 +3132,22 @@ class MainActivity : ComponentActivity() {
         try {
             mediaCommandReceiver = object : BroadcastReceiver() {
                 override fun onReceive(context: Context?, intent: Intent?) {
-                    val cmd = intent?.getStringExtra(PlaybackService.EXTRA_COMMAND)
-                    when (cmd) {
-                        PlaybackService.CMD_NEXT -> playNextAction?.invoke()
-                        PlaybackService.CMD_PREV -> playPreviousAction?.invoke()
-                        PlaybackService.CMD_TOGGLE -> togglePlayAction?.invoke()
-                        PlaybackService.CMD_PLAY -> if (exoPlayer?.isPlaying != true) togglePlayAction?.invoke()
-                        PlaybackService.CMD_PAUSE -> if (exoPlayer?.isPlaying == true) togglePlayAction?.invoke()
+                    // 刻意**不执行任何动作**。
+                    //
+                    // PlaybackService 的四处按键处理都是「先执行动作、再广播一次」，而本接收器位于
+                    // 同一个进程、共享同一个 ExoPlayer 实例。此前这里再执行一遍，等于一次按键切两次歌
+                    // （前景态叠加 UP 泄漏后实测连跳 3 首）。现在以服务端为唯一执行点，本接收器只保留
+                    // 通道不再消费，避免扩大改动面（服务端广播仍在发）。
+                    //
+                    // 播放状态本来就通过 PlaybackQueueManager 的 StateFlow 与 ExoPlayer 回调
+                    // 自动回流到 UI，不依赖这条广播刷新界面。
+                    if (intent != null) {
+                        // 仅留日志以便真机核对通道连通性，不执行任何播放动作
+                        Log.d(
+                            "MainActivity",
+                            "media command ignored (service is the single executor): " +
+                                intent.getStringExtra(PlaybackService.EXTRA_COMMAND)
+                        )
                     }
                 }
             }
@@ -3104,7 +3162,47 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private var lastActivityKeyTimestamp = 0L
+    /**
+     * 媒体键 / 音量键的**按键级**防抖时间戳。
+     *
+     * 早前是一个全局单时间戳（`lastActivityKeyTimestamp`）：250ms 内先按「下一首」再按「上一首」，
+     * 或切歌后立刻调音量，第二条命令会被静默吞掉 —— 表现就是"方向盘按了没反应"。
+     * 改成一键一记后，只压同一颗键的连击与长按重复，不同键互不影响。
+     */
+    private val lastKeyTimestampByCode = HashMap<Int, Long>()
+
+    /**
+     * 已在 ACTION_DOWN 上执行过动作、正在等待配对 UP 的按键码集合。
+     * 用集合而非单个变量：方向盘上「下一首」与「上一首」可能交叠按下，
+     * 单变量会把先按那颗键的 UP 判成"未配对"而泄漏给 MediaSession，又切一次歌。
+     */
+    private val pendingDownKeyCodes = HashSet<Int>()
+
+    /** 与组合层同一份设置存储（同名 SharedPreferences 是进程内单例）。 */
+    private val settingsPrefs by lazy { getSharedPreferences("lemon_settings_prefs", Context.MODE_PRIVATE) }
+
+    /**
+     * 当前是否处于车机模式 —— 供 [dispatchKeyEvent] 这类**组合之外**的代码使用。
+     * 直接读 SharedPreferences 而不缓存到字段：切换模式时正是写这份 prefs，
+     * `apply()` 会同步更新内存值，因此这里读到的永远是最新状态，不需要额外的同步机制。
+     */
+    private val isCarPlatformActive: Boolean
+        get() = PlatformMode.fromKey(settingsPrefs.getString(PLATFORM_MODE_PREF_KEY, null)) == PlatformMode.CAR
+
+    /** 电视导航键：车机模式下需要被整体掐断的按键集合（不含 BACK、媒体键、音量键）。 */
+    private fun isTvNavKey(keyCode: Int): Boolean {
+        return when (keyCode) {
+            KeyEvent.KEYCODE_DPAD_UP,
+            KeyEvent.KEYCODE_DPAD_DOWN,
+            KeyEvent.KEYCODE_DPAD_LEFT,
+            KeyEvent.KEYCODE_DPAD_RIGHT,
+            KeyEvent.KEYCODE_DPAD_CENTER,
+            KeyEvent.KEYCODE_ENTER,
+            KeyEvent.KEYCODE_NUMPAD_ENTER,
+            KeyEvent.KEYCODE_MENU -> true
+            else -> false
+        }
+    }
 
     // 针对电视遥控器媒体键、车载中控硬件方向盘按键与蓝牙多功能键的硬件按键分发 (严禁拦截方向键与返回键)
     private fun isMediaOrVolumeKey(keyCode: Int): Boolean {
@@ -3138,11 +3236,44 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun handleMediaKeyEvent(keyCode: Int): Boolean {
+    /**
+     * 「借位」媒体键：电视遥控器的**频道 / 翻页 / 导航**键被当作上一首、下一首的那批映射。
+     *
+     * 车上这些键位通常归旋钮、收音机预置键或车机自身功能使用，继续当成切歌键判读，
+     * 表现为"没碰音乐却莫名跳歌"。车机模式下**放行而不消费**，归属交给系统与其它应用；
+     * 电视模式完全不受影响。注意**不含** MEDIA_NEXT/PREVIOUS 与 BUTTON_L1/R1 ——
+     * 那是方向盘与手柄的正规映射，恰好是要保住的那条路。
+     */
+    private fun isTvStyleMediaKey(keyCode: Int): Boolean {
+        return when (keyCode) {
+            KeyEvent.KEYCODE_CHANNEL_UP,
+            KeyEvent.KEYCODE_CHANNEL_DOWN,
+            KeyEvent.KEYCODE_NAVIGATE_NEXT,
+            KeyEvent.KEYCODE_NAVIGATE_PREVIOUS,
+            KeyEvent.KEYCODE_PAGE_UP,
+            KeyEvent.KEYCODE_PAGE_DOWN -> true
+            else -> false
+        }
+    }
+
+    private fun handleMediaKeyEvent(event: KeyEvent): Boolean {
+        val keyCode = event.keyCode
         if (!isMediaOrVolumeKey(keyCode)) return false
+
+        val isVolumeKey = keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
+            keyCode == KeyEvent.KEYCODE_VOLUME_DOWN ||
+            keyCode == KeyEvent.KEYCODE_VOLUME_MUTE
+
+        // 长按产生的重复事件：媒体键一律丢弃（按住不放会连跳好几首歌），
+        // 但要 return true 把它消费掉，否则它会被算作"未配对"而漏给 MediaSession。
+        // 音量键保留 —— 按住音量键连续调节是系统约定，压掉会让手感变木。
+        if (event.repeatCount > 0 && !isVolumeKey) return true
+
         val now = System.currentTimeMillis()
-        if (now - lastActivityKeyTimestamp < 250) return true
-        lastActivityKeyTimestamp = now
+        if (!isVolumeKey) {
+            if (now - (lastKeyTimestampByCode[keyCode] ?: 0L) < 250) return true
+            lastKeyTimestampByCode[keyCode] = now
+        }
         when (keyCode) {
             KeyEvent.KEYCODE_MEDIA_NEXT,
             KeyEvent.KEYCODE_MEDIA_FAST_FORWARD,
@@ -3242,8 +3373,39 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.action == KeyEvent.ACTION_DOWN) {
-            if (handleMediaKeyEvent(event.keyCode)) return true
+        // 车机模式：从 Activity 层直接掐断整条电视导航键链路（方向键 / 确定 / 菜单）。
+        // 放在这里而不是 Compose 根节点上，是因为：① Activity 早于整个 View 树收到按键，
+        // 能覆盖 Compose、Dialog、Popup 全部窗口；② 车机模式下焦点体系已停用，
+        // 不能保证有节点持有焦点，挂在 Compose 上的拦截器可能根本收不到事件。
+        // BACK、媒体键、音量键一概不受影响，陀螺仪外的手势与触控也照常。
+        if (isCarPlatformActive && isTvNavKey(event.keyCode)) return true
+
+        // 车机模式下不认「频道 / 翻页 / 导航」这类电视遥控器的借位映射（见 isTvStyleMediaKey）：
+        // 车机上这些键位常被旋钮、预置键占用，继续当切歌键判读会表现为"莫名跳歌"。
+        // 放行而不消费 —— 归属交给系统与其它应用；电视模式不受影响。
+        if (isCarPlatformActive && isTvStyleMediaKey(event.keyCode)) return super.dispatchKeyEvent(event)
+
+        if (isMediaOrVolumeKey(event.keyCode)) {
+            when (event.action) {
+                KeyEvent.ACTION_DOWN -> {
+                    if (handleMediaKeyEvent(event)) {
+                        // 记下这个键，供配对的 UP 判定使用
+                        pendingDownKeyCodes.add(event.keyCode)
+                        return true
+                    }
+                }
+                KeyEvent.ACTION_UP -> {
+                    // 关键修复：DOWN 与配对的 UP 必须**成对**吞掉。此前只拦 DOWN，未被消费的 UP
+                    // 会继续下发给当前 MediaSession，由 PlaybackService.onMediaButtonEvent
+                    // 再执行一次切歌，导致方向盘按一下连跳 2~3 首。
+                    //
+                    // 但只吞**配对**的那一个：设备若只上报 ACTION_UP（部分车机 CAN 适配器如此），
+                    // 这里放行给 MediaSession，由 PlaybackService 的 UP 兜底分支执行，
+                    // 否则会出现"按了完全没反应"。
+                    if (pendingDownKeyCodes.remove(event.keyCode)) return true
+                }
+                else -> return true
+            }
         }
         return super.dispatchKeyEvent(event)
     }
@@ -3269,6 +3431,21 @@ class MainActivity : ComponentActivity() {
                 if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
                     permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
                 }
+            } else {
+                // Android 13 (API 33) 起 READ_EXTERNAL_STORAGE 对媒体文件完全失效，
+                // 必须改用按类型划分的 READ_MEDIA_AUDIO。此前这里只处理了 API ≤ 32 的分支，
+                // 导致新系统车机 / 电视上装了也扫不到任何本地音乐（MediaStore 查询返回空、
+                // File.exists() 对外置目录一律返回 false）。
+                if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                    permissions.add(Manifest.permission.READ_MEDIA_AUDIO)
+                }
+            }
+
+            // Android 13+ 前台播放服务的媒体通知需要通知权限才会显示（没有它通知静默不出现）
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+            ) {
+                permissions.add(Manifest.permission.POST_NOTIFICATIONS)
             }
 
             if (permissions.isNotEmpty()) {

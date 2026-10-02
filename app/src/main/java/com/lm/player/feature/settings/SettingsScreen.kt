@@ -35,6 +35,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.lm.player.core.database.ZdsDatabase
+import com.lm.player.core.designsystem.component.LocalPlatformMode
 import com.lm.player.core.designsystem.component.tvButtonFocusable
 import com.lm.player.core.designsystem.component.tvFocusable
 import com.lm.player.core.designsystem.theme.*
@@ -89,6 +90,7 @@ fun SettingsScreen(
     onAutoPlayOnStartupChange: (Boolean) -> Unit = {},
     onAutoLaunchOnBootChange: (Boolean) -> Unit = {},
     onAutoFallbackToLocalChange: (Boolean) -> Unit = {},
+    onPlatformModeChange: (PlatformMode) -> Unit = {},
     onStreamQualityChanged: () -> Unit = {},
     onChooseDownloadDirectory: () -> Unit = {},
     onImportCustomFolder: () -> Unit = {},
@@ -101,6 +103,8 @@ fun SettingsScreen(
     val coroutineScope = rememberCoroutineScope()
     val database = remember { ZdsDatabase.getInstance(context) }
     val dimensions = LocalAppDimensions.current
+    // 当前平台模式（由 MainActivity 通过 CompositionLocal 下发）：用于切换入口与下方指南文案
+    val currentPlatformMode = LocalPlatformMode.current
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val cardBg = if (isDark) Color(0xFF26262E) else Color.White
     val borderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
@@ -1346,6 +1350,22 @@ fun SettingsScreen(
                                 checked = autoFallbackToLocal,
                                 onCheckedChange = onAutoFallbackToLocalChange
                             )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            // 平台模式切换入口：与首次启动向导写同一份偏好，切换后即时生效、无需重启。
+                            SettingDropdownRow(
+                                title = "使用平台模式",
+                                subtitle = if (currentPlatformMode == PlatformMode.CAR) {
+                                    "车机 / 中控：以触控为主，已停用遥控器焦点光环与方向键操作，降低车机资源占用"
+                                } else {
+                                    "电视 / 机顶盒：完整启用遥控器焦点光环、方向键导航与菜单键快捷键"
+                                },
+                                icon = if (currentPlatformMode == PlatformMode.CAR) Icons.Default.DirectionsCar else Icons.Default.Tv,
+                                selectedValue = currentPlatformMode,
+                                options = PlatformMode.entries.toList(),
+                                getLabel = { it.displayName },
+                                onSelect = onPlatformModeChange
+                            )
                         }
                     }
 
@@ -1362,15 +1382,28 @@ fun SettingsScreen(
                                     verticalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
                                     Text(
-                                        text = "LMPlayer TV车机版 已开启客厅 10 英尺大屏、车载中控横屏与物理遥控器 (D-Pad) 深度适配",
+                                        text = if (currentPlatformMode == PlatformMode.CAR) {
+                                            "LMPlayer TV车机版 当前为「车机 / 中控」模式：围绕横向大屏与触控优化，已停用遥控器焦点光环与方向键操作以降低车机端资源占用"
+                                        } else {
+                                            "LMPlayer TV车机版 已开启客厅 10 英尺大屏、车载中控横屏与物理遥控器 (D-Pad) 深度适配"
+                                        },
                                         fontSize = dimensions.bodySize,
                                         fontWeight = FontWeight.Bold,
                                         color = MaterialTheme.colorScheme.onSurface
                                     )
                                     Text(
-                                        text = "• 全局浏览：支持车机触控直点或使用电视遥控器 [▲ ▼ ◀ ▶] 移动高对比度焦点光环\n" +
-                                            "• 歌曲列表：选中歌曲按 [OK/确定键] 立即播放；按遥控器 [☰ 菜单键] 呼出收藏/下载/加歌单窗口\n" +
-                                            "• 全屏歌词页：遥控器 [▲ ▼ ◀ ▶] 自由选中任意功能按钮并按 [OK键] 操作 ｜ 长按 [◀ / ▶] 快速切换上一首/下一首 ｜ [☰ 菜单键] 展开待播队列",
+                                        // 车机文案只陈述**实际存在**的触控路径，逐条与实现核对过；
+                                        // 不照搬电视侧「菜单键呼出收藏/加歌单窗口」这类与实现不符的说法。
+                                        text = if (currentPlatformMode == PlatformMode.CAR) {
+                                            "• 全局浏览：直接点按界面即可，无需移动光标\n" +
+                                                "• 歌曲列表：点按歌曲立即播放；点按行尾的同步状态按钮可下载或查看下载进度\n" +
+                                                "• 播放页与全屏歌词：点按任意功能按钮操作，拖动进度条跳转\n" +
+                                                "• 方向盘 / 中控的 [上一首] [下一首] [播放暂停] 与音量键始终有效，不受平台模式影响"
+                                        } else {
+                                            "• 全局浏览：支持车机触控直点或使用电视遥控器 [▲ ▼ ◀ ▶] 移动高对比度焦点光环\n" +
+                                                "• 歌曲列表：选中歌曲按 [OK/确定键] 立即播放；按遥控器 [☰ 菜单键] 呼出收藏/下载/加歌单窗口\n" +
+                                                "• 全屏歌词页：遥控器 [▲ ▼ ◀ ▶] 自由选中任意功能按钮并按 [OK键] 操作 ｜ 长按 [◀ / ▶] 快速切换上一首/下一首 ｜ [☰ 菜单键] 展开待播队列"
+                                        },
                                         fontSize = dimensions.captionSize,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         lineHeight = (dimensions.captionSize.value * 1.45f).sp
@@ -1604,7 +1637,19 @@ fun SettingsScreen(
                         showPurgeConfirmDialog = false
                         isPurgingLegacyData = true
                         coroutineScope.launch {
-                            val purgedCount = LocalMediaScanner.purgeLegacyResidualData(database)
+                            // 存储不可读（U 盘/ SD 卡未挂载，或未授予音频读取权限）时不做物理文件校验：
+                            // 此时 File.exists() 会对外置目录下的所有曲目返回 false，
+                            // 执行下去会把整个本地曲库误判成"已删除"整批清掉。
+                            if (!LocalMediaScanner.isLocalStorageReadable(context)) {
+                                isPurgingLegacyData = false
+                                Toast.makeText(
+                                    context,
+                                    "未授予音频读取权限或外置存储未挂载，已跳过清理（未删除任何记录）",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                                return@launch
+                            }
+                            val purgedCount = LocalMediaScanner.purgeLegacyResidualData(database, emptyList(), context)
                             isPurgingLegacyData = false
                             onLocalScanCompleted()
                             Toast.makeText(context, "资料库清理完成！成功清理 $purgedCount 条遗留记录", Toast.LENGTH_LONG).show()

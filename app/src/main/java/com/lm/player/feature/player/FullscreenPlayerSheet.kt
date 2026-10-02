@@ -61,6 +61,7 @@ import com.lm.player.core.designsystem.component.AddToPlaylistDialog
 import com.lm.player.core.designsystem.component.AddToPlaylistDropdownMenu
 import com.lm.player.core.designsystem.component.AlbumArtworkImage
 import com.lm.player.core.designsystem.component.DownloadQualityDropdownMenu
+import com.lm.player.core.designsystem.component.LocalPlatformMode
 import com.lm.player.core.designsystem.component.tvButtonFocusable
 import com.lm.player.core.designsystem.component.tvFocusable
 import com.lm.player.core.designsystem.theme.AppleRed
@@ -392,12 +393,16 @@ fun FullscreenPlayerSheet(
         showTvHud("🎨 已切换主题：${targetTheme.displayName}")
     }
 
+    // 车机模式：本页是全应用唯一的「裸 focusable」节点（不经过 tvFocusable），需单独关掉，
+    // 否则方向键仍能落进这一层并触发下方的 onPreviewKeyEvent 快捷键。
+    val isCarPlatform = LocalPlatformMode.current == PlatformMode.CAR
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .offset { IntOffset(0, animatedOffsetY.roundToInt().coerceAtLeast(0)) }
             .background(playerBackdrop)
-            .focusable(enabled = isNeteaseCoverMode && !isNeteaseControlsVisible)
+            .focusable(enabled = isNeteaseCoverMode && !isNeteaseControlsVisible && !isCarPlatform)
             .onFocusChanged { state ->
                 sheetHasFocus = state.hasFocus
             }

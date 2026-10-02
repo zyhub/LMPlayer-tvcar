@@ -30,6 +30,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.lm.player.core.designsystem.component.DownloadQualityChoiceDialog
+import com.lm.player.core.designsystem.component.LocalPlatformMode
 import com.lm.player.core.designsystem.component.tvButtonFocusable
 import com.lm.player.core.designsystem.component.tvFocusable
 import com.lm.player.core.designsystem.theme.AppleRed
@@ -38,6 +39,7 @@ import com.lm.player.core.designsystem.theme.scale
 import com.lm.player.core.model.AudioQuality
 import com.lm.player.core.model.DownloadTarget
 import com.lm.player.core.model.OnlineMusicSource
+import com.lm.player.core.model.PlatformMode
 import com.lm.player.core.model.UnifiedSong
 import com.lm.player.feature.home.OnlineSourceDropdownMenu
 import com.lm.player.feature.home.SongListItemRow
@@ -880,9 +882,16 @@ fun LibrarySearchDialog(
                             }
 
                             Text(
-                                text = "• 支持车机触控直点或使用遥控器方向键在左侧字母键盘点选歌名/歌手首字母（如输入「ZJL」搜周杰伦，「QT」搜晴天）\n" +
-                                    "• 本地与柠檬曲库 (${allSongs.size} 首) 支持实时首字母过滤，全网音源支持自动联想搜索\n" +
-                                    "• 在搜索结果上按「确定键」立即播放，按遥控器「菜单键」呼出收藏与下载菜单",
+                                // 车机模式只陈述触控路径；电视模式文案保持原样
+                                text = if (LocalPlatformMode.current == PlatformMode.CAR) {
+                                    "• 直接点按左侧字母键盘输入歌名/歌手首字母（如输入「ZJL」搜周杰伦，「QT」搜晴天）\n" +
+                                        "• 本地与柠檬曲库 (${allSongs.size} 首) 支持实时首字母过滤，全网音源支持自动联想搜索\n" +
+                                        "• 点按搜索结果立即播放"
+                                } else {
+                                    "• 支持车机触控直点或使用遥控器方向键在左侧字母键盘点选歌名/歌手首字母（如输入「ZJL」搜周杰伦，「QT」搜晴天）\n" +
+                                        "• 本地与柠檬曲库 (${allSongs.size} 首) 支持实时首字母过滤，全网音源支持自动联想搜索\n" +
+                                        "• 在搜索结果上按「确定键」立即播放，按遥控器「菜单键」呼出收藏与下载菜单"
+                                },
                                 fontSize = dimensions.captionSize,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 lineHeight = 19.sp
