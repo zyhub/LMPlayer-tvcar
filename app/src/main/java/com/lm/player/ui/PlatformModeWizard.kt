@@ -28,10 +28,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.pointer.pointerInput
+import android.view.KeyEvent
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -72,6 +75,7 @@ fun PlatformModeWizard(
 
     // 默认把焦点落在「电视」卡片上：电视端与车机端都能直接按 OK 确认，方向键也能立刻移动光标
     val tvFocusRequester = remember { FocusRequester() }
+    val carFocusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) {
         try {
             kotlinx.coroutines.delay(80L)
@@ -85,7 +89,13 @@ fun PlatformModeWizard(
             .fillMaxSize()
             .background(backgroundColor)
             // 消费空白区域的点击，防止穿透到底层已渲染的界面
-            .pointerInput(Unit) { detectTapGestures { } },
+            .pointerInput(Unit) { detectTapGestures { } }
+            // 上下方向键在本层整体吞掉：向导只有左右两张卡片，按上下键不应把焦点交给
+            // 身后被遮住的主界面（那会让光标「消失」在看不见的地方）。左右键照常放行。
+            .onKeyEvent { event ->
+                val code = event.nativeKeyEvent.keyCode
+                code == KeyEvent.KEYCODE_DPAD_UP || code == KeyEvent.KEYCODE_DPAD_DOWN
+            },
         contentAlignment = Alignment.Center
     ) {
         Column(
@@ -116,7 +126,16 @@ fun PlatformModeWizard(
                     subtitle = "使用遥控器方向键操作，完整启用焦点光环与按键快捷键",
                     accent = tvAccent,
                     onClick = { onSelect(PlatformMode.TV) },
-                    modifier = Modifier.focusRequester(tvFocusRequester)
+                    modifier = Modifier
+                        .focusRequester(tvFocusRequester)
+                        // 焦点围栏：上下穿越一律 Cancel（光标不动），左右与另一张卡片互相跳转，
+                        // 使光标永远被限制在「电视」「车机」两个选项之间。
+                        .focusProperties {
+                            up = FocusRequester.Cancel
+                            down = FocusRequester.Cancel
+                            left = FocusRequester.Cancel
+                            right = carFocusRequester
+                        }
                 )
                 PlatformModeCard(
                     icon = Icons.Default.DirectionsCar,
@@ -125,6 +144,13 @@ fun PlatformModeWizard(
                     accent = carAccent,
                     onClick = { onSelect(PlatformMode.CAR) },
                     modifier = Modifier
+                        .focusRequester(carFocusRequester)
+                        .focusProperties {
+                            up = FocusRequester.Cancel
+                            down = FocusRequester.Cancel
+                            left = tvFocusRequester
+                            right = FocusRequester.Cancel
+                        }
                 )
             }
 
