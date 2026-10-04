@@ -26,8 +26,8 @@ data class UpdateInfo(
 object AppUpdateManager {
 
     private const val TAG = "AppUpdateManager"
-    const val CURRENT_VERSION_NAME = "1.10.7"
-    const val CURRENT_VERSION_CODE = 54
+    const val CURRENT_VERSION_NAME = "1.10.8"
+    const val CURRENT_VERSION_CODE = 55
     const val AUTHOR_NAME = "Zhou"
     const val AUTHOR_EMAIL = "1390999045@qq.com"
     const val APP_DESCRIPTION = "本软件为 TV车机版，专为智能电视、机顶盒与车载中控横屏大屏量身打造的高保真无损音乐播放器。专属接入柠檬音乐服务端，支持5大音源全网融合搜索与无损畅听、全盘本地音频深度扫描、智能歌词联动以及电视遥控器与车机触控双栖深度适配。"

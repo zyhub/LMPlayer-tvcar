@@ -283,8 +283,13 @@ class MainActivity : ComponentActivity() {
             var currentScreen by remember { mutableStateOf(Screen.HOME) }
             val screenHistoryStack = remember { mutableStateListOf<Screen>() }
             var isChildSubViewActive by remember { mutableStateOf(false) }
+            var favoritesRefreshTrigger by remember { mutableStateOf(0) }
+            val refreshServerFavorites: () -> Unit = { favoritesRefreshTrigger++ }
 
             val navigateToScreen: (Screen) -> Unit = { target ->
+                if (target == Screen.MINE || target == Screen.LIBRARY) {
+                    favoritesRefreshTrigger++
+                }
                 if (target != currentScreen) {
                     if (target == Screen.HOME) {
                         screenHistoryStack.clear()
@@ -355,6 +360,27 @@ class MainActivity : ComponentActivity() {
             // 不写入 playlists 表，避免为展示字段触发数据库版本升级导致用户数据被清空。
             var playlistPreviewCovers by remember { mutableStateOf<Map<String, List<String>>>(emptyMap()) }
             var recentlyAddedSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
+            // 「我喜欢的音乐」的口径来源：柠檬服务器收藏 (/api/library/user-data 的 favorites)。
+            // 本地 Room 的 isFavorite 只是这份服务器收藏在本机的镜像，用它来枚举收藏会漏掉
+            // 「在别的设备/网页端收藏、本机没同步过」的曲目，所以收藏列表一律以服务器为准。
+            var serverFavoriteSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
+            // 每次访问「我的」/「资料库」或触发 favoritesRefreshTrigger 时及时向服务器拉取「我喜欢的音乐」
+            LaunchedEffect(serversList, favoritesRefreshTrigger, currentScreen == Screen.MINE || currentScreen == Screen.LIBRARY) {
+                val srv = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
+                    ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
+                    ?: return@LaunchedEffect
+                val fetched = withContext(Dispatchers.IO) {
+                    try {
+                        val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
+                        val protocol = LemonMusicProtocol(client, srv.serverUrl, srv.username, srv.tokenOrApiKey)
+                        protocol.getPlaylistSongs("lemon_favorites").getOrNull()
+                    } catch (e: Exception) {
+                        Log.w("MainActivity", "Fetching server favorites failed", e)
+                        null
+                    }
+                }
+                if (fetched != null) serverFavoriteSongs = fetched
+            }
             // 「最近播放」以 PlaybackQueueManager 的 flow 为**唯一真源**。
             // 先同步装载一次本地播放足迹（单次读盘成本与原实现一致），未连接服务器时直接展示这份记录；
             // 之后所有"前移/合并服务器足迹"都走 manager 的方法，界面这里不再各自维护副本
@@ -1514,6 +1540,13 @@ class MainActivity : ComponentActivity() {
                 } else {
                     listOf(updatedSong) + songList
                 }
+                // 「我喜欢的音乐」以服务器收藏为准，这里先把本机这份镜像改掉，
+                // 确保用户点击红心后即时生效
+                serverFavoriteSongs = if (newFav) {
+                    (listOf(updatedSong) + serverFavoriteSongs).distinctBy { it.id }
+                } else {
+                    serverFavoriteSongs.filterNot { it.id == songToFav.id }
+                }
                 if (PlaybackQueueManager.currentSongFlow.value?.id == songToFav.id) {
                     PlaybackQueueManager.updateCurrentSong(updatedSong)
                 }
@@ -1581,6 +1614,12 @@ class MainActivity : ComponentActivity() {
                             )
                             protocol.toggleFavoriteSongOnServer(updatedSong, newFav)
                             syncServerPlaylists(activeServer)
+                            val favs = protocol.getPlaylistSongs("lemon_favorites").getOrNull()
+                            if (favs != null) {
+                                withContext(Dispatchers.Main) {
+                                    serverFavoriteSongs = favs
+                                }
+                            }
                         }
                     } catch (e: Exception) {
                         Log.e("MainActivity", "handleToggleFavorite error", e)
@@ -1864,9 +1903,10 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // 监听 ExoPlayer 在线容灾回退与中途断流无缝断点续播
+            // 监听 ExoPlayer 在线容灾回退与中途断流无缝断点续播及音质降级
             var lastStreamRetrySongId by remember { mutableStateOf("") }
             var lastStreamRetryTimeMs by remember { mutableStateOf(0L) }
+            var lastStreamRetryQualityIdx by remember { mutableStateOf(0) }
             DisposableEffect(exoPlayer, currentSong, songList, autoFallbackToLocal) {
                 val listener = object : Player.Listener {
                     override fun onPlayerError(error: PlaybackException) {
@@ -1900,24 +1940,32 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
 
-                            // 2. 若在线流或柠檬代理流播放中途断流/超时，自动向柠檬服务器重新换取最新流地址并从当前秒数无缝续播
-                            val now = System.currentTimeMillis()
-                            val canRetryRefresh = lastStreamRetrySongId != targetSong.id || (now - lastStreamRetryTimeMs) > 10_000L
-                            if (canRetryRefresh) {
+                            // 2. 音质降级与换源重试：若在线流或高音质(Hi-Res/FLAC)播放中途断流/无法缓冲，
+                            // 参考柠檬音乐机制按音质候选链 (flac24bit -> flac -> 320k -> 128k) 依次换源降低音质重试并提示用户
+                            val preferredQuality = LemonMusicProtocol.getPreferredStreamQuality(this@MainActivity)
+                            val fallbackQualities = LemonMusicProtocol.getFallbackQualities(preferredQuality)
+                            val currentDowngradeIdx = if (lastStreamRetrySongId == targetSong.id) lastStreamRetryQualityIdx else 0
+                            val nextQualityIdx = currentDowngradeIdx + 1
+                            if (nextQualityIdx < fallbackQualities.size) {
                                 lastStreamRetrySongId = targetSong.id
-                                lastStreamRetryTimeMs = now
-                                Log.i("MainActivity", "Auto-recovering stream for ${targetSong.title} at ${resumePos}ms")
+                                lastStreamRetryTimeMs = System.currentTimeMillis()
+                                lastStreamRetryQualityIdx = nextQualityIdx
+                                val nextQualityKey = fallbackQualities[nextQualityIdx]
+                                val nextQualityLabel = AudioQuality.fromKey(nextQualityKey).label
+                                Log.i("MainActivity", "Auto-downgrading quality for ${targetSong.title} to $nextQualityKey ($nextQualityLabel) at ${resumePos}ms")
+                                Toast.makeText(this@MainActivity, "当前音质无法缓冲，已自动为您换源降至【$nextQualityLabel】播放", Toast.LENGTH_SHORT).show()
                                 PlaybackQueueManager.playSong(
                                     targetSong = targetSong,
                                     context = this@MainActivity,
                                     startPositionMs = resumePos,
-                                    forceRefresh = true
+                                    forceRefresh = true,
+                                    overrideQuality = nextQualityKey
                                 )
                                 return
                             }
 
                             if (autoFallbackToLocal) {
-                                // 3. 若重新刷新仍失败，尝试回退至服务器资料库内同版本已归档曲目并保留播放进度
+                                // 3. 若降级仍失败，尝试回退至服务器资料库内同版本已归档曲目并保留播放进度
                                 val matchedServerSong = songList.firstOrNull {
                                     it.id != targetSong.id &&
                                     it.streamUrl != targetSong.streamUrl &&
@@ -2086,6 +2134,7 @@ class MainActivity : ComponentActivity() {
                                         }
                                         syncServerPlaylists(active)
                                         syncServerSongsWithToast(active, false)
+                                        refreshServerFavorites()
                                     }
                                 } else if (active != null && isLocalMode) {
                                     // 若已配置服务器但此前断网处于本地模式，点击「我的」时自动尝试重连刷新服务器
@@ -2101,6 +2150,7 @@ class MainActivity : ComponentActivity() {
                                                 }
                                                 syncServerPlaylists(active)
                                                 syncServerSongsWithToast(active, false)
+                                                refreshServerFavorites()
                                                 return@launch
                                             }
                                         } catch (_: Exception) {}
@@ -2144,6 +2194,7 @@ class MainActivity : ComponentActivity() {
                                 Toast.makeText(this@MainActivity, "正在从柠檬音乐同步全量曲库...", Toast.LENGTH_SHORT).show()
                                 syncServerPlaylists(active)
                                 syncServerSongs(active)
+                                refreshServerFavorites()
                             } else {
                                 Toast.makeText(this@MainActivity, "当前为本地模式，可前往设置扫描本地文件", Toast.LENGTH_SHORT).show()
                             }
@@ -2189,13 +2240,14 @@ class MainActivity : ComponentActivity() {
                                 Screen.SEARCH -> {
                                     val activeServer = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
                                         ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
-                                    val onlineSearchCallback: (suspend (String, OnlineMusicSource) -> List<UnifiedSong>)? = remember(activeServer) {
+                                    // page/limit 透传给服务端，由服务端做翻页；一页拉满即认为还有下一页。
+                                    val onlineSearchCallback: (suspend (String, OnlineMusicSource, Int, Int) -> List<UnifiedSong>)? = remember(activeServer) {
                                         val srv = activeServer
                                         if (srv != null) {
-                                            { keyword, source ->
+                                            { keyword, source, page, limit ->
                                                 val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
                                                 val protocol = LemonMusicProtocol(client, srv.serverUrl, srv.username, srv.tokenOrApiKey)
-                                                protocol.searchOnline(keyword, source = source.key).getOrNull() ?: emptyList()
+                                                protocol.searchOnline(keyword, source = source.key, page = page, limit = limit).getOrNull() ?: emptyList()
                                             }
                                         } else null
                                     }
@@ -2269,6 +2321,7 @@ class MainActivity : ComponentActivity() {
                                             onSyncNow = {
                                                 Toast.makeText(this@MainActivity, "正在从柠檬音乐同步全量曲库...", Toast.LENGTH_SHORT).show()
                                                 syncServerSongs(activeServer)
+                                                refreshServerFavorites()
                                             },
                                             onOpenDownloads = { navigateToScreen(Screen.DOWNLOADS) },
                                             onGoToSettings = { navigateToScreen(Screen.SETTINGS) },
@@ -2342,8 +2395,9 @@ class MainActivity : ComponentActivity() {
                                             onSyncNow = {
                                                 val active = serversList.firstOrNull { it.isCurrentActive }
                                                 if (active != null) {
-                                                    Toast.makeText(this@MainActivity, "正在从柠檬音乐同步曲库...", Toast.LENGTH_SHORT).show()
+                                                    Toast.makeText(this@MainActivity, "正在从柠檬音乐同步曲库与收藏...", Toast.LENGTH_SHORT).show()
                                                     syncServerSongs(active)
+                                                    refreshServerFavorites()
                                                 } else {
                                                     Toast.makeText(this@MainActivity, "当前为本地模式，可前往设置扫描本地文件", Toast.LENGTH_SHORT).show()
                                                 }
@@ -2390,8 +2444,37 @@ class MainActivity : ComponentActivity() {
                                             }
                                         }
                                     }
+                                    // 「我喜欢的音乐」的数据口径：
+                                    //   在线模式 —— 直接以柠檬服务器收藏为准，能对上库内曲目的用库内数据，其余沿用服务器记录；
+                                    //   本地/已下载 —— 从服务器收藏中枚举出"已下载"的曲目，没下载的不显示。
+                                    // 拉不到服务器收藏时回落到本地 isFavorite 标记，避免收藏卡片整块变空。
+                                    val favoriteSongs = remember(
+                                        serverFavoriteSongs, librarySongs, completedDownloadedSongs, isLocalMode
+                                    ) {
+                                        when {
+                                            serverFavoriteSongs.isEmpty() -> librarySongs.filter { it.isFavorite }
+                                            !isLocalMode -> serverFavoriteSongs.map { fav ->
+                                                librarySongs.firstOrNull { it.id == fav.id } ?: fav
+                                            }
+                                            else -> serverFavoriteSongs.mapNotNull { fav ->
+                                                completedDownloadedSongs.firstOrNull { local ->
+                                                    local.id == fav.id || SongMatchingResolver.isSongMatch(
+                                                        title1 = local.title,
+                                                        artist1 = local.artist,
+                                                        durationMs1 = local.durationMs,
+                                                        title2 = fav.title,
+                                                        artist2 = fav.artist,
+                                                        durationMs2 = fav.durationMs,
+                                                        album1 = local.album,
+                                                        album2 = fav.album
+                                                    )
+                                                }
+                                            }.distinctBy { it.id }
+                                        }
+                                    }
                                     LocalLibraryScreen(
                                         allSongs = librarySongs,
+                                        favoriteSongs = favoriteSongs,
                                         downloadedSongs = completedDownloadedSongs,
                                         recentlyPlayedSongs = recentlyPlayedSongs,
                                         playlists = if (isLocalMode) {
@@ -2424,9 +2507,10 @@ class MainActivity : ComponentActivity() {
                                         onSyncNow = {
                                             val active = serversList.firstOrNull { it.isCurrentActive } ?: serversList.firstOrNull()
                                             if (active != null) {
-                                                Toast.makeText(this@MainActivity, "正在从柠檬音乐同步曲库...", Toast.LENGTH_SHORT).show()
+                                                Toast.makeText(this@MainActivity, "正在从柠檬音乐同步曲库与收藏...", Toast.LENGTH_SHORT).show()
                                                 syncServerPlaylists(active)
                                                 syncServerSongs(active)
+                                                refreshServerFavorites()
                                             } else {
                                                 Toast.makeText(this@MainActivity, "当前为本地模式，可前往设置扫描本地文件", Toast.LENGTH_SHORT).show()
                                             }
@@ -2437,7 +2521,9 @@ class MainActivity : ComponentActivity() {
                                         onDownloadSongWithOptions = handleDownloadWithOptions,
                                         onBatchDownloadSongsWithOptions = handleBatchDownloadWithOptions,
                                         onDeleteDownloadedSongs = { songsToDelete ->
+                                            val deletedIds = songsToDelete.map { it.id }.toSet()
                                             downloadEngine.deleteDownloadedSongs(songsToDelete)
+                                            songList = songList.map { if (it.id in deletedIds) it.copy(localFilePath = null, downloadStatus = DownloadStatus.NOT_DOWNLOADED) else it }
                                         },
                                         onToggleFavorite = { songToToggle ->
                                             handleToggleFavorite(songToToggle)
@@ -2654,10 +2740,14 @@ class MainActivity : ComponentActivity() {
                                         onPauseAll = { downloadEngine.pauseAll() },
                                         onResumeAll = { downloadEngine.resumeAll() },
                                         onDeleteDownloadedSong = { songToDelete ->
+                                            val deletedIds = setOf(songToDelete.id)
                                             downloadEngine.deleteDownloadedSong(songToDelete)
+                                            songList = songList.map { if (it.id in deletedIds) it.copy(localFilePath = null, downloadStatus = DownloadStatus.NOT_DOWNLOADED) else it }
                                         },
                                         onDeleteDownloadedSongs = { songsToDelete ->
+                                            val deletedIds = songsToDelete.map { it.id }.toSet()
                                             downloadEngine.deleteDownloadedSongs(songsToDelete)
+                                            songList = songList.map { if (it.id in deletedIds) it.copy(localFilePath = null, downloadStatus = DownloadStatus.NOT_DOWNLOADED) else it }
                                         },
                                         onReEmbedSong = { songToFix ->
                                             lifecycleScope.launch(Dispatchers.IO) {
@@ -2868,13 +2958,14 @@ class MainActivity : ComponentActivity() {
                         if (isSearchDialogOpen) {
                             val activeServer = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
                                 ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
-                            val onlineSearchCallback: (suspend (String, OnlineMusicSource) -> List<UnifiedSong>)? = remember(activeServer) {
+                            // page/limit 透传给服务端，由服务端做翻页；一页拉满即认为还有下一页。
+                            val onlineSearchCallback: (suspend (String, OnlineMusicSource, Int, Int) -> List<UnifiedSong>)? = remember(activeServer) {
                                 val srv = activeServer
                                 if (srv != null) {
-                                    { keyword, source ->
+                                    { keyword, source, page, limit ->
                                         val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
                                         val protocol = LemonMusicProtocol(client, srv.serverUrl, srv.username, srv.tokenOrApiKey)
-                                        protocol.searchOnline(keyword, source = source.key).getOrNull() ?: emptyList()
+                                        protocol.searchOnline(keyword, source = source.key, page = page, limit = limit).getOrNull() ?: emptyList()
                                     }
                                 } else null
                             }

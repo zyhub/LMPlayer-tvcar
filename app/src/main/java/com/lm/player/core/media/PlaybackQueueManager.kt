@@ -496,19 +496,71 @@ object PlaybackQueueManager {
         val validIncomingLocal = incoming.localFilePath?.takeIf {
             it.isNotBlank() && (it.startsWith("content://") || java.io.File(it).exists())
         }
-        val effectiveLocal = validIncomingLocal ?: validExistingLocal
+        val effectiveLocal = if (incoming.downloadStatus == DownloadStatus.NOT_DOWNLOADED && incoming.localFilePath == null) {
+            null
+        } else {
+            validIncomingLocal ?: validExistingLocal
+        }
         val effectiveStream = when {
             !effectiveLocal.isNullOrBlank() -> effectiveLocal
             incoming.streamUrl.isNotBlank() && !incoming.streamUrl.startsWith("lemon_online://") -> incoming.streamUrl
-            existing.streamUrl.isNotBlank() -> existing.streamUrl
+            existing.streamUrl.isNotBlank() && !existing.streamUrl.startsWith("/") -> existing.streamUrl
             else -> incoming.streamUrl
+        }
+        val effectiveDownloadStatus = if (!effectiveLocal.isNullOrBlank()) {
+            DownloadStatus.DOWNLOADED
+        } else {
+            if (incoming.downloadStatus == DownloadStatus.DOWNLOADED) DownloadStatus.NOT_DOWNLOADED else incoming.downloadStatus
         }
         return incoming.copy(
             localFilePath = effectiveLocal,
             streamUrl = effectiveStream,
-            downloadStatus = if (!effectiveLocal.isNullOrBlank()) DownloadStatus.DOWNLOADED else incoming.downloadStatus,
+            downloadStatus = effectiveDownloadStatus,
             rawMetaJson = incoming.rawMetaJson ?: existing.rawMetaJson
         )
+    }
+
+    /**
+     * 当本地已下载歌曲被删除时，立即同步清除播放队列、当前播放及最近播放中的已下载标志与本地路径
+     */
+    fun onSongsDownloadDeleted(songIds: Set<String>) {
+        if (songIds.isEmpty()) return
+        val current = _currentSongFlow.value
+        if (current != null && current.id in songIds) {
+            val updated = current.copy(
+                localFilePath = null,
+                downloadStatus = DownloadStatus.NOT_DOWNLOADED
+            )
+            _currentSongFlow.value = updated
+            savePlaybackState(song = updated, commitSync = true)
+        }
+        if (_playlistFlow.value.isNotEmpty()) {
+            _playlistFlow.value = _playlistFlow.value.map { song ->
+                if (song.id in songIds) {
+                    song.copy(
+                        localFilePath = null,
+                        downloadStatus = DownloadStatus.NOT_DOWNLOADED
+                    )
+                } else song
+            }
+        }
+        if (_recentPlayedSongsFlow.value.isNotEmpty()) {
+            val updated = _recentPlayedSongsFlow.value.map { song ->
+                if (song.id in songIds) {
+                    song.copy(
+                        localFilePath = null,
+                        downloadStatus = DownloadStatus.NOT_DOWNLOADED
+                    )
+                } else song
+            }
+            _recentPlayedSongsFlow.value = updated
+            appContext?.let { ctx ->
+                val snapshot = synchronized(recentPlayLock) {
+                    RecentPlaySnapshot(updated, HashMap(recentPlayedAt))
+                }
+                ioExecutor.execute { persistRecentPlaySnapshot(ctx, snapshot) }
+            }
+        }
     }
 
     /**
@@ -780,7 +832,8 @@ object PlaybackQueueManager {
         newPlaylist: List<UnifiedSong>? = null,
         startPositionMs: Long = 0L,
         forceRefresh: Boolean = false,
-        streamPreResolved: Boolean = false
+        streamPreResolved: Boolean = false,
+        overrideQuality: String? = null
     ) {
         ensurePlayerListener(context)
         _currentSongFlow.value = targetSong
@@ -810,7 +863,8 @@ object PlaybackQueueManager {
                 val mediaItem: MediaItem? = router.resolveMediaItem(
                     targetSong,
                     forceRefresh = forceRefresh,
-                    streamPreResolved = streamPreResolved
+                    streamPreResolved = streamPreResolved,
+                    overrideQuality = overrideQuality
                 )
                 if (mediaItem == null) {
                     // 明确告知用户"这首放不了"，而不是让它显示成正在播放却毫无声音

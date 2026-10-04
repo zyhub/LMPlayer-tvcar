@@ -20,6 +20,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
@@ -179,20 +180,56 @@ private object TvPinyinSearchHelper {
         return null
     }
 
-    fun matchesSong(song: UnifiedSong, rawQuery: String): Boolean {
+    fun scoreSong(song: UnifiedSong, rawQuery: String): Int {
         val q = rawQuery.trim().lowercase()
-        if (q.isEmpty()) return false
-        if (song.title.lowercase().contains(q) ||
-            song.artist.lowercase().contains(q) ||
-            song.album.lowercase().contains(q)
-        ) {
-            return true
+        if (q.isEmpty()) return 0
+        val titleLower = song.title.trim().lowercase()
+        val artistLower = song.artist.trim().lowercase()
+        val titleInit = getPinyinInitials(song.title)
+        val artistInit = getPinyinInitials(song.artist)
+
+        // 1. 歌名拼音首字母与输入完全一致（例如输入 KX 匹配 2 字歌名如“开心”、“空隙”）
+        if (titleInit == q) {
+            return 2000
         }
-        // 首字母匹配（例如输入 ZJL 匹配 周杰伦，输入 QT 匹配 晴天）
-        val titleInitials = getPinyinInitials(song.title)
-        val artistInitials = getPinyinInitials(song.artist)
-        val albumInitials = getPinyinInitials(song.album)
-        return titleInitials.contains(q) || artistInitials.contains(q) || albumInitials.contains(q)
+        // 2. 歌名本身与输入完全一致
+        if (titleLower == q) {
+            return 1800
+        }
+        // 3. 歌手拼音首字母完全一致（如 ZJL 匹配“周杰伦”）
+        if (artistInit == q) {
+            return 1600
+        }
+        // 4. 歌名拼音首字母以输入为前缀（字数越少越靠前！输入 KX 时，2字 > 3字 > 4字 > 7字“可惜我是水瓶座”）
+        if (titleInit.startsWith(q)) {
+            val lengthDiff = (titleInit.length - q.length).coerceAtLeast(0)
+            return (1200 - lengthDiff * 50).coerceAtLeast(600)
+        }
+        // 5. 歌手拼音首字母以输入为前缀
+        if (artistInit.startsWith(q)) {
+            val lengthDiff = (artistInit.length - q.length).coerceAtLeast(0)
+            return (900 - lengthDiff * 40).coerceAtLeast(500)
+        }
+        // 6. 歌名包含文本
+        if (titleLower.contains(q)) {
+            return 400
+        }
+        // 7. 歌手包含文本
+        if (artistLower.contains(q)) {
+            return 300
+        }
+        // 8. 歌名或歌手首字母包含输入字串
+        if (titleInit.contains(q)) {
+            return 200
+        }
+        if (artistInit.contains(q)) {
+            return 100
+        }
+        return 0
+    }
+
+    fun matchesSong(song: UnifiedSong, rawQuery: String): Boolean {
+        return scoreSong(song, rawQuery) > 0
     }
 
     fun buildSmartSuggestions(rawQuery: String, allSongs: List<UnifiedSong>): List<String> {
@@ -201,28 +238,57 @@ private object TvPinyinSearchHelper {
         val qLower = q.lowercase()
         val suggestions = LinkedHashSet<String>()
 
-        // 1. KTV 热门预设首字母精确/前缀匹配
+        // 1. KTV 热门预设首字母精确匹配优先
+        ktvPopularPresets.forEach { (initials, word) ->
+            if (initials.equals(q, ignoreCase = true)) {
+                suggestions.add(word)
+            }
+        }
+
+        // 2. 本地/NAS 曲库首字母完全一致（字数完全匹配）的歌名与歌手优先
+        val exactMatchingSongs = allSongs.filter {
+            getPinyinInitials(it.title) == qLower || getPinyinInitials(it.artist) == qLower
+        }.distinctBy { it.title.trim() }
+
+        exactMatchingSongs.forEach { song ->
+            if (suggestions.size >= 14) return suggestions.toList()
+            val titleInit = getPinyinInitials(song.title)
+            if (titleInit == qLower) {
+                suggestions.add(song.title.trim())
+            }
+            val artistInit = getPinyinInitials(song.artist)
+            if (artistInit == qLower && song.artist.isNotBlank() && song.artist != "未知歌手") {
+                suggestions.add(song.artist.trim())
+            }
+        }
+
+        // 3. KTV 预设前缀匹配
         ktvPopularPresets.forEach { (initials, word) ->
             if (initials.uppercase().startsWith(q) || word.uppercase().contains(q)) {
                 suggestions.add(word)
             }
         }
 
-        // 2. 从本地/NAS 曲库提取匹配该首字母的歌手与歌名
-        for (song in allSongs) {
+        // 4. 曲库前缀匹配（按字数升序排列，短的在前！）
+        val prefixMatching = allSongs.filter {
+            getPinyinInitials(it.title).startsWith(qLower) || getPinyinInitials(it.artist).startsWith(qLower)
+        }.distinctBy { it.title.trim() }
+         .sortedBy { it.title.length }
+
+        for (song in prefixMatching) {
             if (suggestions.size >= 14) break
-            val artist = song.artist.trim()
-            if (artist.isNotBlank() && artist != "未知歌手") {
-                val artistInit = getPinyinInitials(artist)
-                if (artistInit.startsWith(qLower) || artist.lowercase().contains(qLower)) {
-                    suggestions.add(artist)
-                }
-            }
             val title = song.title.trim()
             if (title.isNotBlank()) {
                 val titleInit = getPinyinInitials(title)
-                if (titleInit.startsWith(qLower) || title.lowercase().contains(qLower)) {
+                if (titleInit.startsWith(qLower)) {
                     suggestions.add(title)
+                }
+            }
+            val artist = song.artist.trim()
+            if (artist.isNotBlank() && artist != "未知歌手") {
+                val artistInit = getPinyinInitials(artist)
+                if (artistInit.startsWith(qLower)) {
+                    suggestions.add(artist)
                 }
             }
         }
@@ -235,6 +301,14 @@ private object TvPinyinSearchHelper {
  * - 左侧：应用内首字母/数字快速搜索软键盘（A-Z、0-9、退格、清空、立即搜索、系统输入法）+ 首字母智能联想词条
  * - 右侧：在线音源切换胶囊 + 媒体库/全网搜索结果双路展示
  */
+
+/**
+ * 在线搜索结果每页条数（TV / 车机端）。
+ * 大屏一屏能排下的行数比手机少，且遥控器逐行移动比手指滑动慢得多，
+ * 所以这里刻意用比手机（20 首/页）更小的页容量，翻页代价更低。
+ */
+private const val ONLINE_SEARCH_PAGE_SIZE = 12
+
 @Composable
 fun LibrarySearchDialog(
     allSongs: List<UnifiedSong>,
@@ -249,7 +323,8 @@ fun LibrarySearchDialog(
     onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { song, _, _ -> onDownloadSong(song) },
     initialOnlineSource: OnlineMusicSource = OnlineMusicSource.KUWO,
     onOnlineSourceChanged: ((OnlineMusicSource) -> Unit)? = null,
-    onOnlineSearch: (suspend (keyword: String, source: OnlineMusicSource) -> List<UnifiedSong>)? = null,
+    // page/limit 透传给服务端 /api/search，实现搜索结果翻页；每页条数由调用方按客户端注入
+    onOnlineSearch: (suspend (keyword: String, source: OnlineMusicSource, page: Int, limit: Int) -> List<UnifiedSong>)? = null,
     onParseExternalPlaylist: (suspend (url: String, source: OnlineMusicSource) -> List<UnifiedSong>)? = null,
     isServerConnected: Boolean = true,
     contentPadding: PaddingValues = PaddingValues(0.dp),
@@ -269,8 +344,19 @@ fun LibrarySearchDialog(
     var selectedResultTab by remember { mutableIntStateOf(0) } // 0: 全部结果, 1: 全网在线, 2: 本地/NAS曲库
     var showSystemKeyboardDialog by remember { mutableStateOf(false) }
     var manualSearchTrigger by remember { mutableIntStateOf(0) }
+    // 在线结果翻页：服务端 /api/search 原生支持 page/limit，这里只维护当前页码。
+    // hasMore 用「本页返回条数是否已满」推断，因为服务端响应里没有 total/pages 字段。
+    var onlinePage by remember { mutableIntStateOf(1) }
+    var onlinePageHasMore by remember { mutableStateOf(false) }
 
     val firstKeyFocusRequester = remember { FocusRequester() }
+
+    // 关键词 / 音源一变就回到第 1 页。
+    // 放在下面取数 effect 之前：两者同帧重启时，本 effect 先把页码归位，
+    // 取数 effect 因页码变化被取消重启，350ms 防抖期内不会真的发出多余请求。
+    LaunchedEffect(query, selectedSource) {
+        if (onlinePage != 1) onlinePage = 1
+    }
 
     // 首字母智能联想词（当用户输入如 ZJL 时自动映射“周杰伦”用于联想芯片及在线搜索优化）
     val smartSuggestions = remember(query, allSongs) {
@@ -278,9 +364,10 @@ fun LibrarySearchDialog(
     }
 
     // 在线全网搜索协程（运行在 Dispatchers.IO，当输入纯首字母缩写且命中 KTV 预设或曲库歌手时自动使用展开词或原词检索）
-    LaunchedEffect(query, selectedSource, manualSearchTrigger, onOnlineSearch) {
+    LaunchedEffect(query, selectedSource, manualSearchTrigger, onOnlineSearch, onlinePage) {
         if (query.isBlank()) {
             onlineResults = emptyList()
+            onlinePageHasMore = false
             isSearchingOnline = false
             return@LaunchedEffect
         }
@@ -292,6 +379,7 @@ fun LibrarySearchDialog(
                     onParseExternalPlaylist(trimmed, selectedSource)
                 }
                 onlineResults = parsed
+                onlinePageHasMore = false
                 isSearchingOnline = false
             } catch (ce: kotlinx.coroutines.CancellationException) {
                 throw ce
@@ -309,13 +397,21 @@ fun LibrarySearchDialog(
         if (manualSearchTrigger == 0) {
             delay(350)
         }
-        // 如果输入的是全英文缩写（如 ZJL、QT），优先看是否有精确匹配的预设中文词或曲库智能联想词，提升全网音源搜索命中率
+        // 如果输入的是全英文缩写（如 ZJL、QT），优先看是否有精确匹配的预设中文词或曲库严格匹配词，提升全网音源搜索命中率
         val exactPreset = TvPinyinSearchHelper.ktvPopularPresets.firstOrNull {
             it.first.equals(trimmed, ignoreCase = true)
         }?.second
         val effectiveOnlineKeyword = exactPreset
             ?: if (trimmed.all { it.isLetter() && it.code < 128 } && smartSuggestions.isNotEmpty()) {
-                smartSuggestions.first()
+                val firstSuggestion = smartSuggestions.first()
+                val suggestionInit = TvPinyinSearchHelper.getPinyinInitials(firstSuggestion)
+                // 只有当联想词的拼音首字母与输入严格匹配（如2字母对应2字歌名），才自动展开；
+                // 严禁将2字母缩写盲目展开为7个字的歌曲（如输入 KX 展开为“可惜我是水瓶座”导致全屏重复歌曲）
+                if (suggestionInit.equals(trimmed, ignoreCase = true)) {
+                    firstSuggestion
+                } else {
+                    trimmed
+                }
             } else {
                 trimmed
             }
@@ -323,9 +419,11 @@ fun LibrarySearchDialog(
         isSearchingOnline = true
         try {
             val fetched = withContext(Dispatchers.IO) {
-                onOnlineSearch(effectiveOnlineKeyword, selectedSource)
+                onOnlineSearch(effectiveOnlineKeyword, selectedSource, onlinePage, ONLINE_SEARCH_PAGE_SIZE)
             }
             onlineResults = fetched
+            // 服务端响应没有 total/pages 字段，只能用"本页装满没有"来推断还有没有下一页
+            onlinePageHasMore = fetched.size >= ONLINE_SEARCH_PAGE_SIZE
             isSearchingOnline = false
         } catch (ce: kotlinx.coroutines.CancellationException) {
             throw ce
@@ -341,21 +439,27 @@ fun LibrarySearchDialog(
     val activeTaskMatchKey = com.lm.player.core.media.DownloadEngine.structuralMatchKey(activeDownloadTasks())
     val resolvedOnlineResults = remember(onlineResults, allSongs, activeTaskMatchKey) {
         val tasks = activeDownloadTasks()
-        if (onlineResults.isEmpty()) onlineResults
+        val rawList = if (onlineResults.isEmpty()) onlineResults
         else com.lm.player.core.media.SongMatchingResolver.resolveSongList(
             incomingSongs = onlineResults,
             allCachedSongs = allSongs,
             activeTasks = tasks
         )
+        // 消除全网在线搜索结果里的重复歌曲（按歌名和歌手去重，保留最高音质/首个版本）
+        rawList.distinctBy { "${it.title.trim().lowercase()}_${it.artist.trim().lowercase()}" }
     }
 
-    // 本地/NAS 曲库搜索结果（支持歌名/歌手/专辑关键字 + 拼音首字母快速检索，限制最多展示150首防止大列表卡顿）
+    // 本地/NAS 曲库搜索结果（按匹配精密度权重打分排序：首字母完全对齐优先，字数少者靠前，去重并限制最多展示150首）
     val searchResults = remember(query, allSongs) {
         if (query.isBlank()) {
             emptyList()
         } else {
             allSongs.asSequence()
-                .filter { TvPinyinSearchHelper.matchesSong(it, query) }
+                .map { song -> song to TvPinyinSearchHelper.scoreSong(song, query) }
+                .filter { it.second > 0 }
+                .sortedWith(compareByDescending<Pair<UnifiedSong, Int>> { it.second }.thenBy { it.first.title.length })
+                .map { it.first }
+                .distinctBy { "${it.title.trim().lowercase()}_${it.artist.trim().lowercase()}" }
                 .take(150)
                 .toList()
         }
@@ -496,7 +600,7 @@ fun LibrarySearchDialog(
                         }
                     }
 
-                    // 3. 快捷功能按键行：[退格] [清空] [全拼/链接] [立即搜索]
+                    // 3. 快捷功能按键行：[退格] [清空] [搜索]
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -555,37 +659,12 @@ fun LibrarySearchDialog(
                             }
                         }
 
-                        // 全拼/链接输入
-                        Surface(
-                            shape = RoundedCornerShape(10.dp),
-                            color = MaterialTheme.colorScheme.surface,
-                            border = BorderStroke(1.dp, borderColor),
-                            modifier = Modifier
-                                .weight(1.1f)
-                                .height(36.dp)
-                                .tvFocusable(
-                                    shape = RoundedCornerShape(10.dp),
-                                    focusedScale = 1.05f,
-                                    onClick = { showSystemKeyboardDialog = true }
-                                )
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxSize(),
-                                horizontalArrangement = Arrangement.Center,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(Icons.Default.Keyboard, contentDescription = null, modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurface)
-                                Spacer(modifier = Modifier.width(3.dp))
-                                Text("全拼/链接", fontSize = dimensions.badgeSize, fontWeight = FontWeight.SemiBold)
-                            }
-                        }
-
-                        // 立即搜索 (AppleRed 高亮按钮 + 金色获焦外框)
+                        // 搜索 (AppleRed 高亮按钮 + 金色获焦外框)
                         Surface(
                             shape = RoundedCornerShape(10.dp),
                             color = AppleRed,
                             modifier = Modifier
-                                .weight(1.1f)
+                                .weight(1.2f)
                                 .height(36.dp)
                                 .tvFocusable(
                                     shape = RoundedCornerShape(10.dp),
@@ -600,8 +679,8 @@ fun LibrarySearchDialog(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color.White)
-                                Spacer(modifier = Modifier.width(3.dp))
-                                Text("全网搜", fontSize = dimensions.badgeSize, fontWeight = FontWeight.Bold, color = Color.White)
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("搜索", fontSize = dimensions.badgeSize, fontWeight = FontWeight.Bold, color = Color.White)
                             }
                         }
                     }
@@ -1050,6 +1129,19 @@ fun LibrarySearchDialog(
                                     }
                                 )
                             }
+                            // 翻页条：每页 ONLINE_SEARCH_PAGE_SIZE 首，由服务端按 page 取。
+                            // 只在「不在第一页」或「还有下一页」时出现，空结果不会挂一个没用的翻页条。
+                            if (onlinePage > 1 || onlinePageHasMore) {
+                                item(key = "online_pager") {
+                                    TvSearchPagerBar(
+                                        page = onlinePage,
+                                        hasMore = onlinePageHasMore,
+                                        isLoading = isSearchingOnline,
+                                        onPrev = { if (onlinePage > 1) onlinePage -= 1 },
+                                        onNext = { if (onlinePageHasMore) onlinePage += 1 }
+                                    )
+                                }
+                            }
                         }
 
                         // 媒体库（本地与 NAS 曲库）结果
@@ -1165,3 +1257,105 @@ fun LibrarySearchDialog(
     }
 }
 
+
+/**
+ * 搜索结果翻页条 (TV / 车机)。
+ * 在线结果由服务端 /api/search 的 page/limit 分页，这里只负责切换页码与展示当前页。
+ *
+ * 复用 PlatformModeWizard 的「焦点围栏」约定：上下穿越一律 Cancel，左右在
+ * 「上一页 / 下一页」两个按钮之间互跳，光标永远被限制在这两个选项内，不会跑丢到别的控件上。
+ */
+@Composable
+private fun TvSearchPagerBar(
+    page: Int,
+    hasMore: Boolean,
+    isLoading: Boolean,
+    onPrev: () -> Unit,
+    onNext: () -> Unit
+) {
+    val dimensions = LocalAppDimensions.current
+    val prevFocusRequester = remember { FocusRequester() }
+    val nextFocusRequester = remember { FocusRequester() }
+    val canPrev = page > 1 && !isLoading
+    val canNext = hasMore && !isLoading
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = dimensions.scale(10.dp), bottom = dimensions.scale(4.dp)),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        TvSearchPagerChip(
+            text = "上一页",
+            enabled = canPrev,
+            onClick = onPrev,
+            modifier = Modifier
+                .focusRequester(prevFocusRequester)
+                .focusProperties {
+                    up = FocusRequester.Cancel
+                    down = FocusRequester.Cancel
+                    left = FocusRequester.Cancel
+                    right = nextFocusRequester
+                }
+        )
+        Text(
+            text = if (isLoading) "第 $page 页 · 加载中" else "第 $page 页",
+            fontSize = dimensions.bodySize,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = dimensions.scale(16.dp))
+        )
+        TvSearchPagerChip(
+            text = "下一页",
+            enabled = canNext,
+            onClick = onNext,
+            modifier = Modifier
+                .focusRequester(nextFocusRequester)
+                .focusProperties {
+                    up = FocusRequester.Cancel
+                    down = FocusRequester.Cancel
+                    left = prevFocusRequester
+                    right = FocusRequester.Cancel
+                }
+        )
+    }
+}
+
+@Composable
+private fun TvSearchPagerChip(
+    text: String,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val dimensions = LocalAppDimensions.current
+    Surface(
+        shape = RoundedCornerShape(50),
+        color = if (enabled) {
+            AppleRed.copy(alpha = 0.16f)
+        } else {
+            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f)
+        },
+        border = BorderStroke(
+            1.dp,
+            if (enabled) AppleRed.copy(alpha = 0.45f) else Color.Transparent
+        ),
+        modifier = modifier.tvFocusable(
+            shape = RoundedCornerShape(50),
+            enabled = enabled,
+            onClick = onClick
+        )
+    ) {
+        Text(
+            text = text,
+            fontSize = dimensions.bodySize,
+            fontWeight = FontWeight.SemiBold,
+            color = if (enabled) AppleRed else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+            modifier = Modifier.padding(
+                horizontal = dimensions.scale(22.dp),
+                vertical = dimensions.scale(10.dp)
+            )
+        )
+    }
+}

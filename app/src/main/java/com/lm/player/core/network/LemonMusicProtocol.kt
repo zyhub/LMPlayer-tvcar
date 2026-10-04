@@ -2316,7 +2316,10 @@ class LemonMusicProtocol(
         fallbackTitle: String? = null,
         fallbackArtist: String? = null,
         refresh: Boolean = false,
-        allowSearchFallback: Boolean = true
+        allowSearchFallback: Boolean = true,
+        // 「跨平台同档补源」调用时置 true：调用方刚刚在本平台试过同一档，直接跳到搜索补源阶段，
+        // 避免对同一个 songId 连发两次必然失败的取链请求。
+        skipDirectAttempt: Boolean = false
     ): Result<String> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticated()
@@ -2470,9 +2473,15 @@ class LemonMusicProtocol(
                 return Pair(code, body)
             }
 
-            val (firstCode, firstBody) = requestPlayUrlWithSourceFallback(actualSource, rawId, metaJson)
-            if (firstCode in 200..299) {
-                parsePlayUrlFromBody(firstBody)?.let { return@withContext Result.success(it) }
+            var firstCode = -1
+            var firstBody = ""
+            if (!skipDirectAttempt) {
+                val (code, body) = requestPlayUrlWithSourceFallback(actualSource, rawId, metaJson)
+                firstCode = code
+                firstBody = body
+                if (code in 200..299) {
+                    parsePlayUrlFromBody(body)?.let { return@withContext Result.success(it) }
+                }
             }
 
             // 仅在允许搜索回退且该歌曲自身的所有音质尝试均失败时，才通过搜索补全同版本曲目元数据重试（严格校验版本一致性，绝不回退到非匹配的首个搜索结果）
@@ -2507,21 +2516,31 @@ class LemonMusicProtocol(
                 }
             }
 
-            val errMsg = runCatching {
+            val errMsg = if (firstBody.isNotBlank()) runCatching {
                 val json = JSONObject(firstBody)
                 json.optString("error").ifBlank { json.optString("msg") }
-            }.getOrNull()
-            Result.failure(Exception(errMsg?.ifBlank { null } ?: "获取在线播放地址失败 (HTTP $firstCode)"))
+            }.getOrNull() else null
+            val reason = when {
+                !errMsg.isNullOrBlank() -> errMsg
+                firstCode >= 0 -> "获取在线播放地址失败 (HTTP $firstCode)"
+                else -> "当前平台无此音质，且未找到可用的同名同版本跨平台音源"
+            }
+            Result.failure(Exception(reason))
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
     /**
-     * 按用户设置的试听音质及逐级回退策略 (flac24bit -> flac -> 320k -> 128k) 解析在线播放地址，
-     * 并返回实际生效的音质、格式与比特率，以便播放器界面实时展示准确音质标签。
-     * 优先在当前歌曲自身的 ID/metaJson 上完成全音质阶梯回退（避免因高音质不可用而过早跨源搜索串歌至录音室版），
-     * 仅当自身所有音质均失败时才启用版本严格匹配的搜索回退。
+     * 按用户设置的试听音质解析在线播放地址，并返回实际生效的音质、格式与比特率。
+     *
+     * 回退顺序：每一档音质都先「本平台本曲目取链」，失败后立刻「跨平台同档补源」，
+     * 本档在所有平台都拿不到才降到下一档，如此重复 (flac24bit -> flac -> 320k -> 128k)。
+     *
+     * 之所以这么排：用户选了最高音质却播不出来，绝大多数情况是「当前平台没有这一档」，
+     * 而不是「这首歌没有高音质」。旧实现是本平台一路降到 128k 之后才跨平台、且固定按 320k 取链，
+     * 于是网易云明明有 flac 也会给用户放 320k 甚至 128k —— 这正是「选最高音质无法播放」的根因。
+     * 跨平台搜索仍然走版本严格匹配 (SongMatchingResolver.isSongMatch)，不会串到别的 Live/翻唱版本。
      */
     suspend fun resolveOnlineStreamWithQuality(
         songId: String,
@@ -2557,18 +2576,22 @@ class LemonMusicProtocol(
                 detectedFormat == "mp3" && (cleanPath.contains("128") && !cleanPath.contains("320") && qEnum != AudioQuality.Q_320K) -> 128
                 else -> qEnum.bitrate
             }
-            Log.i(TAG, "Resolved online stream [$songId] requested=$preferredQuality -> active=$qKey ($detectedFormat ${detectedBitRate}kbps)")
+            val requestedQuality = AudioQuality.fromKey(preferredQuality)
+            val isDowngraded = qEnum.bitrate < requestedQuality.bitrate
+            Log.i(TAG, "Resolved online stream [$songId] requested=$preferredQuality -> active=$qKey (downgraded=$isDowngraded, $detectedFormat ${detectedBitRate}kbps)")
             return ResolvedOnlineStream(
                 url = url,
                 qualityKey = qKey,
                 format = detectedFormat,
-                bitRate = detectedBitRate
+                bitRate = detectedBitRate,
+                isDowngraded = isDowngraded
             )
         }
 
-        // 第一轮：仅针对当前歌曲自身的 songId 与 metaJson 逐级尝试音质，禁止跨曲搜索替换，确保 Live/黑胶等特定版本原汁原味播放
+        // 逐档下探：每一档都先走本平台，再走跨平台同档补源，本档彻底拿不到才降一档重来
         for ((index, qKey) in candidateQualities.withIndex()) {
-            val res = resolveOnlineStreamUrl(
+            // 1) 本平台、本曲目自身 ID/metaJson 取链，禁止跨曲搜索替换，确保 Live/黑胶等特定版本原汁原味播放
+            val directRes = resolveOnlineStreamUrl(
                 songId = songId,
                 source = source,
                 quality = qKey,
@@ -2578,31 +2601,27 @@ class LemonMusicProtocol(
                 refresh = refresh || index > 0,
                 allowSearchFallback = false
             )
-            val url = res.getOrNull()
-            if (!url.isNullOrBlank()) {
-                return@withContext Result.success(buildResolvedStream(url, qKey))
-            } else {
-                lastError = res.exceptionOrNull()
+            directRes.getOrNull()?.takeIf { it.isNotBlank() }?.let {
+                return@withContext Result.success(buildResolvedStream(it, qKey))
             }
-        }
+            lastError = directRes.exceptionOrNull() ?: lastError
 
-        // 第二轮：若当前歌曲自身 ID 在所有音质下均无法取链，启用严格版本匹配的搜索回退
-        val fallbackQuality = candidateQualities.firstOrNull { it == AudioQuality.Q_320K.key } ?: candidateQualities.last()
-        val fallbackRes = resolveOnlineStreamUrl(
-            songId = songId,
-            source = source,
-            quality = fallbackQuality,
-            metaJson = metaJson,
-            fallbackTitle = fallbackTitle,
-            fallbackArtist = fallbackArtist,
-            refresh = true,
-            allowSearchFallback = true
-        )
-        val fallbackUrl = fallbackRes.getOrNull()
-        if (!fallbackUrl.isNullOrBlank()) {
-            return@withContext Result.success(buildResolvedStream(fallbackUrl, fallbackQuality))
-        } else {
-            lastError = fallbackRes.exceptionOrNull() ?: lastError
+            // 2) 同档跨平台补源：本平台没有这一档时，先去其它平台找同名同版本曲目，仍按当前这一档取链
+            val crossRes = resolveOnlineStreamUrl(
+                songId = songId,
+                source = source,
+                quality = qKey,
+                metaJson = metaJson,
+                fallbackTitle = fallbackTitle,
+                fallbackArtist = fallbackArtist,
+                refresh = true,
+                allowSearchFallback = true,
+                skipDirectAttempt = true
+            )
+            crossRes.getOrNull()?.takeIf { it.isNotBlank() }?.let {
+                return@withContext Result.success(buildResolvedStream(it, qKey))
+            }
+            lastError = crossRes.exceptionOrNull() ?: lastError
         }
 
         Result.failure(lastError ?: Exception("未能获取可用的在线播放流地址"))

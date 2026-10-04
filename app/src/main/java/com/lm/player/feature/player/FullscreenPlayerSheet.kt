@@ -251,7 +251,8 @@ fun FullscreenPlayerSheet(
     val lyricsCardPillSelectedBg = if (isDark) Color(0xFF3C3C45) else Color(0xFFFFFFFF)
 
     // 手机版同款 3 大音频规格标签（音质、码率、文件大小）
-    val isLocalOffline = !song.localFilePath.isNullOrBlank() || song.downloadStatus == com.lm.player.core.model.DownloadStatus.DOWNLOADED
+    val isLocalOffline = !song.localFilePath.isNullOrBlank() && 
+        (song.localFilePath!!.startsWith("content://") || runCatching { java.io.File(song.localFilePath!!).let { it.exists() && it.length() > 0L } }.getOrDefault(false))
     val (realExt, realBitRate, realSizeStr) = remember(song.id, song.localFilePath, song.format) {
         com.lm.player.feature.home.resolveRealLocalFormatAndSize(song)
     }
@@ -1105,6 +1106,8 @@ fun FullscreenPlayerSheet(
                                         }
 
                                         // 4. 下载与缓存
+                                        val hasPhysicalLocal = !song.localFilePath.isNullOrBlank() && 
+                                            (song.localFilePath!!.startsWith("content://") || runCatching { java.io.File(song.localFilePath!!).let { it.exists() && it.length() > 0L } }.getOrDefault(false))
                                         Box {
                                             Box(
                                                 modifier = Modifier
@@ -1128,7 +1131,7 @@ fun FullscreenPlayerSheet(
                                                     .background(neteaseBtnBg),
                                                 contentAlignment = Alignment.Center
                                             ) {
-                                                val isDownloaded = song.downloadStatus == DownloadStatus.DOWNLOADED || song.localFilePath != null
+                                                val isDownloaded = hasPhysicalLocal && (song.downloadStatus == DownloadStatus.DOWNLOADED || !song.localFilePath.isNullOrBlank())
                                                 Icon(
                                                     imageVector = if (isDownloaded) Icons.Default.CheckCircle else Icons.Default.FileDownload,
                                                     contentDescription = "下载",
@@ -1144,7 +1147,7 @@ fun FullscreenPlayerSheet(
                                                 },
                                                 song = song,
                                                 isServerConnected = isServerConnected,
-                                                hasLocal = song.downloadStatus == DownloadStatus.DOWNLOADED || song.localFilePath != null,
+                                                hasLocal = hasPhysicalLocal,
                                                 hasServer = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online",
                                                 onConfirm = { target, quality ->
                                                     showLandscapeDownloadMenu = false
@@ -1429,6 +1432,8 @@ fun FullscreenPlayerSheet(
                             }
 
                             // 缓存与下载
+                            val hasPhysicalLocal = !song.localFilePath.isNullOrBlank() && 
+                                (song.localFilePath!!.startsWith("content://") || runCatching { java.io.File(song.localFilePath!!).let { it.exists() && it.length() > 0L } }.getOrDefault(false))
                             Box {
                                 Box(
                                     modifier = Modifier
@@ -1449,7 +1454,7 @@ fun FullscreenPlayerSheet(
                                         .background(circleButtonBg),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    val isDownloaded = song.downloadStatus == DownloadStatus.DOWNLOADED || song.localFilePath != null
+                                    val isDownloaded = hasPhysicalLocal && (song.downloadStatus == DownloadStatus.DOWNLOADED || !song.localFilePath.isNullOrBlank())
                                     val isServerCached = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online"
                                     if (isDownloaded && isServerCached) {
                                         Icon(Icons.Default.CheckCircle, contentDescription = "双端已同步", tint = Color(0xFF34C759), modifier = Modifier.size(20.dp))
@@ -1467,7 +1472,7 @@ fun FullscreenPlayerSheet(
                                     },
                                     song = song,
                                     isServerConnected = isServerConnected,
-                                    hasLocal = song.downloadStatus == DownloadStatus.DOWNLOADED || song.localFilePath != null,
+                                    hasLocal = hasPhysicalLocal,
                                     hasServer = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online",
                                     onConfirm = { target, quality ->
                                         showLandscapeDownloadMenu = false
@@ -2515,6 +2520,8 @@ fun FullscreenPlayerSheet(
                         }
 
                         // 下载与缓存选择按钮 (支持本地/服务器/双端同步选择)
+                        val hasPhysicalLocal = !song.localFilePath.isNullOrBlank() && 
+                            (song.localFilePath!!.startsWith("content://") || runCatching { java.io.File(song.localFilePath!!).let { it.exists() && it.length() > 0L } }.getOrDefault(false))
                         Box {
                             Box(
                                 modifier = Modifier
@@ -2524,7 +2531,7 @@ fun FullscreenPlayerSheet(
                                     .clickable { showDownloadMenu = true },
                                 contentAlignment = Alignment.Center
                             ) {
-                                val isDownloaded = song.downloadStatus == DownloadStatus.DOWNLOADED || song.localFilePath != null
+                                val isDownloaded = hasPhysicalLocal && (song.downloadStatus == DownloadStatus.DOWNLOADED || !song.localFilePath.isNullOrBlank())
                                 val isServerCached = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online"
                                 if (isDownloaded && isServerCached) {
                                     Icon(
@@ -2555,7 +2562,7 @@ fun FullscreenPlayerSheet(
                                 onDismissRequest = { showDownloadMenu = false },
                                 song = song,
                                 isServerConnected = isServerConnected,
-                                hasLocal = song.downloadStatus == DownloadStatus.DOWNLOADED || song.localFilePath != null,
+                                hasLocal = hasPhysicalLocal,
                                 hasServer = song.serverId.isNotBlank() && song.serverId != "local_storage" && song.serverId != "lemon_online",
                                 onConfirm = { target, quality ->
                                     showDownloadMenu = false

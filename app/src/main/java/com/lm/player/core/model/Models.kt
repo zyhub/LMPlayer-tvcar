@@ -393,7 +393,8 @@ data class ResolvedOnlineStream(
     val url: String,
     val qualityKey: String,
     val format: String,
-    val bitRate: Int
+    val bitRate: Int,
+    val isDowngraded: Boolean = false
 )
 
 @Immutable

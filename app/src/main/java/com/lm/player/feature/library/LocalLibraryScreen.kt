@@ -73,6 +73,9 @@ import kotlinx.coroutines.launch
 @Composable
 fun LocalLibraryScreen(
     allSongs: List<UnifiedSong>,
+    // 「我喜欢的音乐」的数据源由宿主注入：在线模式=服务器收藏，本地/已下载模式=服务器收藏 ∩ 已下载。
+    // 为空时回落到 allSongs.filter { isFavorite }，保证断网等异常场景下收藏卡片不会整块消失。
+    favoriteSongs: List<UnifiedSong> = emptyList(),
     downloadedSongs: List<UnifiedSong> = emptyList(),
     recentlyPlayedSongs: List<UnifiedSong> = emptyList(),
     playlists: List<UnifiedPlaylist> = emptyList(),
@@ -186,7 +189,9 @@ fun LocalLibraryScreen(
         if (downloadedSongs.isNotEmpty()) {
             downloadedSongs
         } else {
-            allSongs.filter { it.downloadStatus == DownloadStatus.DOWNLOADED || !it.localFilePath.isNullOrBlank() }
+            allSongs.filter { 
+                !it.localFilePath.isNullOrBlank() && (it.localFilePath!!.startsWith("content://") || java.io.File(it.localFilePath!!).exists())
+            }
         }
     }
     // 最近播放聚合：优先使用宿主注入的真实播放足迹，退回本地库前 30 首兜底展示
@@ -198,8 +203,11 @@ fun LocalLibraryScreen(
     val selectedDownloadSongIds = remember { mutableStateListOf<String>() }
     var showBatchDeleteLocalDialog by remember { mutableStateOf(false) }
 
-    // 我喜欢的音乐实时聚合与下钻视图联动刷新
-    val favSongs = remember(allSongs) { allSongs.filter { it.isFavorite } }
+    // 我喜欢的音乐实时聚合与下钻视图联动刷新。
+    // 优先用宿主注入的服务器收藏口径，只有宿主拿不到时才退回本地 isFavorite 标记。
+    val favSongs = remember(allSongs, favoriteSongs) {
+        if (favoriteSongs.isNotEmpty()) favoriteSongs else allSongs.filter { it.isFavorite }
+    }
     LaunchedEffect(favSongs) {
         if (activeSubViewTitle == "我喜欢的音乐") {
             activeSubViewSongs = favSongs
@@ -405,7 +413,6 @@ fun LocalLibraryScreen(
         if (activeSubViewTitle == null) {
             val goldColor = Color(0xFFFFC947)
             val cardBg = if (isDark) Color(0xFF212532).copy(alpha = 0.92f) else MaterialTheme.colorScheme.surface.copy(alpha = 0.94f)
-            val favSongs = remember(allSongs) { allSongs.filter { it.isFavorite } }
 
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
@@ -1921,7 +1928,6 @@ fun LocalLibraryScreen(
 
                         // B. 我喜欢的音乐
                         item {
-                            val favSongs = allSongs.filter { it.isFavorite }
                             PlaylistSpecialCard(
                                 title = "我喜欢的音乐",
                                 subtitle = "${favSongs.size} 首歌曲",

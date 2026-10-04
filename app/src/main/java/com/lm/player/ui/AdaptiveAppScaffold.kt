@@ -445,7 +445,7 @@ private fun TvPersistentVinylPlayerCard(
         } else {
             val hasLocalFile = !song.localFilePath.isNullOrBlank() &&
                 (song.localFilePath.startsWith("content://") || java.io.File(song.localFilePath).exists())
-            if (hasLocalFile || song.downloadStatus == DownloadStatus.DOWNLOADED) {
+            if (hasLocalFile) {
                 val (realExt, realBitRate, realSizeStr) = com.lm.player.feature.home.resolveRealLocalFormatAndSize(song)
                 val isLossless = realExt in listOf("FLAC", "WAV", "APE", "ALAC", "DSD", "DSF") || realBitRate >= 800
                 val qLabel = when {

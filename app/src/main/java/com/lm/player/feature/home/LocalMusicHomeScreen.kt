@@ -265,8 +265,9 @@ fun SongListItemRow(
     }
     // 磁盘存在性检查并入 remember：原先每次重组都 stat 一次
     val isDownloaded = remember(song.id, song.localFilePath, song.downloadStatus) {
-        song.downloadStatus == DownloadStatus.DOWNLOADED ||
-                (!song.localFilePath.isNullOrBlank() && (song.localFilePath.startsWith("content://") || java.io.File(song.localFilePath).exists()))
+        val hasLocal = !song.localFilePath.isNullOrBlank() &&
+                (song.localFilePath.startsWith("content://") || java.io.File(song.localFilePath).exists())
+        hasLocal && (song.downloadStatus == DownloadStatus.DOWNLOADED || !song.localFilePath.isNullOrBlank())
     }
     val isDownloading = activeTask != null || song.downloadStatus == DownloadStatus.DOWNLOADING
     val currentProgress = activeTask?.progress ?: song.downloadProgress
