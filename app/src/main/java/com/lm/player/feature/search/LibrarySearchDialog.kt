@@ -1111,7 +1111,7 @@ fun LibrarySearchDialog(
                             }
                             itemsIndexed(
                                 items = resolvedOnlineResults,
-                                key = { idx, song -> "search_online_${idx}_${song.id}" },
+                                key = { _, song -> "search_online_${song.id}" },
                                 contentType = { _, _ -> "search_online_song_item" }
                             ) { _, song ->
                                 SongListItemRow(
@@ -1157,7 +1157,7 @@ fun LibrarySearchDialog(
                             }
                             itemsIndexed(
                                 items = searchResults,
-                                key = { idx, song -> "search_local_${idx}_${song.id}" },
+                                key = { _, song -> "search_local_${song.id}" },
                                 contentType = { _, _ -> "search_song_item" }
                             ) { _, song ->
                                 SongListItemRow(

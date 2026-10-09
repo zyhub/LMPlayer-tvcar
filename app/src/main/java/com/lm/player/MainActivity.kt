@@ -77,6 +77,7 @@ import com.lm.player.feature.library.LocalLibraryScreen
 import com.lm.player.feature.player.FullscreenPlayerSheet
 import com.lm.player.feature.search.LibrarySearchDialog
 import com.lm.player.feature.settings.AppUpdateDialog
+import com.lm.player.feature.settings.LocalFolderPickerDialog
 import com.lm.player.feature.settings.SettingsScreen
 import com.lm.player.ui.AdaptiveAppScaffold
 import com.lm.player.ui.PlatformModeWizard
@@ -360,6 +361,8 @@ class MainActivity : ComponentActivity() {
             // 不写入 playlists 表，避免为展示字段触发数据库版本升级导致用户数据被清空。
             var playlistPreviewCovers by remember { mutableStateOf<Map<String, List<String>>>(emptyMap()) }
             var recentlyAddedSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
+            var showCustomFolderPickerForDownload by remember { mutableStateOf(false) }
+            var showCustomFolderPickerForImport by remember { mutableStateOf(false) }
             // 「我喜欢的音乐」的口径来源：柠檬服务器收藏 (/api/library/user-data 的 favorites)。
             // 本地 Room 的 isFavorite 只是这份服务器收藏在本机的镜像，用它来枚举收藏会漏掉
             // 「在别的设备/网页端收藏、本机没同步过」的曲目，所以收藏列表一律以服务器为准。
@@ -1534,7 +1537,18 @@ class MainActivity : ComponentActivity() {
 
             val handleToggleFavorite: (UnifiedSong) -> Unit = { songToFav ->
                 val newFav = !songToFav.isFavorite
-                val updatedSong = songToFav.copy(isFavorite = newFav)
+                val isAutoCache = uiPrefs.getBoolean("auto_cache_on_favorite", false) ||
+                    uiPrefs.getBoolean("auto_cache_to_server_on_favorite", false)
+                val activeServer = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
+                    ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
+                val willCacheToServer = newFav && isAutoCache && activeServer != null
+                val targetServerId = activeServer?.id?.ifBlank { "lemon_music" } ?: "lemon_music"
+                val effectiveServerId = when {
+                    willCacheToServer && (songToFav.serverId.isBlank() || songToFav.serverId == "lemon_online" || songToFav.serverId == "default") -> targetServerId
+                    songToFav.serverId.isNotBlank() && songToFav.serverId != "lemon_online" -> songToFav.serverId
+                    else -> "lemon_online"
+                }
+                val updatedSong = songToFav.copy(isFavorite = newFav, serverId = effectiveServerId)
                 songList = if (songList.any { it.id == songToFav.id }) {
                     songList.map { if (it.id == songToFav.id) updatedSong else it }
                 } else {
@@ -1559,12 +1573,6 @@ class MainActivity : ComponentActivity() {
                     try {
                         val existing = database.songDao().getSongById(songToFav.id)
                         if (existing == null) {
-                            val activeSrv = serversList.firstOrNull { it.isCurrentActive } ?: serversList.firstOrNull()
-                            val effectiveServerId = when {
-                                songToFav.serverId.isNotBlank() && songToFav.serverId != "lemon_online" -> songToFav.serverId
-                                activeSrv != null -> activeSrv.id
-                                else -> "local_storage"
-                            }
                             database.songDao().insertSongs(
                                 listOf(
                                     SongEntity(
@@ -1577,7 +1585,7 @@ class MainActivity : ComponentActivity() {
                                         durationMs = updatedSong.durationMs,
                                         coverUrl = updatedSong.coverUrl,
                                         streamUrl = updatedSong.streamUrl,
-                                        serverId = effectiveServerId,
+                                        serverId = updatedSong.serverId,
                                         localFilePath = updatedSong.localFilePath,
                                         downloadStatus = updatedSong.downloadStatus,
                                         bitRate = updatedSong.bitRate,
@@ -1590,6 +1598,9 @@ class MainActivity : ComponentActivity() {
                             )
                         } else {
                             database.songDao().updateFavorite(songToFav.id, newFav)
+                            if (willCacheToServer) {
+                                database.songDao().updateServerId(songToFav.id, updatedSong.serverId)
+                            }
                         }
                         if (newFav) {
                             database.playlistDao().addSongToPlaylist(
@@ -1603,8 +1614,6 @@ class MainActivity : ComponentActivity() {
                         }
                         database.playlistDao().updateSongCount("lemon_favorites")
 
-                        val activeServer = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
-                            ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
                         if (activeServer != null) {
                             val protocol = LemonMusicProtocol(
                                 NetworkClientFactory.createOkHttpClient(this@MainActivity),
@@ -1616,8 +1625,34 @@ class MainActivity : ComponentActivity() {
                             syncServerPlaylists(activeServer)
                             val favs = protocol.getPlaylistSongs("lemon_favorites").getOrNull()
                             if (favs != null) {
+                                val mappedFavs = if (isAutoCache) {
+                                    favs.map { s ->
+                                        if (s.serverId == "lemon_online" || s.serverId.isBlank() || s.serverId == "default") {
+                                            s.copy(serverId = activeServer.id.ifBlank { "lemon_music" })
+                                        } else s
+                                    }
+                                } else favs
                                 withContext(Dispatchers.Main) {
-                                    serverFavoriteSongs = favs
+                                    serverFavoriteSongs = mappedFavs
+                                }
+                            }
+                            val isAutoCache = uiPrefs.getBoolean("auto_cache_on_favorite", false) ||
+                                uiPrefs.getBoolean("auto_cache_to_server_on_favorite", false)
+                            if (newFav && isAutoCache) {
+                                try {
+                                    val qKey = uiPrefs.getString("auto_cache_server_quality", null)
+                                        ?: uiPrefs.getString("default_download_quality", AudioQuality.Q_320K.key)
+                                        ?: AudioQuality.Q_320K.key
+                                    val targetQuality = AudioQuality.fromKey(qKey)
+                                    val serverTask = DownloadRequestPlanner.buildServerDownloadTask(updatedSong, targetQuality)
+                                    val cacheRes = protocol.addServerDownloadTasks(listOf(serverTask))
+                                    withContext(Dispatchers.Main) {
+                                        if (cacheRes.isSuccess) {
+                                            Toast.makeText(this@MainActivity, "已同步提交服务器缓存 [${targetQuality.badge}]", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    Log.w("MainActivity", "autoCacheOnFavorite error", e)
                                 }
                             }
                         }
@@ -2531,7 +2566,6 @@ class MainActivity : ComponentActivity() {
                                         onOpenDownloads = { navigateToScreen(Screen.DOWNLOADS) },
                                         onRefreshPlaylists = {
                                             if (activeConfig != null) {
-                                                Toast.makeText(this@MainActivity, "正在同步在线播放列表...", Toast.LENGTH_SHORT).show()
                                                 syncServerPlaylists(activeConfig)
                                             } else {
                                                 Toast.makeText(this@MainActivity, "当前处于本地模式，暂无在线歌单", Toast.LENGTH_SHORT).show()
@@ -2921,7 +2955,11 @@ class MainActivity : ComponentActivity() {
                                                 downloadEngine.updateSettings(updated)
                                                 Toast.makeText(this@MainActivity, "已成功设定并保存下载存储目录：$resolvedPath", Toast.LENGTH_SHORT).show()
                                             }
-                                            chooseDownloadDirectoryLauncher.launch(null)
+                                            try {
+                                                chooseDownloadDirectoryLauncher.launch(null)
+                                            } catch (_: Exception) {
+                                                showCustomFolderPickerForDownload = true
+                                            }
                                         },
                                         onImportCustomFolder = {
                                             onImportFolderResult = { uri ->
@@ -2942,7 +2980,11 @@ class MainActivity : ComponentActivity() {
                                                     }
                                                 }
                                             }
-                                            importFolderLauncher.launch(null)
+                                            try {
+                                                importFolderLauncher.launch(null)
+                                            } catch (_: Exception) {
+                                                showCustomFolderPickerForImport = true
+                                            }
                                         },
                                         onExitAppCompletely = {
                                             exitAppCompletely()
@@ -3001,6 +3043,46 @@ class MainActivity : ComponentActivity() {
                                 onDismiss = { isSearchDialogOpen = false }
                             )
                         }
+
+                        if (showCustomFolderPickerForDownload) {
+                            LocalFolderPickerDialog(
+                                initialPath = downloadEngine.downloadSettings.value.customDownloadPath,
+                                onDismiss = { showCustomFolderPickerForDownload = false },
+                                onConfirm = { selectedPath ->
+                                    showCustomFolderPickerForDownload = false
+                                    if (selectedPath.isNotBlank()) {
+                                        val updated = downloadEngine.downloadSettings.value.copy(customDownloadPath = selectedPath)
+                                        downloadEngine.updateSettings(updated)
+                                        Toast.makeText(this@MainActivity, "已成功设定并保存下载存储目录：$selectedPath", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            )
+                        }
+
+                        if (showCustomFolderPickerForImport) {
+                            LocalFolderPickerDialog(
+                                initialPath = "",
+                                onDismiss = { showCustomFolderPickerForImport = false },
+                                onConfirm = { selectedPath ->
+                                    showCustomFolderPickerForImport = false
+                                    if (selectedPath.isNotBlank()) {
+                                        val existingFolders = uiPrefs.getStringSet("local_music_scan_folders", emptySet())?.toSet() ?: emptySet()
+                                        val updatedFolders = existingFolders + selectedPath
+                                        uiPrefs.edit().remove("local_music_scan_folders").apply()
+                                        uiPrefs.edit().putStringSet("local_music_scan_folders", updatedFolders).apply()
+                                        lifecycleScope.launch(Dispatchers.IO) {
+                                            val count = LocalMediaScanner.scanCustomDirectory(this@MainActivity, selectedPath, database)
+                                            val dlDir = downloadEngine.getDownloadDir()
+                                            val matched = LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, dlDir)
+                                            LocalMediaScanner.matchAndMergeLocalWithServer(database)
+                                            withContext(Dispatchers.Main) {
+                                                Toast.makeText(this@MainActivity, "扫描完成！成功导入 $count 首本地歌曲，比对匹配 $matched 首服务器歌曲已标为本地已下载", Toast.LENGTH_LONG).show()
+                                            }
+                                        }
+                                    }
+                                }
+                            )
+                        }
                         }
                     }
                         }
@@ -3008,7 +3090,8 @@ class MainActivity : ComponentActivity() {
                     // 全屏现代高保真音乐播放器弹窗 (支持横屏分屏歌词与多主题联动)
                     // 「全屏封面」主题采用自底部滑入/滑出的转场，其余主题保持淡入缩放
                     val useSlideTransition = playerThemeStyle ==
-                        com.lm.player.core.designsystem.theme.PlayerThemeStyle.NETEASE_TV_COVER
+                        com.lm.player.core.designsystem.theme.PlayerThemeStyle.NETEASE_TV_COVER ||
+                        playerThemeStyle == com.lm.player.core.designsystem.theme.PlayerThemeStyle.KARAOKE_COVER
                     AnimatedVisibility(
                         visible = isFullPlayerVisible && currentSong != null,
                         enter = if (useSlideTransition) {

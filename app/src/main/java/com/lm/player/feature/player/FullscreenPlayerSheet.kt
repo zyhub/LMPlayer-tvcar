@@ -216,8 +216,26 @@ fun FullscreenPlayerSheet(
 
     // 动态主题渐变背景 (深色沉浸黑曜石，浅色纯净白)。
     // remember 住 Brush：播放页重组频繁，每次都新建会持续产生 shader 垃圾
-    val playerBackdrop = remember(isDark) {
-        if (isDark) {
+    val playerBackdrop = remember(isDark, playerThemeStyle) {
+        if (playerThemeStyle == com.lm.player.core.designsystem.theme.PlayerThemeStyle.KARAOKE_COVER) {
+            if (isDark) {
+                Brush.verticalGradient(
+                    colors = listOf(
+                        Color(0xFF1E2028),
+                        Color(0xFF15161D),
+                        Color(0xFF0F1014)
+                    )
+                )
+            } else {
+                Brush.verticalGradient(
+                    colors = listOf(
+                        Color(0xFFEBE8E3),
+                        Color(0xFFE3DFD8),
+                        Color(0xFFD8D3CA)
+                    )
+                )
+            }
+        } else if (isDark) {
             Brush.verticalGradient(
                 colors = listOf(
                     Color(0xFF14171A),
@@ -241,10 +259,16 @@ fun FullscreenPlayerSheet(
     val surfaceGlassColor = if (isDark) Color(0xFF2C2C30).copy(alpha = 0.75f) else Color(0xFFEAEAEE).copy(alpha = 0.85f)
     val circleButtonBg = if (isDark) Color(0xFF25252A) else Color(0xFFF2F2F7)
 
-    // 「经典黑胶」主题右栏卡片卡片底色与文字色随主题联动：
-    // 浅色主题为灰白卡片 + 深色歌词，深色主题整体转为黑色卡片 + 浅色歌词，
-    // 避免深色模式下整屏播放界面里突兀地嵌一块高亮白卡，也保证卡内文字始终可读。
-    val lyricsCardBg = if (isDark) Color(0xFF16161A).copy(alpha = 0.95f) else Color(0xFFEBEBF0).copy(alpha = 0.95f)
+    // 右栏卡片卡片底色与文字色随主题联动：
+    // 「画卷逐字」采用通透极简无边框设计，经典黑胶采用灰白/黑色立体卡片
+    val isKaraokeTheme = playerThemeStyle == com.lm.player.core.designsystem.theme.PlayerThemeStyle.KARAOKE_COVER
+    val lyricsCardBg = if (isKaraokeTheme) {
+        Color.Transparent
+    } else if (isDark) {
+        Color(0xFF16161A).copy(alpha = 0.95f)
+    } else {
+        Color(0xFFEBEBF0).copy(alpha = 0.95f)
+    }
     val lyricsCardPrimary = if (isDark) Color(0xFFF2F2F7) else Color(0xFF1C1C1E)
     val lyricsCardSecondary = if (isDark) Color(0xFF9A9AA4) else Color(0xFF6B6B74)
     val lyricsCardPillBg = if (isDark) Color(0xFF2A2A31) else Color(0xFFD9D9E0)
@@ -536,8 +560,8 @@ fun FullscreenPlayerSheet(
             // TV 横屏客厅影院级布局：支持「经典黑胶分屏 (MODERN)」与「网易云全屏封面 (NETEASE_TV_COVER)」一键切换
             // =========================================================================
             // 歌词视窗宽度固定为 48%（已移除原可左右拖拽的「显示范围调节条」）
-            val effectiveLyricsRatio = 0.48f
-            val playerWeight = (1.0f - effectiveLyricsRatio).coerceIn(0.50f, 0.58f)
+            val effectiveLyricsRatio = if (playerThemeStyle == com.lm.player.core.designsystem.theme.PlayerThemeStyle.KARAOKE_COVER) 0.54f else 0.48f
+            val playerWeight = (1.0f - effectiveLyricsRatio).coerceIn(0.44f, 0.58f)
             val isLyricsVisible = true
             val rightPaneTargetFocus = if (landscapeRightPaneMode == 0) {
                 lyricsAdjustFocusRequester
@@ -1516,155 +1540,244 @@ fun FullscreenPlayerSheet(
                         }
                     }
 
-                    // 2. 酷我 TV 风格超大圆形黑胶唱片封面（播放时平滑旋转） + 歌名歌手与无损音质标签
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(18.dp)
-                    ) {
-                        // 大尺寸圆形黑胶唱片（带平滑旋转动画）。
-                        // 角度在 graphicsLayer 的 block 内读取，属于延迟读取：每帧只失效这一层，
-                        // 不会重组整个播放页。
-                        Box(
+                    // 2. 封面展示区：支持「画卷逐字」大圆角精选封面与「经典黑胶」旋转唱片
+                    if (playerThemeStyle == com.lm.player.core.designsystem.theme.PlayerThemeStyle.KARAOKE_COVER) {
+                        Column(
                             modifier = Modifier
-                                .size(220.dp)
-                                .shadow(20.dp, CircleShape)
-                                .clip(CircleShape)
-                                .graphicsLayer { rotationZ = vinylRotation.value }
-                                .background(
-                                    remember {
-                                        Brush.radialGradient(
-                                            colors = listOf(
-                                                Color(0xFF2E3240),
-                                                Color(0xFF14161E),
-                                                Color(0xFF242834),
-                                                Color(0xFF0E1016)
-                                            )
-                                        )
-                                    }
-                                )
-                                .border(2.dp, Color.White.copy(alpha = 0.16f), CircleShape),
-                            contentAlignment = Alignment.Center
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center
                         ) {
-                            // 唱片同心纹理环
-                            Box(
-                                modifier = Modifier
-                                    .size(196.dp)
-                                    .border(0.8.dp, Color.White.copy(alpha = 0.07f), CircleShape)
-                            )
-                            Box(
-                                modifier = Modifier
-                                    .size(174.dp)
-                                    .border(0.8.dp, Color.White.copy(alpha = 0.07f), CircleShape)
-                            )
-                            // 中央圆形专辑封面
+                            // 大圆角精选封面 (带柔和弥散光影和精致边框)
                             AlbumArtworkImage(
                                 model = song.coverUrl,
                                 seedId = song.id,
-                                targetSize = 480,
+                                targetSize = 640,
                                 modifier = Modifier
-                                    .size(150.dp)
-                                    .clip(CircleShape)
-                                    .border(2.dp, Color.Black.copy(alpha = 0.45f), CircleShape),
-                                cornerRadius = 75.dp
+                                    .size(240.dp)
+                                    .shadow(24.dp, RoundedCornerShape(24.dp))
+                                    .clip(RoundedCornerShape(24.dp))
+                                    .border(1.5.dp, if (isDark) Color.White.copy(alpha = 0.16f) else Color.Black.copy(alpha = 0.08f), RoundedCornerShape(24.dp)),
+                                cornerRadius = 24.dp
                             )
-                            // 黑胶中心轴孔
-                            Box(
-                                modifier = Modifier
-                                    .size(24.dp)
-                                    .clip(CircleShape)
-                                    .background(Color(0xFF181B24))
-                                    .border(2.dp, Color.White.copy(alpha = 0.30f), CircleShape)
-                            )
-                        }
-
-                        Column(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.Center
-                        ) {
+                            Spacer(modifier = Modifier.height(14.dp))
                             Text(
                                 text = song.title,
                                 style = TextStyle(
-                                    fontSize = 22.sp,
+                                    fontSize = 23.sp,
                                     fontWeight = FontWeight.ExtraBold,
                                     color = primaryTextColor
-                                ),
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Spacer(modifier = Modifier.height(6.dp))
-                            Text(
-                                text = song.artist,
-                                style = TextStyle(
-                                    fontSize = 15.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = secondaryTextColor
                                 ),
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = "专辑：${song.album.ifBlank { "单曲精选" }}",
+                                text = "${song.artist} · ${song.album.ifBlank { "单曲精选" }}",
                                 style = TextStyle(
-                                    fontSize = 12.sp,
-                                    color = secondaryTextColor.copy(alpha = 0.8f)
+                                    fontSize = 13.5.sp,
+                                    fontWeight = FontWeight.Normal,
+                                    color = secondaryTextColor
                                 ),
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
-                            Spacer(modifier = Modifier.height(10.dp))
+                            Spacer(modifier = Modifier.height(8.dp))
                             Row(
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                // 标签 1：音质 (如 无损 FLAC / Hi-Res FLAC) —— 统一淡黄
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = if (isDark) Color(0x33FFFFFF) else Color(0x1F000000)
+                                ) {
+                                    Text(
+                                        text = if (song.localFilePath != null) "本地" else "STRM",
+                                        fontSize = 10.5.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = primaryTextColor,
+                                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                                    )
+                                }
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = if (isDark) Color(0x33FFFFFF) else Color(0x1F000000)
+                                ) {
+                                    Text(
+                                        text = if (song.serverId.isNotBlank() && song.serverId != "local_storage") "首传" else "在线",
+                                        fontSize = 10.5.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = primaryTextColor,
+                                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                                    )
+                                }
                                 Surface(
                                     shape = RoundedCornerShape(6.dp),
                                     color = specBadgeContainer(SpecBadgeQualityColor),
                                     border = BorderStroke(0.8.dp, specBadgeBorder(SpecBadgeQualityColor))
                                 ) {
                                     Text(
-                                        text = displayQualityBadge,
+                                        text = displayQualityBadge.take(6),
                                         fontSize = 10.5.sp,
                                         fontWeight = FontWeight.ExtraBold,
                                         color = SpecBadgeQualityColor,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
                                         modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
                                     )
                                 }
-                                // 标签 2：码率 (如 960 kbps / 320 kbps) —— 统一淡绿
-                                Surface(
-                                    shape = RoundedCornerShape(6.dp),
-                                    color = specBadgeContainer(SpecBadgeBitrateColor),
-                                    border = BorderStroke(0.8.dp, specBadgeBorder(SpecBadgeBitrateColor))
-                                ) {
-                                    Text(
-                                        text = displayBitrateBadge,
-                                        fontSize = 10.5.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = SpecBadgeBitrateColor,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                            }
+                        }
+                    } else {
+                        // 酷我 TV 风格超大圆形黑胶唱片封面（播放时平滑旋转） + 歌名歌手与无损音质标签
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(18.dp)
+                        ) {
+                            // 大尺寸圆形黑胶唱片（带平滑旋转动画）。
+                            // 角度在 graphicsLayer 的 block 内读取，属于延迟读取：每帧只失效这一层，
+                            // 不会重组整个播放页。
+                            Box(
+                                modifier = Modifier
+                                    .size(220.dp)
+                                    .shadow(20.dp, CircleShape)
+                                    .clip(CircleShape)
+                                    .graphicsLayer { rotationZ = vinylRotation.value }
+                                    .background(
+                                        remember {
+                                            Brush.radialGradient(
+                                                colors = listOf(
+                                                    Color(0xFF2E3240),
+                                                    Color(0xFF14161E),
+                                                    Color(0xFF242834),
+                                                    Color(0xFF0E1016)
+                                                )
+                                            )
+                                        }
                                     )
-                                }
-                                // 标签 3：文件大小 (如 28.4 MB) —— 统一淡红
-                                Surface(
-                                    shape = RoundedCornerShape(6.dp),
-                                    color = specBadgeContainer(SpecBadgeSizeColor),
-                                    border = BorderStroke(0.8.dp, specBadgeBorder(SpecBadgeSizeColor))
+                                    .border(2.dp, Color.White.copy(alpha = 0.16f), CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                // 唱片同心纹理环
+                                Box(
+                                    modifier = Modifier
+                                        .size(196.dp)
+                                        .border(0.8.dp, Color.White.copy(alpha = 0.07f), CircleShape)
+                                )
+                                Box(
+                                    modifier = Modifier
+                                        .size(174.dp)
+                                        .border(0.8.dp, Color.White.copy(alpha = 0.07f), CircleShape)
+                                )
+                                // 中央圆形专辑封面
+                                AlbumArtworkImage(
+                                    model = song.coverUrl,
+                                    seedId = song.id,
+                                    targetSize = 480,
+                                    modifier = Modifier
+                                        .size(150.dp)
+                                        .clip(CircleShape)
+                                        .border(2.dp, Color.Black.copy(alpha = 0.45f), CircleShape),
+                                    cornerRadius = 75.dp
+                                )
+                                // 黑胶中心轴孔
+                                Box(
+                                    modifier = Modifier
+                                        .size(24.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFF181B24))
+                                        .border(2.dp, Color.White.copy(alpha = 0.30f), CircleShape)
+                                )
+                            }
+
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.Center
+                            ) {
+                                Text(
+                                    text = song.title,
+                                    style = TextStyle(
+                                        fontSize = 22.sp,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        color = primaryTextColor
+                                    ),
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = song.artist,
+                                    style = TextStyle(
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = secondaryTextColor
+                                    ),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "专辑：${song.album.ifBlank { "单曲精选" }}",
+                                    style = TextStyle(
+                                        fontSize = 12.sp,
+                                        color = secondaryTextColor.copy(alpha = 0.8f)
+                                    ),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Text(
-                                        text = displaySizeBadge,
-                                        fontSize = 10.5.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = SpecBadgeSizeColor,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
-                                    )
+                                    // 标签 1：音质 (如 无损 FLAC / Hi-Res FLAC) —— 统一淡黄
+                                    Surface(
+                                        shape = RoundedCornerShape(6.dp),
+                                        color = specBadgeContainer(SpecBadgeQualityColor),
+                                        border = BorderStroke(0.8.dp, specBadgeBorder(SpecBadgeQualityColor))
+                                    ) {
+                                        Text(
+                                            text = displayQualityBadge,
+                                            fontSize = 10.5.sp,
+                                            fontWeight = FontWeight.ExtraBold,
+                                            color = SpecBadgeQualityColor,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                    // 标签 2：码率 (如 960 kbps / 320 kbps) —— 统一淡绿
+                                    Surface(
+                                        shape = RoundedCornerShape(6.dp),
+                                        color = specBadgeContainer(SpecBadgeBitrateColor),
+                                        border = BorderStroke(0.8.dp, specBadgeBorder(SpecBadgeBitrateColor))
+                                    ) {
+                                        Text(
+                                            text = displayBitrateBadge,
+                                            fontSize = 10.5.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = SpecBadgeBitrateColor,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                    // 标签 3：文件大小 (如 28.4 MB) —— 统一淡红
+                                    Surface(
+                                        shape = RoundedCornerShape(6.dp),
+                                        color = specBadgeContainer(SpecBadgeSizeColor),
+                                        border = BorderStroke(0.8.dp, specBadgeBorder(SpecBadgeSizeColor))
+                                    ) {
+                                        Text(
+                                            text = displaySizeBadge,
+                                            fontSize = 10.5.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = SpecBadgeSizeColor,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -2167,17 +2280,14 @@ fun FullscreenPlayerSheet(
                                         lyrics = lyrics.lines,
                                         currentPositionMs = progressMs,
                                         onSeekToLyric = onSeekTo,
-                                        fontSizeSp = lyricsFontSize,
+                                        fontSizeSp = if (isKaraokeTheme) lyricsFontSize.coerceAtLeast(24f) else lyricsFontSize,
                                         lyricsOffsetMs = lyricsOffsetMs,
                                         lyricTheme = currentLyricTheme,
                                         onFontSizeChange = updateFontSize,
                                         onOffsetChange = updateOffset,
                                         onThemeChange = updateTheme,
                                         showAdjustButton = true,
-                                        // 灰白卡片固定使用深色歌词，保证浅色卡片上的对比度
-                                        overrideActiveColor = lyricsCardPrimary,
-                                        overrideInactiveColor = lyricsCardSecondary.copy(alpha = 0.72f),
-                                        overrideFadeColor = lyricsCardBg,
+                                        overrideFadeColor = if (isKaraokeTheme) (if (isDark) Color(0xFF15161D) else Color(0xFFE0DCD5)) else lyricsCardBg,
                                         adjustButtonFocusRequester = lyricsAdjustFocusRequester,
                                         upFocusRequester = lyricsTabFocusRequester,
                                         leftFocusRequester = repeatFocusRequester,
@@ -2973,7 +3083,34 @@ fun AudioSpecsDropdownMenu(
     val isLossless = formatStr in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF") || effectiveBitRate >= 800
     val qualityTag = if (isLossless) "Hi-Res 无损母带" else if (effectiveBitRate >= 320) "极高品质音频" else "标准音频"
 
-    val locationText: String = if (isLocal) (song.localFilePath ?: "本地存储") else (song.streamUrl.takeIf { it.isNotBlank() } ?: "柠檬在线流")
+    val locationText: String = if (isLocal && !song.localFilePath.isNullOrBlank()) {
+        val f = java.io.File(song.localFilePath)
+        f.parent ?: song.localFilePath
+    } else {
+        val stream = song.streamUrl
+        var nasPath = ""
+        if (stream.contains("path=")) {
+            try {
+                val uri = android.net.Uri.parse(stream)
+                val pathParam = uri.getQueryParameter("path")
+                if (!pathParam.isNullOrBlank()) {
+                    val decoded = java.net.URLDecoder.decode(pathParam, "UTF-8")
+                    val parentDir = if (decoded.contains("/")) decoded.substringBeforeLast("/") + "/" else decoded
+                    nasPath = parentDir
+                }
+            } catch (_: Exception) {}
+        }
+        if (nasPath.isBlank() && !song.relativeFolderPath.isNullOrBlank()) {
+            val folder = song.relativeFolderPath.trim().trimEnd('/')
+            nasPath = "$folder/"
+        }
+        if (nasPath.isBlank()) {
+            val artist = song.artist.ifBlank { "未知歌手" }
+            val album = song.album.ifBlank { "单曲" }
+            nasPath = "/音乐/$artist/$album/"
+        }
+        "NAS: $nasPath"
+    }
 
     DropdownMenu(
         expanded = expanded,
@@ -3009,7 +3146,46 @@ fun AudioSpecsDropdownMenu(
         HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f), thickness = 0.5.dp)
         Spacer(modifier = Modifier.height(8.dp))
 
+        val isOnlineSong = song.id.startsWith("lemon_online_") ||
+            song.serverId == "lemon_online" ||
+            song.streamUrl.startsWith("lemon_online://") ||
+            (com.lm.player.core.media.DownloadRequestPlanner.hasRemoteSource(song) && !isLocal)
+
+        val platformKey = when {
+            song.id.startsWith("lemon_online_") -> song.id.removePrefix("lemon_online_").substringBefore("_")
+            else -> {
+                val rawJson = song.rawMetaJson ?: song.relativeFolderPath
+                if (!rawJson.isNullOrBlank()) {
+                    runCatching {
+                        val obj = org.json.JSONObject(rawJson)
+                        obj.optString("source").ifBlank { obj.optString("platform") }
+                    }.getOrNull().orEmpty()
+                } else ""
+            }
+        }.ifBlank { "kw" }
+
+        val platformName = when (platformKey.lowercase()) {
+            "tx" -> "QQ音乐"
+            "kw" -> "酷我音乐"
+            "wy" -> "网易云音乐"
+            "kg" -> "酷狗音乐"
+            "mg" -> "咪咕音乐"
+            "bd" -> "百度音乐"
+            else -> platformKey.uppercase()
+        }
+
+        val sourceName = runCatching {
+            val rawJson = song.rawMetaJson ?: song.relativeFolderPath
+            if (!rawJson.isNullOrBlank()) {
+                val obj = org.json.JSONObject(rawJson)
+                obj.optString("sourceName").ifBlank { obj.optString("scriptName") }
+            } else ""
+        }.getOrNull()?.ifBlank { null } ?: "官方音源"
+
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            if (isOnlineSong) {
+                SpecRowItem("解析来源", "$sourceName / ${platformName}解析", isBold = true, valueColor = AppleRed)
+            }
             SpecRowItem("音质等级", qualityTag, valueColor = if (isLossless) Color(0xFFD4AF37) else AppleRed)
             SpecRowItem("编码格式", formatStr, isBold = true)
             SpecRowItem("音频码率", "$effectiveBitRate kbps")
@@ -3149,6 +3325,7 @@ fun PlayerThemeDropdownMenu(
     val selectableThemes = remember {
         listOf(
             com.lm.player.core.designsystem.theme.PlayerThemeStyle.MODERN,
+            com.lm.player.core.designsystem.theme.PlayerThemeStyle.KARAOKE_COVER,
             com.lm.player.core.designsystem.theme.PlayerThemeStyle.NETEASE_TV_COVER
         )
     }
@@ -3193,6 +3370,7 @@ fun PlayerThemeDropdownMenu(
             val isSelected = themeStyle == currentTheme
             val iconVec = when (themeStyle) {
                 com.lm.player.core.designsystem.theme.PlayerThemeStyle.MODERN -> Icons.Default.Album
+                com.lm.player.core.designsystem.theme.PlayerThemeStyle.KARAOKE_COVER -> Icons.Default.Mic
                 com.lm.player.core.designsystem.theme.PlayerThemeStyle.NETEASE_TV_COVER -> Icons.Default.Wallpaper
                 else -> Icons.Default.Palette
             }

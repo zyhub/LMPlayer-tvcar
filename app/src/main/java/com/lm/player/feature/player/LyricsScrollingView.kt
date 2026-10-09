@@ -24,6 +24,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
@@ -46,6 +47,7 @@ import com.lm.player.core.designsystem.component.tvButtonFocusable
 import com.lm.player.core.designsystem.component.tvFocusable
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LyricTheme
+import com.lm.player.core.designsystem.theme.SystemFontManager
 import com.lm.player.core.model.LyricLine
 
 @Composable
@@ -74,12 +76,25 @@ fun LyricsScrollingView(
     downFocusRequester: FocusRequester? = null,
     modifier: Modifier = Modifier
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val prefs = remember { context.getSharedPreferences("lemon_settings_prefs", android.content.Context.MODE_PRIVATE) }
+    var isKaraokeEnabled by remember {
+        mutableStateOf(prefs.getBoolean("lyric_karaoke_enabled", true))
+    }
+    var useSystemFont by remember {
+        mutableStateOf(prefs.getBoolean("lyric_use_system_font", true))
+    }
+    val lyricFontFamily = remember(useSystemFont) {
+        SystemFontManager.getSystemFontFamily(useSystemFont)
+    }
+
     val cleanLyrics = remember(lyrics) {
         lyrics.filter { it.text.isNotBlank() && !it.text.trim().equals("null", ignoreCase = true) }
     }
 
     var showAdjustDialog by remember { mutableStateOf(false) }
-    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
+    val isDark = overrideFadeColor?.let { it.red * 0.299f + it.green * 0.587f + it.blue * 0.114f < 0.5f }
+        ?: (MaterialTheme.colorScheme.background.red < 0.5f)
 
     val activeColor = overrideActiveColor ?: if (isDark) lyricTheme.activeColorDark else lyricTheme.activeColorLight
     val inactiveColor = overrideInactiveColor ?: if (isDark) lyricTheme.inactiveColorDark else lyricTheme.inactiveColorLight
@@ -88,6 +103,24 @@ fun LyricsScrollingView(
 
     // 结合用户快慢偏置时间计算有效播放时间戳
     val effectivePositionMs = (currentPositionMs + lyricsOffsetMs).coerceAtLeast(0L)
+
+    // 逐字歌词高刷帧级平滑时间插值，消除 400ms 刷新周期产生的逐字流光顿挫跳跃
+    var lastTickPos by remember { mutableLongStateOf(effectivePositionMs) }
+    var lastTickUptime by remember { mutableLongStateOf(android.os.SystemClock.uptimeMillis()) }
+
+    LaunchedEffect(effectivePositionMs) {
+        lastTickPos = effectivePositionMs
+        lastTickUptime = android.os.SystemClock.uptimeMillis()
+    }
+
+    var frameTick by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(isKaraokeEnabled) {
+        if (isKaraokeEnabled) {
+            while (true) {
+                withFrameMillis { frameTick = it }
+            }
+        }
+    }
 
     // 计算当前处于哪一行歌词 (采用二分查找匹配对应行)
     val activeIndex = remember(cleanLyrics, effectivePositionMs) {
@@ -250,10 +283,71 @@ fun LyricsScrollingView(
                                 else -> Alignment.CenterStart
                             }
                         ) {
+                        if (isActive) {
+                            if (isKaraokeEnabled) {
+                                Box(modifier = Modifier.wrapContentWidth()) {
+                                    Text(
+                                        text = item.text,
+                                        textAlign = textAlign,
+                                        style = TextStyle(
+                                            fontFamily = lyricFontFamily,
+                                            fontSize = currentSize,
+                                            fontWeight = fontWeight,
+                                            color = inactiveColor.copy(alpha = 0.55f),
+                                            lineHeight = (currentSize.value * 1.16f).sp
+                                        ),
+                                        maxLines = if (lines <= 5) 1 else 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = item.text,
+                                        textAlign = textAlign,
+                                        style = TextStyle(
+                                            fontFamily = lyricFontFamily,
+                                            fontSize = currentSize,
+                                            fontWeight = fontWeight,
+                                            color = activeColor,
+                                            lineHeight = (currentSize.value * 1.16f).sp
+                                        ),
+                                        maxLines = if (lines <= 5) 1 else 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.drawWithContent {
+                                            val _tick = frameTick
+                                            val elapsed = (android.os.SystemClock.uptimeMillis() - lastTickUptime).coerceIn(0L, 600L)
+                                            val smoothPos = lastTickPos + elapsed
+                                            val startMs = item.timestampMs
+                                            val endMs = cleanLyrics.getOrNull(index + 1)?.timestampMs ?: (startMs + 4000L)
+                                            val duration = (endMs - startMs).coerceIn(600L, 12000L)
+                                            val progress = ((smoothPos - startMs).toFloat() / duration.toFloat()).coerceIn(0f, 1f)
+                                            if (progress > 0f) {
+                                                clipRect(0f, 0f, size.width * progress, size.height) {
+                                                    this@drawWithContent.drawContent()
+                                                }
+                                            }
+                                        }
+                                    )
+                                }
+                            } else {
+                                Text(
+                                    text = item.text,
+                                    textAlign = textAlign,
+                                    style = TextStyle(
+                                        fontFamily = lyricFontFamily,
+                                        fontSize = currentSize,
+                                        fontWeight = fontWeight,
+                                        color = activeColor,
+                                        lineHeight = (currentSize.value * 1.16f).sp
+                                    ),
+                                    maxLines = if (lines <= 5) 1 else 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        } else {
                             Text(
                                 text = item.text,
                                 textAlign = textAlign,
                                 style = TextStyle(
+                                    fontFamily = lyricFontFamily,
                                     fontSize = currentSize,
                                     fontWeight = fontWeight,
                                     color = animatedColor,
@@ -267,20 +361,21 @@ fun LyricsScrollingView(
                     }
                 }
             }
-        } else {
-            // 经典黑胶模式还原上一版的全高实时滚动歌词
-            val activeFontSize = remember(fontSizeSp) { fontSizeSp.sp }
-            val inactiveFontSize = remember(fontSizeSp) { (fontSizeSp * 0.74f).sp }
-            val activeLineHeight = remember(fontSizeSp) { (fontSizeSp * 1.38f).sp }
-            val inactiveLineHeight = remember(fontSizeSp) { (fontSizeSp * 0.74f * 1.38f).sp }
+        }
+    } else {
+            // 经典黑胶模式还原上一版的全高实时滚动歌词并支持逐字歌词 (Karaoke)
+            val activeFontSize = remember(fontSizeSp) { (fontSizeSp * 1.08f).sp }
+            val inactiveFontSize = remember(fontSizeSp) { (fontSizeSp * 0.82f).sp }
+            val activeLineHeight = remember(fontSizeSp) { (fontSizeSp * 1.50f).sp }
+            val inactiveLineHeight = remember(fontSizeSp) { (fontSizeSp * 0.82f * 1.45f).sp }
 
             LazyColumn(
                 state = listState,
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(horizontal = horizontalPaddingDp.dp),
-                contentPadding = PaddingValues(vertical = 36.dp),
-                verticalArrangement = Arrangement.spacedBy((fontSizeSp * 0.95f).dp)
+                contentPadding = PaddingValues(vertical = 42.dp),
+                verticalArrangement = Arrangement.spacedBy((fontSizeSp * 0.90f).dp)
             ) {
                 itemsIndexed(
                     items = cleanLyrics,
@@ -301,21 +396,86 @@ fun LyricsScrollingView(
                     }
                     val currentSize = if (isActive) activeFontSize else inactiveFontSize
                     val currentLineHeight = if (isActive) activeLineHeight else inactiveLineHeight
-                    val fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal
+                    val fontWeight = if (isActive) FontWeight.ExtraBold else FontWeight.Medium
 
-                    Text(
-                        text = item.text,
-                        textAlign = textAlign,
-                        style = TextStyle(
-                            fontSize = currentSize,
-                            fontWeight = fontWeight,
-                            color = textColor,
-                            lineHeight = currentLineHeight
-                        ),
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { onSeekToLyric((item.timestampMs - lyricsOffsetMs).coerceAtLeast(0L)) }
-                    )
+                            .clickable { onSeekToLyric((item.timestampMs - lyricsOffsetMs).coerceAtLeast(0L)) },
+                        contentAlignment = when (textAlign) {
+                            TextAlign.Center -> Alignment.Center
+                            TextAlign.End -> Alignment.CenterEnd
+                            else -> Alignment.CenterStart
+                        }
+                    ) {
+                        if (isActive) {
+                            if (isKaraokeEnabled) {
+                                // 逐字歌词 (Karaoke 逐字高亮流光推进)
+                                Box(modifier = Modifier.wrapContentWidth()) {
+                                    Text(
+                                        text = item.text,
+                                        textAlign = textAlign,
+                                        style = TextStyle(
+                                            fontFamily = lyricFontFamily,
+                                            fontSize = currentSize,
+                                            fontWeight = fontWeight,
+                                            color = inactiveColor.copy(alpha = 0.50f),
+                                            lineHeight = currentLineHeight
+                                        )
+                                    )
+                                    Text(
+                                        text = item.text,
+                                        textAlign = textAlign,
+                                        style = TextStyle(
+                                            fontFamily = lyricFontFamily,
+                                            fontSize = currentSize,
+                                            fontWeight = fontWeight,
+                                            color = activeColor,
+                                            lineHeight = currentLineHeight
+                                        ),
+                                        modifier = Modifier.drawWithContent {
+                                            val _tick = frameTick
+                                            val elapsed = (android.os.SystemClock.uptimeMillis() - lastTickUptime).coerceIn(0L, 600L)
+                                            val smoothPos = lastTickPos + elapsed
+                                            val startMs = item.timestampMs
+                                            val endMs = cleanLyrics.getOrNull(index + 1)?.timestampMs ?: (startMs + 4000L)
+                                            val duration = (endMs - startMs).coerceIn(600L, 12000L)
+                                            val progress = ((smoothPos - startMs).toFloat() / duration.toFloat()).coerceIn(0f, 1f)
+                                            if (progress > 0f) {
+                                                clipRect(0f, 0f, size.width * progress, size.height) {
+                                                    this@drawWithContent.drawContent()
+                                                }
+                                            }
+                                        }
+                                    )
+                                }
+                            } else {
+                                Text(
+                                    text = item.text,
+                                    textAlign = textAlign,
+                                    style = TextStyle(
+                                        fontFamily = lyricFontFamily,
+                                        fontSize = currentSize,
+                                        fontWeight = fontWeight,
+                                        color = activeColor,
+                                        lineHeight = currentLineHeight
+                                    )
+                                )
+                            }
+                        } else {
+                            Text(
+                                text = item.text,
+                                textAlign = textAlign,
+                                style = TextStyle(
+                                    fontFamily = lyricFontFamily,
+                                    fontSize = currentSize,
+                                    fontWeight = fontWeight,
+                                    color = textColor,
+                                    lineHeight = currentLineHeight
+                                )
+                            )
+                        }
+                    }
                 }
             }
 
@@ -394,9 +554,19 @@ fun LyricsScrollingView(
                     fontSizeSp = fontSizeSp,
                     lyricsOffsetMs = lyricsOffsetMs,
                     lyricTheme = lyricTheme,
+                    isKaraokeEnabled = isKaraokeEnabled,
+                    useSystemFont = useSystemFont,
                     onFontSizeChange = onFontSizeChange,
                     onOffsetChange = onOffsetChange,
-                    onThemeChange = onThemeChange
+                    onThemeChange = onThemeChange,
+                    onKaraokeChange = {
+                        isKaraokeEnabled = it
+                        prefs.edit().putBoolean("lyric_karaoke_enabled", it).apply()
+                    },
+                    onFontModeChange = {
+                        useSystemFont = it
+                        prefs.edit().putBoolean("lyric_use_system_font", it).apply()
+                    }
                 )
             }
         }
@@ -413,9 +583,13 @@ fun LyricsAdjustDropdownMenu(
     fontSizeSp: Float,
     lyricsOffsetMs: Long,
     lyricTheme: LyricTheme,
+    isKaraokeEnabled: Boolean = true,
+    useSystemFont: Boolean = true,
     onFontSizeChange: (Float) -> Unit,
     onOffsetChange: (Long) -> Unit,
-    onThemeChange: (LyricTheme) -> Unit
+    onThemeChange: (LyricTheme) -> Unit,
+    onKaraokeChange: (Boolean) -> Unit = {},
+    onFontModeChange: (Boolean) -> Unit = {}
 ) {
     val isDark = isSystemInDarkTheme()
     val primaryText = if (isDark) Color.White else Color.Black
@@ -633,13 +807,123 @@ fun LyricsAdjustDropdownMenu(
                     }
                 }
             }
-            Spacer(modifier = Modifier.height(2.dp))
-            Text(
-                text = "${lyricTheme.displayName} • ${lyricTheme.description}",
-                fontSize = 10.sp,
-                color = secondaryText,
-                modifier = Modifier.padding(top = 4.dp)
+            HorizontalDivider(
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
+                thickness = 0.5.dp,
+                modifier = Modifier.padding(vertical = 6.dp)
             )
+
+            // 4. 显示动效 (逐字流光 / 逐条整行)
+            Text("显示动效", fontSize = 12.sp, fontWeight = FontWeight.Medium, color = secondaryText)
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = if (isKaraokeEnabled) AppleRed.copy(alpha = 0.2f) else (if (isDark) Color(0xFF2C2C34) else Color(0xFFF2F2F7)),
+                    border = if (isKaraokeEnabled) BorderStroke(1.2.dp, AppleRed) else null,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(30.dp)
+                        .tvFocusable(
+                            shape = RoundedCornerShape(8.dp),
+                            focusedScale = 1.06f,
+                            onClick = { onKaraokeChange(true) }
+                        )
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text(
+                            text = "逐字流光",
+                            fontSize = 11.sp,
+                            fontWeight = if (isKaraokeEnabled) FontWeight.Bold else FontWeight.Normal,
+                            color = if (isKaraokeEnabled) AppleRed else primaryText
+                        )
+                    }
+                }
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = if (!isKaraokeEnabled) AppleRed.copy(alpha = 0.2f) else (if (isDark) Color(0xFF2C2C34) else Color(0xFFF2F2F7)),
+                    border = if (!isKaraokeEnabled) BorderStroke(1.2.dp, AppleRed) else null,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(30.dp)
+                        .tvFocusable(
+                            shape = RoundedCornerShape(8.dp),
+                            focusedScale = 1.06f,
+                            onClick = { onKaraokeChange(false) }
+                        )
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text(
+                            text = "逐条整行",
+                            fontSize = 11.sp,
+                            fontWeight = if (!isKaraokeEnabled) FontWeight.Bold else FontWeight.Normal,
+                            color = if (!isKaraokeEnabled) AppleRed else primaryText
+                        )
+                    }
+                }
+            }
+
+            HorizontalDivider(
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
+                thickness = 0.5.dp,
+                modifier = Modifier.padding(vertical = 6.dp)
+            )
+
+            // 5. 歌词字体 (系统本机字体 / 默认软件字体)
+            Text("歌词字体", fontSize = 12.sp, fontWeight = FontWeight.Medium, color = secondaryText)
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = if (useSystemFont) AppleRed.copy(alpha = 0.2f) else (if (isDark) Color(0xFF2C2C34) else Color(0xFFF2F2F7)),
+                    border = if (useSystemFont) BorderStroke(1.2.dp, AppleRed) else null,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(30.dp)
+                        .tvFocusable(
+                            shape = RoundedCornerShape(8.dp),
+                            focusedScale = 1.06f,
+                            onClick = { onFontModeChange(true) }
+                        )
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text(
+                            text = "系统本机字体",
+                            fontSize = 11.sp,
+                            fontWeight = if (useSystemFont) FontWeight.Bold else FontWeight.Normal,
+                            color = if (useSystemFont) AppleRed else primaryText
+                        )
+                    }
+                }
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = if (!useSystemFont) AppleRed.copy(alpha = 0.2f) else (if (isDark) Color(0xFF2C2C34) else Color(0xFFF2F2F7)),
+                    border = if (!useSystemFont) BorderStroke(1.2.dp, AppleRed) else null,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(30.dp)
+                        .tvFocusable(
+                            shape = RoundedCornerShape(8.dp),
+                            focusedScale = 1.06f,
+                            onClick = { onFontModeChange(false) }
+                        )
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text(
+                            text = "默认软件字体",
+                            fontSize = 11.sp,
+                            fontWeight = if (!useSystemFont) FontWeight.Bold else FontWeight.Normal,
+                            color = if (!useSystemFont) AppleRed else primaryText
+                        )
+                    }
+                }
+            }
         }
     }
 }
@@ -652,9 +936,13 @@ fun LyricsAdjustDialog(
     fontSizeSp: Float,
     lyricsOffsetMs: Long,
     lyricTheme: LyricTheme,
+    isKaraokeEnabled: Boolean = true,
+    useSystemFont: Boolean = true,
     onFontSizeChange: (Float) -> Unit,
     onOffsetChange: (Long) -> Unit,
     onThemeChange: (LyricTheme) -> Unit,
+    onKaraokeChange: (Boolean) -> Unit = {},
+    onFontModeChange: (Boolean) -> Unit = {},
     onDismiss: () -> Unit
 ) {
     val isDark = isSystemInDarkTheme()
@@ -832,6 +1120,120 @@ fun LyricsAdjustDialog(
                         color = secondaryText,
                         modifier = Modifier.padding(top = 2.dp)
                     )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // 4. 显示动效 (逐字流光 / 逐条整行)
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Text("显示动效", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = primaryText)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (isKaraokeEnabled) AppleRed.copy(alpha = 0.2f) else (if (isDark) Color(0xFF2C2C34) else Color(0xFFF2F2F7)),
+                            border = if (isKaraokeEnabled) BorderStroke(1.5.dp, AppleRed) else null,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(36.dp)
+                                .tvFocusable(
+                                    shape = RoundedCornerShape(10.dp),
+                                    focusedScale = 1.06f,
+                                    onClick = { onKaraokeChange(true) }
+                                )
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text(
+                                    text = "逐字流光",
+                                    fontSize = 12.sp,
+                                    fontWeight = if (isKaraokeEnabled) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (isKaraokeEnabled) AppleRed else primaryText
+                                )
+                            }
+                        }
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (!isKaraokeEnabled) AppleRed.copy(alpha = 0.2f) else (if (isDark) Color(0xFF2C2C34) else Color(0xFFF2F2F7)),
+                            border = if (!isKaraokeEnabled) BorderStroke(1.5.dp, AppleRed) else null,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(36.dp)
+                                .tvFocusable(
+                                    shape = RoundedCornerShape(10.dp),
+                                    focusedScale = 1.06f,
+                                    onClick = { onKaraokeChange(false) }
+                                )
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text(
+                                    text = "逐条整行",
+                                    fontSize = 12.sp,
+                                    fontWeight = if (!isKaraokeEnabled) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (!isKaraokeEnabled) AppleRed else primaryText
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // 5. 歌词字体 (系统本机字体 / 默认软件字体)
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Text("歌词字体", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = primaryText)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (useSystemFont) AppleRed.copy(alpha = 0.2f) else (if (isDark) Color(0xFF2C2C34) else Color(0xFFF2F2F7)),
+                            border = if (useSystemFont) BorderStroke(1.5.dp, AppleRed) else null,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(36.dp)
+                                .tvFocusable(
+                                    shape = RoundedCornerShape(10.dp),
+                                    focusedScale = 1.06f,
+                                    onClick = { onFontModeChange(true) }
+                                )
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text(
+                                    text = "系统本机字体",
+                                    fontSize = 12.sp,
+                                    fontWeight = if (useSystemFont) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (useSystemFont) AppleRed else primaryText
+                                )
+                            }
+                        }
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (!useSystemFont) AppleRed.copy(alpha = 0.2f) else (if (isDark) Color(0xFF2C2C34) else Color(0xFFF2F2F7)),
+                            border = if (!useSystemFont) BorderStroke(1.5.dp, AppleRed) else null,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(36.dp)
+                                .tvFocusable(
+                                    shape = RoundedCornerShape(10.dp),
+                                    focusedScale = 1.06f,
+                                    onClick = { onFontModeChange(false) }
+                                )
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text(
+                                    text = "默认软件字体",
+                                    fontSize = 12.sp,
+                                    fontWeight = if (!useSystemFont) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (!useSystemFont) AppleRed else primaryText
+                                )
+                            }
+                        }
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(20.dp))

@@ -1247,27 +1247,6 @@ fun LocalLibraryScreen(
                                             shape = RoundedCornerShape(12.dp),
                                             focusedScale = 1.05f,
                                             focusedBorderColor = goldColor,
-                                            onClick = { isCreatePlaylistDialogOpen = true }
-                                        )
-                                    ) {
-                                        Text(
-                                            text = "+ 新建歌单",
-                                            fontSize = dimensions.badgeSize,
-                                            fontWeight = FontWeight.SemiBold,
-                                            color = goldColor,
-                                            maxLines = 1,
-                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
-                                        )
-                                    }
-
-                                    Surface(
-                                        shape = RoundedCornerShape(12.dp),
-                                        color = Color.White.copy(alpha = 0.07f),
-                                        border = BorderStroke(1.dp, borderColor),
-                                        modifier = Modifier.tvFocusable(
-                                            shape = RoundedCornerShape(12.dp),
-                                            focusedScale = 1.05f,
-                                            focusedBorderColor = goldColor,
                                             onClick = {
                                                 activeSubViewTitle = "全部歌单"
                                                 activeSubViewSubtitle = "共 ${playlists.size} 个自建及云端歌单"
@@ -1289,55 +1268,46 @@ fun LocalLibraryScreen(
 
                             Spacer(modifier = Modifier.height(12.dp))
 
-                            if (playlists.isEmpty()) {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(vertical = 12.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text(
-                                        text = "暂无歌单，可点击右上角「+ 新建歌单」或连接服务器同步",
-                                        fontSize = dimensions.captionSize,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                            LazyRow(
+                                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
+                            ) {
+                                itemsIndexed(
+                                    items = playlists,
+                                    key = { _, pl -> "row_pl_${pl.id}" }
+                                ) { _, pl ->
+                                    PlaylistCardItem(
+                                        playlist = pl,
+                                        onClick = {
+                                            isFromAllPlaylists = false
+                                            activeSubViewTitle = pl.name
+                                            activeSubViewSubtitle = if (isLocalMode) {
+                                                "本地已缓存 · 在线共 ${pl.songCount} 首"
+                                            } else {
+                                                "${if (pl.isOnline) "云端歌单" else "本地歌单"} · ${pl.songCount} 首"
+                                            }
+                                            if (onFetchPlaylistSongs != null) {
+                                                isLoadingSubView = true
+                                                coroutineScope.launch {
+                                                    val loaded = onFetchPlaylistSongs(pl.id, pl.isOnline)
+                                                    activeSubViewSongs = loaded
+                                                    if (isLocalMode) {
+                                                        activeSubViewSubtitle = "本地已缓存 · 共 ${loaded.size} 首 (在线共 ${pl.songCount} 首)"
+                                                    }
+                                                    isLoadingSubView = false
+                                                }
+                                            } else {
+                                                activeSubViewSongs = allSongs.filter { it.album == pl.name }
+                                            }
+                                        },
+                                        modifier = Modifier.width(dimensions.scale(124.dp))
                                     )
                                 }
-                            } else {
-                                LazyRow(
-                                    horizontalArrangement = Arrangement.spacedBy(16.dp),
-                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
-                                ) {
-                                    itemsIndexed(
-                                        items = playlists,
-                                        key = { idx, pl -> "row_pl_${idx}_${pl.id}" }
-                                    ) { _, pl ->
-                                        PlaylistCardItem(
-                                            playlist = pl,
-                                            onClick = {
-                                                isFromAllPlaylists = false
-                                                activeSubViewTitle = pl.name
-                                                activeSubViewSubtitle = if (isLocalMode) {
-                                                    "本地已缓存 · 在线共 ${pl.songCount} 首"
-                                                } else {
-                                                    "${if (pl.isOnline) "云端歌单" else "本地歌单"} · ${pl.songCount} 首"
-                                                }
-                                                if (onFetchPlaylistSongs != null) {
-                                                    isLoadingSubView = true
-                                                    coroutineScope.launch {
-                                                        val loaded = onFetchPlaylistSongs(pl.id, pl.isOnline)
-                                                        activeSubViewSongs = loaded
-                                                        if (isLocalMode) {
-                                                            activeSubViewSubtitle = "本地已缓存 · 共 ${loaded.size} 首 (在线共 ${pl.songCount} 首)"
-                                                        }
-                                                        isLoadingSubView = false
-                                                    }
-                                                } else {
-                                                    activeSubViewSongs = allSongs.filter { it.album == pl.name }
-                                                }
-                                            },
-                                            modifier = Modifier.width(dimensions.scale(124.dp))
-                                        )
-                                    }
+                                item(key = "row_create_playlist_card") {
+                                    CreatePlaylistActionCard(
+                                        onClick = { isCreatePlaylistDialogOpen = true },
+                                        modifier = Modifier.width(dimensions.scale(124.dp))
+                                    )
                                 }
                             }
                         }
@@ -1438,7 +1408,7 @@ fun LocalLibraryScreen(
                                 ) {
                                     itemsIndexed(
                                         items = artists.take(18),
-                                        key = { idx, artist -> "artist_circle_${idx}_${artist.id}" }
+                                        key = { _, artist -> "artist_circle_${artist.id}" }
                                     ) { _, artist ->
                                         Column(
                                             modifier = Modifier
@@ -1650,7 +1620,7 @@ fun LocalLibraryScreen(
                 } else {
                     itemsIndexed(
                         items = filteredSongs,
-                        key = { idx, song -> "libsong_${idx}_${song.id}" },
+                        key = { _, song -> "libsong_${song.id}" },
                         contentType = { _, _ -> "library_song_item" }
                     ) { idx, song ->
                         val isSelected = song.id in selectedMainSongIds
@@ -1744,22 +1714,7 @@ fun LocalLibraryScreen(
                     }
 
                     // 播放全部与管理按键
-                    if (activeSubViewTitle == "全部歌单") {
-                        Button(
-                            onClick = { isCreatePlaylistDialogOpen = true },
-                            shape = RoundedCornerShape(16.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                            modifier = Modifier.tvButtonFocusable(
-                                shape = RoundedCornerShape(16.dp),
-                                focusedBorderColor = Color(0xFFFFD60A)
-                            )
-                        ) {
-                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("新建歌单", fontSize = dimensions.captionSize)
-                        }
-                    } else if (activeSubViewTitle == "本地下载" && activeSubViewSongs.isNotEmpty()) {
+                    if (activeSubViewTitle == "本地下载" && activeSubViewSongs.isNotEmpty()) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             if (!isDownloadManagementMode) {
                                 OutlinedButton(
@@ -1992,7 +1947,7 @@ fun LocalLibraryScreen(
                         }
 
                         // E. 自建与服务端歌单
-                        itemsIndexed(playlists, key = { idx, pl -> "grid_pl_${idx}_${pl.id}" }) { _, pl ->
+                        itemsIndexed(playlists, key = { _, pl -> "grid_pl_${pl.id}" }) { _, pl ->
                             PlaylistCardItem(
                                 playlist = pl,
                                 onClick = {
@@ -2020,6 +1975,12 @@ fun LocalLibraryScreen(
                                 modifier = Modifier.fillMaxWidth()
                             )
                         }
+                        item(key = "grid_create_playlist_card") {
+                            CreatePlaylistActionCard(
+                                onClick = { isCreatePlaylistDialogOpen = true },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
                     }
                 } else if (activeSubViewTitle == "全部文件夹") {
                     LazyVerticalGrid(
@@ -2032,7 +1993,7 @@ fun LocalLibraryScreen(
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        itemsIndexed(localFolders, key = { idx, folder -> "grid_folder_${idx}_${folder.id}" }) { _, folder ->
+                        itemsIndexed(localFolders, key = { _, folder -> "grid_folder_${folder.id}" }) { _, folder ->
                             FolderCardItem(
                                 folder = folder,
                                 onClick = {
@@ -2056,7 +2017,7 @@ fun LocalLibraryScreen(
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        itemsIndexed(artists, key = { idx, artist -> "grid_artist_${idx}_${artist.id}" }) { _, artist ->
+                        itemsIndexed(artists, key = { _, artist -> "grid_artist_${artist.id}" }) { _, artist ->
                             Surface(
                                 shape = RoundedCornerShape(16.dp),
                                 color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
@@ -2119,7 +2080,7 @@ fun LocalLibraryScreen(
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
                         verticalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
-                        itemsIndexed(albums, key = { idx, album -> "grid_album_${idx}_${album.id}" }) { _, album ->
+                        itemsIndexed(albums, key = { _, album -> "grid_album_${album.id}" }) { _, album ->
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -2195,7 +2156,7 @@ fun LocalLibraryScreen(
                     ) {
                         itemsIndexed(
                             items = activeSubViewSongs,
-                            key = { idx, song -> "subsong_${idx}_${song.id}" },
+                            key = { _, song -> "subsong_${song.id}" },
                             contentType = { _, _ -> "subview_song_row" }
                         ) { _, song ->
                             if (isDownloadManagementMode && activeSubViewTitle == "本地下载") {

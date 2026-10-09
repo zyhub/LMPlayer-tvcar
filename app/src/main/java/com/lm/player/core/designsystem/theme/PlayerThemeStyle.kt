@@ -22,6 +22,11 @@ enum class PlayerThemeStyle(
         id = "ipod_retro",
         displayName = "怀旧专辑 (iPod)",
         description = "经典 3D Cover Flow 滚动卡片流，歌词在卡片下方展示"
+    ),
+    KARAOKE_COVER(
+        id = "karaoke_cover",
+        displayName = "画卷逐字",
+        description = "大尺寸圆角精选封面 + 逐字流光卡拉OK动感歌词"
     );
 
     companion object {

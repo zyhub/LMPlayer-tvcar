@@ -235,6 +235,7 @@ data class LemonSourceScriptInfo(
     val version: String = "",
     val homepage: String = "",
     val supportedPlatforms: List<String> = emptyList(),
+    val disabledPlatforms: List<String> = emptyList(),
     val isActive: Boolean = false,
     val healthSummary: String = ""
 )
@@ -377,6 +378,22 @@ data class LemonServerDownloadTask(
 )
 
 @Immutable
+data class LemonServerDownloadTaskRecord(
+    val id: String,
+    val name: String,
+    val singer: String,
+    val album: String = "",
+    val quality: String = "320k",
+    val status: String = "waiting", // waiting, downloading, completed, error, paused, await_confirm
+    val progress: Int = 0,
+    val error: String = "",
+    val createdAt: Long = 0L,
+    val filePath: String = "",
+    val songId: String = "",
+    val coverUrl: String = ""
+)
+
+@Immutable
 data class LemonDownloadPreferences(
     val defaultTarget: DownloadTarget = DownloadTarget.LOCAL,
     val defaultQuality: AudioQuality = AudioQuality.Q_320K,
@@ -385,7 +402,8 @@ data class LemonDownloadPreferences(
     val embedLyric: Boolean = true,
     val downloadLrcFile: Boolean = false,
     val existFileMode: String = "skip", // skip | overwrite
-    val groupByFolder: Boolean = false
+    val groupByFolder: Boolean = false,
+    val autoCacheOnFavorite: Boolean = false
 )
 
 @Immutable
