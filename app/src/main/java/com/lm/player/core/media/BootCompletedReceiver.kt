@@ -106,29 +106,36 @@ class BootCompletedReceiver : BroadcastReceiver() {
         if (!autoLaunch) return
 
         val appContext = context.applicationContext
+        val pendingResult = goAsync()
         Handler(Looper.getMainLooper()).postDelayed({
-            // 主路径：把前台播放服务拉起来（BOOT_COMPLETED 场景允许启动前台服务）
             try {
-                val serviceIntent = Intent(appContext, PlaybackService::class.java)
-                ContextCompat.startForegroundService(appContext, serviceIntent)
-            } catch (e: Exception) {
-                Log.w(TAG, "Start PlaybackService on boot failed", e)
-            }
-
-            // 尽力而为：部分盒子会因后台启动 Activity 限制静默丢弃，属预期
-            try {
-                val activityIntent = Intent(appContext, MainActivity::class.java).apply {
-                    addFlags(
-                        Intent.FLAG_ACTIVITY_NEW_TASK or
-                            Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                            Intent.FLAG_ACTIVITY_CLEAR_TOP
-                    )
-                    putExtra("from_boot_completed", true)
+                // 主路径：把前台播放服务拉起来（BOOT_COMPLETED 场景允许启动前台服务）
+                try {
+                    val serviceIntent = Intent(appContext, PlaybackService::class.java)
+                    ContextCompat.startForegroundService(appContext, serviceIntent)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Start PlaybackService on boot failed", e)
                 }
-                appContext.startActivity(activityIntent)
-                Log.i(TAG, "Launched MainActivity on system boot completed")
-            } catch (e: Exception) {
-                Log.e(TAG, "Launch MainActivity on boot failed", e)
+
+                // 尽力而为：部分盒子会因后台启动 Activity 限制静默丢弃，属预期
+                try {
+                    val activityIntent = Intent(appContext, MainActivity::class.java).apply {
+                        addFlags(
+                            Intent.FLAG_ACTIVITY_NEW_TASK or
+                                Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                                Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        )
+                        putExtra("from_boot_completed", true)
+                    }
+                    appContext.startActivity(activityIntent)
+                    Log.i(TAG, "Launched MainActivity on system boot completed")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Launch MainActivity on boot failed", e)
+                }
+            } finally {
+                try {
+                    pendingResult.finish()
+                } catch (_: Throwable) {}
             }
         }, 1500L)
     }

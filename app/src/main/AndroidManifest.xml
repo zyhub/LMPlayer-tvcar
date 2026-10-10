@@ -15,12 +15,25 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!--
+        多播与 WifiLock 权限：
+        - ACCESS_WIFI_STATE：PlaybackWakeLockManager 创建 WifiLock 必需（缺失时 acquire 抛
+          SecurityException 被 catch 吞掉 → WifiLock 永不生效，注释里「拿不到属于正常」即是此问题）；
+          同时 ExoPlayer 的 setWakeMode(C.WAKE_MODE_NETWORK) 附带的 WifiLock 也会被静默降级。
+        - CHANGE_WIFI_MULTICAST_STATE：局域网投屏的 mDNS/SSDP 多播发现必需。
+    -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
     <!-- 前台服务权限与多版本适配 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
     <!-- 开机自启动 (默认关闭，需用户在设置里显式开启后才生效) -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- 在线更新：调起系统安装器需要该权限（Android 8.0+ 用户需在系统设置中授权「未知来源」） -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- 存储权限适配 (API 23~32，支持电视外接 U 盘与移动硬盘扫描) -->
     <uses-permission
@@ -43,7 +56,7 @@
 
     <application
         android:name=".LMApplication"
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:banner="@drawable/tv_banner"
         android:hardwareAccelerated="true"
         android:icon="@mipmap/ic_launcher"
@@ -91,6 +104,7 @@
              配合设备保护存储读取开关 (否则开机早期读回默认 false，开关形同虚设)。 -->
         <receiver
             android:name=".core.media.BootCompletedReceiver"
+            android:permission="android.permission.RECEIVE_BOOT_COMPLETED"
             android:enabled="true"
             android:exported="true"
             android:directBootAware="true"
@@ -102,6 +116,18 @@
                 <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
+
+        <!-- FileProvider：在线更新安装包需要以 content:// 授权给系统安装器读取。
+             Android 7.0+ 禁止以 file:// 传递跨应用文件，缺少该 Provider 时更新流程无法调起安装器。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <!-- 移除 AndroidX ProfileInstaller 注入的受系统 DUMP 权限保护的导出广播接收器，防止电视安全中心误报系统级组件风险 -->
         <receiver

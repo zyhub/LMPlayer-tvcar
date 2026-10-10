@@ -53,6 +53,10 @@ object NetworkClientFactory {
 
     fun getActiveAuthToken(): String = activeAuthToken
 
+    fun clearActiveAuthToken() {
+        activeAuthToken = ""
+    }
+
     fun createOkHttpClient(context: Context): OkHttpClient {
         return getSharedClient(context)
     }
@@ -66,7 +70,9 @@ object NetworkClientFactory {
         val appContext = context.applicationContext
         val cacheDir = appContext.cacheDir.resolve("okhttp_http_cache")
         val cache = try {
-            okhttp3.Cache(cacheDir, 64L * 1024 * 1024)
+            // HTTP 磁盘缓存 16MB（原 64MB）：音频流接口已强制 FORCE_NETWORK 绕过该缓存，
+            // 其余接口（JSON/图片）收益有限，没必要占 64MB 磁盘配额
+            okhttp3.Cache(cacheDir, 16L * 1024 * 1024)
         } catch (_: Exception) {
             null
         }

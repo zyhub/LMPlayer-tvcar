@@ -48,16 +48,16 @@ class PlaybackRouter(
         streamPreResolved: Boolean = false,
         overrideQuality: String? = null
     ): MediaItem? {
-        // 单次解析内缓存本地曲库全量列表，避免本地匹配与服务器路径回退重复做全表扫描
-        var cachedLibrarySongs: List<SongEntity>? = null
-        suspend fun loadLibrarySongs(): List<SongEntity> {
-            cachedLibrarySongs?.let { return it }
+        // 单次解析内缓存同 ID / 同标题候选歌曲，定向索引查询，严禁全库扫描
+        var cachedCandidates: List<SongEntity>? = null
+        suspend fun loadCandidates(): List<SongEntity> {
+            cachedCandidates?.let { return it }
             val loaded = try {
-                ZdsDatabase.getInstance(context).songDao().getAllSongsList()
+                ZdsDatabase.getInstance(context).songDao().findCandidatesForPlayback(song.id, song.title)
             } catch (_: Exception) {
                 emptyList()
             }
-            cachedLibrarySongs = loaded
+            cachedCandidates = loaded
             return loaded
         }
 
@@ -85,10 +85,10 @@ class PlaybackRouter(
                 else -> null
             }
 
-            // 本地库智能匹配：当直接路径为空时，尝试从本地曲库匹配已下载的物理音频（严格校验版本、专辑与时长）
+            // 本地库智能匹配：当直接路径为空时，尝试从本地曲库匹配已下载的物理音频（定向索引查询，严禁全库扫描）
             directLocalPath ?: try {
-                val allSongs = loadLibrarySongs()
-                val matched = allSongs.firstOrNull { s ->
+                val candidates = loadCandidates()
+                val matched = candidates.firstOrNull { s ->
                     val hasFile = !s.localFilePath.isNullOrBlank() && File(s.localFilePath).let { f -> f.exists() && f.length() > 0 }
                     hasFile && (s.id == song.id || SongMatchingResolver.isSongMatch(
                         s.title, s.artist, s.durationMs,
@@ -145,9 +145,9 @@ class PlaybackRouter(
                             }
                         }
                         if (serverPath.isNullOrBlank()) {
-                            // 从本地数据库中查找同 ID 或完全同版本服务端曲目的有效路径/流地址
-                            val allSongs = loadLibrarySongs()
-                            val matchedServerSong = allSongs.firstOrNull { s ->
+                            // 从本地数据库中查找同 ID 或完全同版本服务端曲目的有效路径/流地址（定向候选匹配）
+                            val candidates = loadCandidates()
+                            val matchedServerSong = candidates.firstOrNull { s ->
                                 (s.id == song.id || SongMatchingResolver.isSongMatch(
                                     s.title, s.artist, s.durationMs,
                                     song.title, song.artist, song.durationMs,

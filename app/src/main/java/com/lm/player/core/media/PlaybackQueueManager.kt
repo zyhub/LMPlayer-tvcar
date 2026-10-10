@@ -92,6 +92,7 @@ object PlaybackQueueManager {
     private var recentPlayedAt: MutableMap<String, Long> = HashMap()
     @Volatile private var recentPlayedPrimed = false
 
+
     private var isListenerAttached = false
     private var appContext: Context? = null
 
@@ -595,7 +596,19 @@ object PlaybackQueueManager {
                         }
                     }
                 }
+                // 最近播放足迹同样要跟上最新的本地化元数据：下载完成后从「最近播放」点开时
+                // 必须能直接播放本地文件。TV 端此前漏掉了这段合并（手机端有），
+                // 导致下载完成后最近播放条目仍带旧的 streamUrl、没有 localFilePath，
+                // 离线状态下点开必然解析失败。
+                if (_recentPlayedSongsFlow.value.isNotEmpty()) {
+                    val recentMap = songs.associateBy { it.id }
+                    _recentPlayedSongsFlow.value = _recentPlayedSongsFlow.value.map { existing ->
+                        val matched = recentMap[existing.id]
+                        if (matched != null) mergeSongMetadata(existing, matched) else existing
+                    }
+                }
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 Log.w(TAG, "Failed to update queue metadata", e)
             }
         }
@@ -638,12 +651,43 @@ object PlaybackQueueManager {
     private fun startPeriodicPositionSave(context: Context, player: Player) {
         positionSaveJob?.cancel()
         positionSaveJob = coroutineScope.launch {
+            // 软解模式下的「稳定播放探针」：同一首歌连续播放累计到阈值后才判定为一次成功。
+            // 达到阈值即尝试回升硬解（见 Media3Factory.noteSuccessfulPlayback），
+            // 避免一次偶发解码错误让整机永久软解。
+            var probedSongId: String? = null
+            var stableTicks = 0
             while (isActive && _isPlayingFlow.value) {
                 delay(5000L)
                 if (player.isPlaying) {
                     val pos = player.currentPosition.coerceAtLeast(0L)
-                    if (pos > 0L) {
+                    // 关键：位置必须与「播放器实际在放的那首歌」配对写入。
+                    // playSong 会先更新 _currentSongFlow 再异步解析真实地址（可能耗时数秒），
+                    // 这期间播放器仍在放旧歌 —— 若不校验就会把**旧歌的播放位置写到新歌名下**，
+                    // 下次启动恢复出「新歌 + 旧歌进度」的错位状态。
+                    val actualMediaId = player.currentMediaItem?.mediaId
+                    val flowSongId = _currentSongFlow.value?.id
+                    val positionBelongsToCurrentSong = actualMediaId == null || flowSongId == null || actualMediaId == flowSongId
+                    if (pos > 0L && positionBelongsToCurrentSong) {
                         savePlaybackState(context, _currentSongFlow.value, positionMs = pos, commitSync = false)
+                    }
+                    if (Media3Factory.isSoftwareDecodingActive) {
+                        val songId = _currentSongFlow.value?.id
+                        if (songId != probedSongId) {
+                            probedSongId = songId
+                            stableTicks = 0
+                        }
+                        stableTicks++
+                        // 同一首歌稳定播放 ≥15 秒（3 个 tick）视为一次成功播放
+                        if (stableTicks == 3) {
+                            stableTicks = 0
+                            val swapped = Media3Factory.noteSuccessfulPlayback(context)
+                            if (swapped) {
+                                // 回升成功：播放器实例已被重建并换绑，续播当前进度
+                                val resume = _currentSongFlow.value ?: return@launch
+                                playSong(resume, context, startPositionMs = pos)
+                                return@launch
+                            }
+                        }
                     }
                 }
             }
@@ -695,10 +739,26 @@ object PlaybackQueueManager {
 
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED) {
-                    if (_isRepeatFlow.value && _currentSongFlow.value != null) {
-                        playSong(_currentSongFlow.value!!, context)
+                    val list = _playlistFlow.value
+                    val current = _currentSongFlow.value
+                    if (_isRepeatFlow.value && current != null) {
+                        // 单曲循环：原地重播
+                        playSong(current, context)
+                    } else if (list.size <= 1) {
+                        // 「不循环」且队列只有一首：播完即停，绝不原地无限重播。
+                        // 电视是 24 小时常开的设备，原先这里无条件 playNext() → playNext 在列表末尾
+                        // 又会 list.first() 回绕，等于「永远在响」。
+                        Log.i(TAG, "Playback ended and queue has only one item, stopping (repeat=off)")
+                        savePlaybackState(context, current, positionMs = 0L, commitSync = false)
                     } else {
-                        playNext(context)
+                        val idx = list.indexOfFirst { it.id == current?.id }
+                        if (idx >= 0 && idx < list.size - 1) {
+                            playNext(context)
+                        } else {
+                            // 列表末尾且未开循环：停在 ENDED（播放器保持就绪，用户可手动选曲）
+                            Log.i(TAG, "Playback reached end of queue, stopping (repeat=off)")
+                            savePlaybackState(context, current, positionMs = 0L, commitSync = false)
+                        }
                     }
                 }
             }
@@ -718,21 +778,36 @@ object PlaybackQueueManager {
     }
 
     /**
-     * 音频解码异常判定：
-     * 命中解码/音轨相关错误码，或底层抛出 MediaCodec.CodecException 时，说明硬件解码器不可用。
+     * 是否为「硬件解码能力不足」类错误 —— 只有这一类才值得整体降级到软解。
+     *
+     * 此前把 ERROR_CODE_DECODING_FAILED / AUDIO_TRACK_INIT_FAILED / AUDIO_TRACK_WRITE_FAILED
+     * 也算作硬解故障，但它们的成因与硬解能力无关：
+     * - DECODING_FAILED：文件损坏、码流异常（换成软解同样播不了）；
+     * - AUDIO_TRACK_INIT/WRITE_FAILED：音频设备被占用、HDMI 热插拔、路由切换。
+     * 一次偶发就会让此后**所有**歌曲永久走软解，在盒子上表现为高解析度卡顿、发热与耗电。
      */
+    private fun isHardwareCapabilityError(error: PlaybackException): Boolean {
+        val code = error.errorCode
+        if (code == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED ||
+            code == PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES
+        ) {
+            return true
+        }
+        // MediaCodec.CodecException 是解码器自身的异常（能力不足/配置失败），属硬解问题；
+        // 但 ERROR_CODE_AUDIO_TRACK_* 的 cause 也可能是 CodecException，需排除设备类错误。
+        val deviceRelated = code == PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED ||
+            code == PlaybackException.ERROR_CODE_AUDIO_TRACK_WRITE_FAILED
+        return !deviceRelated && error.cause is MediaCodec.CodecException
+    }
+
+    /** 音频解码异常判定：只对「硬解能力不足」类错误触发整体降级 */
     private fun handlePlayerError(error: PlaybackException, context: Context) {
         val code = error.errorCode
-        val isAudioDecodeFailure = code == PlaybackException.ERROR_CODE_DECODING_FAILED ||
-            code == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED ||
-            code == PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES ||
-            code == PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED ||
-            code == PlaybackException.ERROR_CODE_AUDIO_TRACK_WRITE_FAILED ||
-            error.cause is MediaCodec.CodecException
-        if (isAudioDecodeFailure && !Media3Factory.isSoftwareDecodingActive) {
-            triggerSoftwareDecodingFallback(context, "音频解码错误 code=$code")
+        if (isHardwareCapabilityError(error) && !Media3Factory.isSoftwareDecodingActive) {
+            triggerSoftwareDecodingFallback(context, "硬件解码能力不足 code=$code")
         } else {
-            Log.e(TAG, "播放错误 code=$code", error)
+            // 非硬解能力问题：交给上层容灾逻辑（换源/降级音质/本地回退），不整体切换解码方式
+            Log.e(TAG, "播放错误 code=$code（不触发解码方式降级）", error)
         }
     }
 
@@ -907,8 +982,10 @@ object PlaybackQueueManager {
         val isShuffle = _isShuffleFlow.value
 
         val nextSong: UnifiedSong = if (isShuffle) {
-            val candidates = if (list.size > 1) list.filter { it.id != current?.id } else list
-            candidates.random()
+            // 队列只有 1 首、或队列里与当前曲目同 id 的条目占满时，filter 结果会是空列表，
+            // 直接 random() 会抛 NoSuchElementException（该回调运行在 ExoPlayer 主线程 → 必崩）。
+            val candidates = list.filter { it.id != current?.id }.ifEmpty { list }
+            candidates.randomOrNull() ?: return
         } else {
             val currentIndex = list.indexOfFirst { it.id == current?.id }
             if (currentIndex >= 0 && currentIndex < list.size - 1) {
@@ -932,8 +1009,8 @@ object PlaybackQueueManager {
         val isShuffle = _isShuffleFlow.value
 
         val prevSong: UnifiedSong = if (isShuffle) {
-            val candidates = if (list.size > 1) list.filter { it.id != current?.id } else list
-            candidates.random()
+            val candidates = list.filter { it.id != current?.id }.ifEmpty { list }
+            candidates.randomOrNull() ?: return
         } else {
             val currentIndex = list.indexOfFirst { it.id == current?.id }
             if (currentIndex > 0) {
@@ -949,7 +1026,10 @@ object PlaybackQueueManager {
     fun togglePlay(context: Context) {
         ensurePlayerListener(context)
         val player = Media3Factory.getSharedExoPlayer(context)
-        if (player.isPlaying) {
+        // 暂停判定必须用 playWhenReady，不能用 isPlaying：
+        // isPlaying = STATE_READY && playWhenReady && 无抑制，切歌后的缓冲窗口（网络流可达数秒）
+        // 期间 isPlaying == false，会导致遥控器 / 媒体键 / 通知栏的「暂停」全部变成空操作。
+        if (player.playWhenReady) {
             player.pause()
         } else {
             if (player.currentMediaItem == null && _currentSongFlow.value != null) {

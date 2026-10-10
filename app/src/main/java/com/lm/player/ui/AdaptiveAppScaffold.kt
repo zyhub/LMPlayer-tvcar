@@ -18,6 +18,8 @@ import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material3.*
 import androidx.compose.material3.windowsizeclass.WindowWidthSizeClass
+import androidx.compose.foundation.focusable
+import com.lm.player.core.designsystem.component.TvFocusScope
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -129,6 +131,7 @@ fun AdaptiveAppScaffold(
             discoverTabFocusRequester.requestFocus()
         } catch (_: Exception) {}
     }
+
 
     // 从全屏播放器退出时，自动将焦点归还到左侧黑胶大卡
     LaunchedEffect(isFullPlayerVisible) {
@@ -285,12 +288,23 @@ fun AdaptiveAppScaffold(
             )
 
             // 右侧 70% 动态主内容舞台
+            //
+
             Box(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxHeight()
             ) {
-                content(PaddingValues(bottom = 12.dp))
+                // 作用域：进入内容舞台的节点默认属于 TV 页面作用域。
+                //
+                // 注意：这里**不再**加 focusTarget() 与 onFocusChanged 做「焦点防丢兜底」。
+                // 之前那样做会把整个内容舞台变成一个可聚焦节点，Compose 会把焦点优先交给它，
+                // 导致舞台内部的页面（我的/搜索/发现/设置）**完全没有光标**；
+                // 而且「恢复 → 舞台重新获焦 → 再次判定丢失 → 再恢复」会形成自激循环。
+                // 焦点保持改由页面自身负责：focusKey + TvRestoreFocusOnChange + tvFocusEntryAnchor。
+                TvFocusScope("content") {
+                    content(PaddingValues(bottom = 12.dp))
+                }
             }
         }
     }

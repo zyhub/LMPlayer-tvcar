@@ -254,7 +254,9 @@ fun SongListItemRow(
     onClick: () -> Unit,
     onDownloadClick: () -> Unit = {},
     onDownloadWithOptions: ((UnifiedSong, DownloadTarget, AudioQuality) -> Unit)? = null,
-    onOpenDownloads: () -> Unit = {}
+    onOpenDownloads: () -> Unit = {},
+    /** 外部附加修饰符（例如 TV 焦点进入锚点），必须能透传到行根节点上 */
+    modifier: Modifier = Modifier
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val dimensions = LocalAppDimensions.current
@@ -292,7 +294,7 @@ fun SongListItemRow(
     }
 
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .background(
                 color = when {

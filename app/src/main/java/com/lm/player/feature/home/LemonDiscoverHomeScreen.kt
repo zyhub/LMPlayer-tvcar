@@ -5,6 +5,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -30,6 +31,8 @@ import androidx.compose.ui.unit.sp
 import com.lm.player.core.designsystem.component.AlbumArtworkImage
 import com.lm.player.core.designsystem.component.DownloadQualityChoiceDialog
 import com.lm.player.core.designsystem.component.tvButtonFocusable
+import com.lm.player.core.designsystem.component.TvRestoreFocusOnChange
+import com.lm.player.core.designsystem.component.tvFocusEntryAnchor
 import com.lm.player.core.designsystem.component.tvFocusable
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
@@ -111,6 +114,12 @@ fun LemonDiscoverHomeScreen(
     var activeCollectionTitle by remember { mutableStateOf<String?>(null) }
     var activeCollectionCover by remember { mutableStateOf("") }
     var activeCollectionSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
+    var collectionSessionId by remember { mutableStateOf(0) }
+
+    // 列表滚动状态必须建在 if 分支**之外**：分支内创建会随子树销毁而丢失，
+    // 表现为「下钻后返回，滚动位置回到顶部」；而且焦点恢复依赖目标项在视口内。
+    val discoverListState = rememberLazyListState()
+    val collectionListState = rememberLazyListState()
     var isLoadingCollection by remember { mutableStateOf(false) }
 
     LaunchedEffect(activeCollectionTitle) {
@@ -118,6 +127,10 @@ fun LemonDiscoverHomeScreen(
         if (activeCollectionTitle == null) {
             isCollectionMultiSelect = false
             selectedCollectionSongIds.clear()
+        } else {
+            collectionSessionId++
+            // 进入歌单/排行榜详情时，确保列表滚动回到第 0 项，使首行歌曲可被 Compose 组合渲染并接受 tvFocusEntryAnchor 焦点
+            collectionListState.scrollToItem(0)
         }
     }
     DisposableEffect(Unit) {
@@ -156,6 +169,28 @@ fun LemonDiscoverHomeScreen(
         }
         if (allCachedSongs.isEmpty()) songsWithCover
         else SongMatchingResolver.resolveSongList(songsWithCover, allCachedSongs, tasks, downloadDir = null)
+    }
+
+    // 集合详情（歌单 / 排行榜 / 新歌首发 / 专辑）的**进入侧锚点令牌**。
+    //
+    // 只反映「进入了某个集合且内容已就绪」，**不带曲目数量** —— 带数量会在列表增删时
+    // 让令牌变化、锚点被反复触发，把用户正在浏览的焦点抢回首行。
+    // 需求：点歌单/排行榜展开列表时，焦点自动落到列表第一项。
+    //
+    // 注意：必须读取 Compose MutableState (activeCollectionSongs)，不可读取 remember 的局部普通变量 resolvedCollectionSongs，
+    // 否则 derivedStateOf 无 key 闭包会捕获首帧的 emptyList 导致令牌永远为 null，首行焦点锚点永远无法触发！
+    val collectionEntryToken by remember {
+        derivedStateOf {
+            if (activeCollectionTitle != null && !isLoadingCollection && activeCollectionSongs.isNotEmpty()) {
+                "$activeCollectionTitle#$collectionSessionId"
+            } else null
+        }
+    }
+
+    LaunchedEffect(collectionEntryToken) {
+        if (collectionEntryToken != null) {
+            runCatching { collectionListState.scrollToItem(0) }
+        }
     }
 
     LaunchedEffect(currentSource, reloadTrigger) {
@@ -210,8 +245,14 @@ fun LemonDiscoverHomeScreen(
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
+        // 视图切换的焦点恢复：activeCollectionTitle 变化即触发。
+        // 进入集合详情时由首行歌曲的 tvFocusEntryAnchor 落点；
+        // 返回主语时这里把焦点还原到「用户刚才点击的那张卡片」（歌单/排行榜/专辑）。
+        TvRestoreFocusOnChange(activeCollectionTitle == null)
+
         if (activeCollectionTitle == null) {
             LazyColumn(
+                state = discoverListState,
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(
                     top = 2.dp,
@@ -556,11 +597,14 @@ fun LemonDiscoverHomeScreen(
                                         shape = RoundedCornerShape(18.dp),
                                         focusedScale = 1.04f,
                                         focusedBorderColor = goldColor,
+                                        focusKey = "disc_toprank_hero",
                                         onClick = {
                                             val targetToplist = topRank
                                             if (targetToplist != null) {
+                                                collectionSessionId++
                                                 activeCollectionTitle = targetToplist.name
                                                 activeCollectionCover = targetToplist.coverUrl
+                                                activeCollectionSongs = emptyList()
                                                 isLoadingCollection = true
                                                 val tlId = "lemon_toplist_${targetToplist.source}_${targetToplist.id}"
                                                 coroutineScope.launch(Dispatchers.IO) {
@@ -618,15 +662,19 @@ fun LemonDiscoverHomeScreen(
                                         shape = RoundedCornerShape(18.dp),
                                         focusedScale = 1.04f,
                                         focusedBorderColor = goldColor,
+                                        focusKey = "disc_newsongs_hero",
                                         onClick = {
                                             if (newSongs.isNotEmpty()) {
+                                                collectionSessionId++
                                                 activeCollectionTitle = "${currentSource.displayName} · 新歌首发"
                                                 activeCollectionCover = newSongs.firstOrNull()?.coverUrl.orEmpty()
                                                 activeCollectionSongs = newSongs
                                                 isLoadingCollection = false
                                             } else if (topAlbum != null) {
+                                                collectionSessionId++
                                                 activeCollectionTitle = topAlbum.title
                                                 activeCollectionCover = topAlbum.coverUrl
+                                                activeCollectionSongs = emptyList()
                                                 isLoadingCollection = true
                                                 coroutineScope.launch(Dispatchers.IO) {
                                                     val fetched = runCatching { onFetchCollectionSongs(topAlbum.id, currentSource) }.getOrDefault(emptyList())
@@ -714,9 +762,12 @@ fun LemonDiscoverHomeScreen(
                                     ) { _, playlist ->
                                         DiscoverPlaylistCard(
                                             playlist = playlist,
+                                            focusKey = "disc_playlist_${playlist.id}",
                                             onClick = {
+                                                collectionSessionId++
                                                 activeCollectionTitle = playlist.name
                                                 activeCollectionCover = playlist.coverUrl
+                                                activeCollectionSongs = emptyList()
                                                 isLoadingCollection = true
                                                 val plId = playlist.id
                                                 coroutineScope.launch(Dispatchers.IO) {
@@ -754,9 +805,12 @@ fun LemonDiscoverHomeScreen(
                                     ) { _, toplist ->
                                         DiscoverToplistCard(
                                             toplist = toplist,
+                                            focusKey = "disc_toplist_${toplist.id}",
                                             onClick = {
+                                                collectionSessionId++
                                                 activeCollectionTitle = toplist.name
                                                 activeCollectionCover = toplist.coverUrl
+                                                activeCollectionSongs = emptyList()
                                                 isLoadingCollection = true
                                                 val tlId = "lemon_toplist_${toplist.source}_${toplist.id}"
                                                 coroutineScope.launch(Dispatchers.IO) {
@@ -1026,6 +1080,7 @@ fun LemonDiscoverHomeScreen(
                     }
                 } else {
                     LazyColumn(
+                        state = collectionListState,
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(
                             bottom = contentPadding.calculateBottomPadding() + 20.dp
@@ -1036,7 +1091,7 @@ fun LemonDiscoverHomeScreen(
                             items = resolvedCollectionSongs,
                             key = { index, item -> "col_song_${index}_${item.id}" },
                             contentType = { _, _ -> "collection_song_row" }
-                        ) { _, song ->
+                        ) { index, song ->
                             val isSelected = song.id in selectedCollectionSongIds
                             SongListItemRow(
                                 song = song,
@@ -1049,6 +1104,11 @@ fun LemonDiscoverHomeScreen(
                                 onToggleSelect = {
                                     if (isSelected) selectedCollectionSongIds.remove(song.id) else selectedCollectionSongIds.add(song.id)
                                 },
+                                // 进入侧锚点：必须挂在可聚焦节点上（SongListItemRow 内部即 tvFocusable）。
+                                // 只在首行挂 + 派生令牌，保证「展开列表 → 焦点落到第一项」且不反复抢焦点。
+                                modifier = if (index == 0) {
+                                    Modifier.tvFocusEntryAnchor(collectionEntryToken)
+                                } else Modifier,
                                 onClick = { onSongClick(song, resolvedCollectionSongs) },
                                 onDownloadClick = { songForDownloadChoice = song },
                                 onDownloadWithOptions = { s, target, quality ->
@@ -1134,7 +1194,9 @@ private fun SectionHeader(
 @Composable
 private fun DiscoverPlaylistCard(
     playlist: UnifiedPlaylist,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    /** 焦点记忆键：返回主语时用它把焦点还原到「用户刚才点的那张卡」 */
+    focusKey: String? = null
 ) {
     val dimensions = LocalAppDimensions.current
     Column(
@@ -1144,6 +1206,7 @@ private fun DiscoverPlaylistCard(
                 shape = RoundedCornerShape(16.dp),
                 focusedScale = 1.05f,
                 focusedBorderColor = Color(0xFFFFC947),
+                focusKey = focusKey,
                 onClick = onClick
             )
             .padding(4.dp)
@@ -1192,7 +1255,8 @@ private fun DiscoverPlaylistCard(
 @Composable
 private fun DiscoverToplistCard(
     toplist: LemonToplist,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    focusKey: String? = null
 ) {
     val dimensions = LocalAppDimensions.current
     Column(
@@ -1202,6 +1266,7 @@ private fun DiscoverToplistCard(
                 shape = RoundedCornerShape(16.dp),
                 focusedScale = 1.05f,
                 focusedBorderColor = Color(0xFFFFC947),
+                focusKey = focusKey,
                 onClick = onClick
             )
             .padding(4.dp)

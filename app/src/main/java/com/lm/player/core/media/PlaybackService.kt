@@ -45,6 +45,19 @@ class PlaybackService : MediaSessionService() {
     private var exoPlayer: ExoPlayer? = null
     private var mediaSession: MediaSession? = null
 
+    /**
+     * 用户是否已明确要求「彻底停止播放」。
+     *
+     * 播放器是进程级单例，服务销毁后仍可能存活；若没有这个标记，
+     * 彻底关闭后残留的状态回调仍会调用 notify(NOTIFICATION_ID, ...)，
+     * 把媒体通知**重新贴回**通知栏/电视媒体卡片。
+     *
+     * 放在 companion 里是因为 [stopServiceAndPlayback] 是静态入口，实例字段访问不到。
+     */
+    private var isExplicitStopping: Boolean
+        get() = companionIsExplicitStopping
+        set(value) { companionIsExplicitStopping = value }
+
     /** 保活看门狗与屏保广播的协程作用域 (Main)，随服务销毁取消 */
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var keepAliveWatchdogJob: Job? = null
@@ -109,30 +122,48 @@ class PlaybackService : MediaSessionService() {
                 }
             }
 
+            private var lastSeekTimestamp = 0L
+
             override fun seekToNext() {
+                val now = System.currentTimeMillis()
+                if (now - lastSeekTimestamp < 300L) return
+                lastSeekTimestamp = now
                 PlaybackQueueManager.playNext(this@PlaybackService)
-                dispatchBroadcast(CMD_NEXT)
             }
 
             override fun seekToNextMediaItem() {
-                PlaybackQueueManager.playNext(this@PlaybackService)
-                dispatchBroadcast(CMD_NEXT)
+                seekToNext()
             }
 
             override fun seekToPrevious() {
+                val now = System.currentTimeMillis()
+                if (now - lastSeekTimestamp < 300L) return
+                lastSeekTimestamp = now
                 PlaybackQueueManager.playPrevious(this@PlaybackService)
-                dispatchBroadcast(CMD_PREV)
             }
 
             override fun seekToPreviousMediaItem() {
-                PlaybackQueueManager.playPrevious(this@PlaybackService)
-                dispatchBroadcast(CMD_PREV)
+                seekToPrevious()
+            }
+
+            override fun play() {
+                val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
+                if (!p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
+            }
+
+            override fun pause() {
+                val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
+                if (p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
             }
         }
     }
 
     companion object {
         private const val TAG = "PlaybackService"
+
+        /** 「彻底停止播放」标记的存储位置：静态入口与实例方法都需要访问 */
+        @Volatile
+        private var companionIsExplicitStopping = false
         const val CHANNEL_ID = "zds_player_playback_channel"
         const val NOTIFICATION_ID = 1001
 
@@ -155,15 +186,31 @@ class PlaybackService : MediaSessionService() {
          */
         fun stopServiceAndPlayback(context: Context) {
             try {
+                companionIsExplicitStopping = true
                 val player = Media3Factory.getSharedExoPlayer(context)
                 val currentPos = player.currentPosition.coerceAtLeast(0L)
                 PlaybackQueueManager.savePlaybackState(context, positionMs = currentPos, commitSync = true)
                 player.stop()
                 player.clearMediaItems()
+                // 释放进程级播放器：否则 setWakeMode(C.WAKE_MODE_NETWORK) 的
+                // PARTIAL_WAKE_LOCK 会随静态单例一直持有到进程结束（电视长期插电场景耗电）。
+                Media3Factory.releaseSharedPlayer()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping playback", e)
+            }
+
+            // 停服务必须**独立 try**：Android 8+ 在后台调用 startService 会抛
+            // IllegalStateException，若与 stopService 共用同一个 try，异常会把
+            // stopService 一并跳过 —— 服务、通知、唤醒锁的清理全部失效。
+            try {
                 val stopIntent = Intent(context, PlaybackService::class.java).apply {
                     action = ACTION_STOP_SERVICE
                 }
                 context.startService(stopIntent)
+            } catch (e: Exception) {
+                Log.w(TAG, "startService(ACTION_STOP_SERVICE) 失败，直接 stopService", e)
+            }
+            try {
                 context.stopService(Intent(context, PlaybackService::class.java))
             } catch (e: Exception) {
                 Log.e(TAG, "Error stopping PlaybackService", e)
@@ -175,6 +222,13 @@ class PlaybackService : MediaSessionService() {
         super.onCreate()
         try {
             createNotificationChannel()
+
+            // 0. **必须最先建立前台状态**：服务由 startForegroundService 拉起后要在 5 秒内调用
+            //    startForeground，否则系统抛 ForegroundServiceDidNotStartInTimeException 崩溃。
+            //    此前该调用位于本 try 块末尾，一旦 ExoPlayer / MediaSession / 通知构建任一步抛异常，
+            //    异常被外层 catch(Throwable) 吞掉后 startForeground 永不执行 → 必崩。
+            //    此处 mediaSession / exoPlayer 仍为 null，DynamicIslandManager 会走无 Session 兜底通知。
+            startImmediateForeground()
 
             // 1. 获取全局单例 ExoPlayer
             val rawPlayer = Media3Factory.getSharedExoPlayer(this)
@@ -241,25 +295,20 @@ class PlaybackService : MediaSessionService() {
                     when (customCommand.customAction) {
                         CMD_NEXT -> {
                             PlaybackQueueManager.playNext(this@PlaybackService)
-                            dispatchBroadcast(CMD_NEXT)
                         }
                         CMD_PREV -> {
                             PlaybackQueueManager.playPrevious(this@PlaybackService)
-                            dispatchBroadcast(CMD_PREV)
                         }
                         CMD_TOGGLE -> {
                             PlaybackQueueManager.togglePlay(this@PlaybackService)
-                            dispatchBroadcast(CMD_TOGGLE)
                         }
                         CMD_PLAY -> {
                             val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
                             if (!p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
-                            dispatchBroadcast(CMD_PLAY)
                         }
                         CMD_PAUSE -> {
                             val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
                             if (p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
-                            dispatchBroadcast(CMD_PAUSE)
                         }
                     }
                     return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
@@ -358,20 +407,11 @@ class PlaybackService : MediaSessionService() {
                 ): Int {
                     when (playerCommand) {
                         Player.COMMAND_SEEK_TO_NEXT,
-                        Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM -> {
-                            PlaybackQueueManager.playNext(this@PlaybackService)
-                            dispatchBroadcast(CMD_NEXT)
-                            return SessionResult.RESULT_SUCCESS
-                        }
+                        Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
                         Player.COMMAND_SEEK_TO_PREVIOUS,
-                        Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> {
-                            PlaybackQueueManager.playPrevious(this@PlaybackService)
-                            dispatchBroadcast(CMD_PREV)
-                            return SessionResult.RESULT_SUCCESS
-                        }
+                        Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
                         Player.COMMAND_PLAY_PAUSE -> {
-                            PlaybackQueueManager.togglePlay(this@PlaybackService)
-                            dispatchBroadcast(CMD_TOGGLE)
+                            // 仅授权命令执行，实际播放播控与防抖切歌统一由 forwardingPlayer 代理执行，消除重复触发
                             return SessionResult.RESULT_SUCCESS
                         }
                     }
@@ -387,7 +427,8 @@ class PlaybackService : MediaSessionService() {
 
             addSession(session)
 
-            // 4. 立即发布初始前台通知（彻底杜绝 Android 8.0+ 5秒启动超时闪退）
+            // 4. 前台状态已在本 try 块「步骤 0」建立（必须早于任何可能抛异常的步骤），
+            //    此处仅补一次刷新，把新建立的 MediaSession 绑定进媒体通知。
             startImmediateForeground()
 
             // 5. 监听播放状态与曲目切换动态刷新前台通知
@@ -424,6 +465,7 @@ class PlaybackService : MediaSessionService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP_SERVICE) {
+            isExplicitStopping = true
             try {
                 val currentPos = exoPlayer?.currentPosition?.coerceAtLeast(0L)
                 PlaybackQueueManager.savePlaybackState(this, positionMs = currentPos, commitSync = true)
@@ -448,30 +490,30 @@ class PlaybackService : MediaSessionService() {
             when (cmd) {
                 CMD_NEXT -> {
                     PlaybackQueueManager.playNext(this)
-                    dispatchBroadcast(CMD_NEXT)
                 }
                 CMD_PREV -> {
                     PlaybackQueueManager.playPrevious(this)
-                    dispatchBroadcast(CMD_PREV)
                 }
                 CMD_TOGGLE -> {
                     PlaybackQueueManager.togglePlay(this)
-                    dispatchBroadcast(CMD_TOGGLE)
                 }
                 CMD_PLAY -> {
+                    // 用 playWhenReady 而非 isPlaying 判定：缓冲期 isPlaying 为 false，
+                    // 用 isPlaying 会误判并执行反向操作
                     val p = Media3Factory.getSharedExoPlayer(this)
-                    if (!p.isPlaying) PlaybackQueueManager.togglePlay(this)
-                    dispatchBroadcast(CMD_PLAY)
+                    if (!p.playWhenReady) PlaybackQueueManager.togglePlay(this)
                 }
                 CMD_PAUSE -> {
                     val p = Media3Factory.getSharedExoPlayer(this)
-                    if (p.isPlaying) PlaybackQueueManager.togglePlay(this)
-                    dispatchBroadcast(CMD_PAUSE)
+                    if (p.playWhenReady) PlaybackQueueManager.togglePlay(this)
                 }
             }
             updateForegroundNotification(exoPlayer?.isPlaying == true)
             return START_STICKY
         }
+        // 常规启动（界面 startService / 开机自启 / 媒体键唤醒）说明用户又需要播放了，
+        // 复位「彻底停止」标记，否则通知刷新会被永久挡住
+        isExplicitStopping = false
         startImmediateForeground()
         // 无 action 的常规启动 (界面 startService / 开机自启) 同样返回 START_STICKY：
         // 落到 super 会得到不可恢复的默认值，服务一旦被系统回收就很难再拉起来
@@ -494,8 +536,15 @@ class PlaybackService : MediaSessionService() {
         super.onTaskRemoved(rootIntent)
         try {
             val player = exoPlayer
-            if (player == null || player.playbackState == Player.STATE_IDLE) {
-                // 本来就没在播：此时保留服务没有意义，按旧行为正常收摊
+            // 判「本来就没在播」不能只看 STATE_IDLE：用户点歌后立刻回桌面时，
+            // playSong 仍在异步解析真实地址（弱网可达数秒），此刻播放器正好是 IDLE，
+            // 若就此收摊，随后的 setMediaItem/play 会得到一个已经停掉的前台服务 ——
+            // 退化成「无通知的后台播放」，很快被系统冻结。
+            // 因此只要还有 playWhenReady 意图或存在待播放曲目，就必须保留服务。
+            val hasPlaybackIntent = player != null &&
+                (player.playWhenReady || PlaybackQueueManager.currentSongFlow.value != null)
+            if (player == null || (player.playbackState == Player.STATE_IDLE && !hasPlaybackIntent)) {
+                // 确实没有任何播放意图：保留服务没有意义，按常规收摊
                 stopKeepAliveWatchdog()
                 unregisterScreenStateReceiver()
                 PlaybackWakeLockManager.release()
@@ -742,6 +791,9 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun updateForegroundNotification(isPlaying: Boolean) {
+        // 用户已彻底关闭播放时不再刷新通知：播放器是进程级单例，彻底关闭后残留的
+        // 状态回调会把媒体通知重新贴回通知栏/电视媒体卡片（TV-C14）。
+        if (isExplicitStopping) return
         try {
             val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             manager.notify(NOTIFICATION_ID, buildNotification(isPlaying))

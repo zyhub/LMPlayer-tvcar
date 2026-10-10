@@ -5,6 +5,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
@@ -33,6 +34,8 @@ import androidx.compose.ui.window.Dialog
 import com.lm.player.core.designsystem.component.DownloadQualityChoiceDialog
 import com.lm.player.core.designsystem.component.LocalPlatformMode
 import com.lm.player.core.designsystem.component.tvButtonFocusable
+import com.lm.player.core.designsystem.component.tvFocusEntryAnchor
+import com.lm.player.core.designsystem.component.TvSearchHistoryStore
 import com.lm.player.core.designsystem.component.tvFocusable
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
@@ -331,6 +334,7 @@ fun LibrarySearchDialog(
     onDismiss: () -> Unit
 ) {
     val dimensions = LocalAppDimensions.current
+    val context = androidx.compose.ui.platform.LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val borderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
@@ -344,10 +348,19 @@ fun LibrarySearchDialog(
     var selectedResultTab by remember { mutableIntStateOf(0) } // 0: 全部结果, 1: 全网在线, 2: 本地/NAS曲库
     var showSystemKeyboardDialog by remember { mutableStateOf(false) }
     var manualSearchTrigger by remember { mutableIntStateOf(0) }
+
+    // 搜索历史：持久化在 SharedPreferences 里，切换界面/重启应用后仍在。
+    // 初始值直接读盘（数据量 ≤20 条，开销可忽略），避免首帧空白。
+    var searchHistory by remember { mutableStateOf(TvSearchHistoryStore.load(context)) }
     // 在线结果翻页：服务端 /api/search 原生支持 page/limit，这里只维护当前页码。
     // hasMore 用「本页返回条数是否已满」推断，因为服务端响应里没有 total/pages 字段。
     var onlinePage by remember { mutableIntStateOf(1) }
     var onlinePageHasMore by remember { mutableStateOf(false) }
+
+    // 结果列表滚动状态：必须提升到 if 分支之外。若在分支内创建，离开空态时 provider 注销、
+    // 滚动位置丢失；而焦点恢复依赖目标项在视口内（不在视口内就没有对应节点）。
+    val resultListState = rememberLazyListState()
+
 
     val firstKeyFocusRequester = remember { FocusRequester() }
 
@@ -372,6 +385,11 @@ fun LibrarySearchDialog(
             return@LaunchedEffect
         }
         val trimmed = query.trim()
+        // 记录搜索历史：**只在用户主动提交时**记（manualSearchTrigger > 0），
+        // 否则逐字输入过程中的每个中间状态都会被写进历史（「周」「周杰」「周杰伦」）。
+        if (manualSearchTrigger > 0 && trimmed.isNotEmpty() && !trimmed.startsWith("http")) {
+            searchHistory = TvSearchHistoryStore.remember(context, trimmed)
+        }
         if (onParseExternalPlaylist != null && (trimmed.startsWith("http://") || trimmed.startsWith("https://"))) {
             isSearchingOnline = true
             try {
@@ -465,8 +483,31 @@ fun LibrarySearchDialog(
         }
     }
 
+    // 进入侧锚点令牌（**派生**，不是命令式自增）。
+    //
+    // 为什么不能「点击时 entryAnchorToken++」：点热词卡/热门点歌的那一刻，
+    // 在线搜索请求还没返回，结果列表里**一行都没有**，锚点节点尚未进入组合，
+    // requestFocus 必然失败；等结果到达时令牌早已不再变化，锚点再也没有机会 ——
+    // 用户看到的就是「点了热词，光标仍被丢到最左边」。
+    //
+    // 改为按「结果视图是否真的有了可聚焦内容」派生：无结果 → 0，有结果 → 一个稳定值。
+    // 这样令牌恰好在**首行结果进入组合**的那一次重组发生变化，锚点一次命中；
+    // 后续翻页/刷新只要条数不变，令牌就不变，不会把正在浏览的用户焦点抢回顶部。
+    // 令牌必须是**布尔跳变**，不能带条数。
+    //
+    // 踩过的坑：第一版用「结果条数」当令牌，翻页时条数会变（12 → 8），
+    // 令牌跟着变 → 锚点被再次触发 → 焦点被抢到首行，
+    // 用户感知就是「点上一页/下一页后光标跳回最左边」。
+    //
+    // 锚点的语义只是「首次有内容时给个落点」，之后一律不再干预。
+    // 因此这里只在 false → true 那一次变化，后续翻页/刷新条数怎么变都不再触发。
+    val hasAnyResult = resolvedOnlineResults.isNotEmpty() || searchResults.isNotEmpty()
+    val resultsAnchorToken by remember {
+        derivedStateOf { hasAnyResult }
+    }
     val keyboardKeys = remember {
         ('A'..'Z').map { it.toString() } + ('0'..'9').map { it.toString() }
+
     }
 
     val panelBg = if (isDark) Color(0xFF212532) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
@@ -742,6 +783,74 @@ fun LibrarySearchDialog(
                         }
                     }
 
+                    // 4.5 搜索历史：切换界面/重启应用后仍保留，一键复用（最新在前）
+                    if (searchHistory.isNotEmpty()) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = "🕘 搜索历史：",
+                                    fontSize = dimensions.badgeSize,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                // 清空历史：挂在可聚焦节点上，遥控器可直达
+                                Text(
+                                    text = "清空",
+                                    fontSize = dimensions.badgeSize,
+                                    color = AppleRed,
+                                    modifier = Modifier
+                                        .tvFocusable(
+                                            shape = RoundedCornerShape(8.dp),
+                                            focusedScale = 1.06f,
+                                            focusKey = "ktv_history_clear",
+                                            onClick = {
+                                                TvSearchHistoryStore.clear(context)
+                                                searchHistory = emptyList()
+                                            }
+                                        )
+                                        .padding(horizontal = 8.dp, vertical = 2.dp)
+                                )
+                            }
+                            LazyRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                contentPadding = PaddingValues(vertical = 2.dp)
+                            ) {
+                                itemsIndexed(
+                                    items = searchHistory,
+                                    key = { _, word -> "hist_$word" }
+                                ) { _, word ->
+                                    Surface(
+                                        shape = RoundedCornerShape(12.dp),
+                                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                                        border = BorderStroke(1.dp, borderColor),
+                                        modifier = Modifier.tvFocusable(
+                                            shape = RoundedCornerShape(12.dp),
+                                            focusedScale = 1.06f,
+                                            focusedBorderColor = Color(0xFFFFD60A),
+                                            focusKey = "ktv_history_$word",
+                                            onClick = {
+                                                query = word
+                                                manualSearchTrigger++
+                                            }
+                                        )
+                                    ) {
+                                        Text(
+                                            text = word,
+                                            fontSize = dimensions.badgeSize,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // 5. 底部：首字母智能联想词条 / 热门搜索词
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(
@@ -769,6 +878,8 @@ fun LibrarySearchDialog(
                                         onClick = {
                                             query = word
                                             manualSearchTrigger++
+                                            // 与热词卡一致：空态切换成结果视图时触发进入侧锚点，
+                                            // 否则焦点会被 Compose 补位到左栏字母键盘首键（「跳到最左」）。
                                         }
                                     )
                                 ) {
@@ -1003,9 +1114,11 @@ fun LibrarySearchDialog(
                                                     .tvFocusable(
                                                         shape = RoundedCornerShape(12.dp),
                                                         focusedScale = 1.04f,
+                                                        focusKey = "ktv_hot_$keyword",
                                                         onClick = {
                                                             query = keyword
                                                             manualSearchTrigger++
+                                                            // 从空态切到结果视图：令牌变化会触发结果区锚点抢占焦点
                                                         }
                                                     )
                                             ) {
@@ -1084,7 +1197,10 @@ fun LibrarySearchDialog(
                         }
                     }
                 } else {
+                    // 滚动状态必须**提升到 if 分支之外**：否则离开空态时 provider 注销、
+                    // 滚动位置重置回顶部；而焦点恢复依赖目标项在视口内（不在视口内就没有节点）。
                     LazyColumn(
+                        state = resultListState,
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(top = 4.dp, bottom = 24.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -1113,13 +1229,20 @@ fun LibrarySearchDialog(
                                 items = resolvedOnlineResults,
                                 key = { _, song -> "search_online_${song.id}" },
                                 contentType = { _, _ -> "search_online_song_item" }
-                            ) { _, song ->
+                            ) { index, song ->
                                 SongListItemRow(
                                     song = song,
                                     activeDownloadTasks = activeDownloadTasks,
                                     currentPlayingSong = currentPlayingSong,
                                     isPlaying = isPlaying,
                                     isServerConnected = isServerConnected,
+                                    // 进入侧锚点：**必须挂在可聚焦节点上**。
+                                    // 之前挂在结果区顶部那个纯文本 Row 上，它本身不可聚焦，
+                                    // requestFocus 必然失败 —— 等于锚点没生效，焦点仍会被
+                                    // Compose 补位到左栏键盘首键。这里挂到第一行结果上。
+                                    modifier = if (index == 0) {
+                                        Modifier.tvFocusEntryAnchor(resultsAnchorToken)
+                                    } else Modifier,
                                     onClick = {
                                         onSongClick(song, resolvedOnlineResults)
                                     },
@@ -1276,8 +1399,24 @@ private fun TvSearchPagerBar(
     val dimensions = LocalAppDimensions.current
     val prevFocusRequester = remember { FocusRequester() }
     val nextFocusRequester = remember { FocusRequester() }
-    val canPrev = page > 1 && !isLoading
-    val canNext = hasMore && !isLoading
+    // 关键：不要让 canPrev / canNext 随 isLoading 变为 false！
+    // 之前写成 hasMore && !isLoading，点击「下一页」后 isLoading 立即变为 true，
+    // 按钮 tvFocusable(enabled = false) 导致 canFocus 变为 false，Compose 焦点管理
+    // 当场丢焦并将光标重置到焦点树根节点的首个子节点（左侧字母软键盘 'A' 键）。
+    // 正确做法：enabled 只反映业务是否还可翻页；加载中由 onClick 内部拦截重复点击。
+    val canPrev = page > 1
+    val canNext = hasMore
+
+    var lastFocusedButton by remember { mutableStateOf<String?>(null) }
+
+    // 当用户聚焦的按钮在翻页后到头变不可用（如翻到末页时下一页失效），平滑引导到另一个可用按钮，绝不掉焦到左侧键盘
+    LaunchedEffect(canNext, canPrev) {
+        if (lastFocusedButton == "next" && !canNext && canPrev) {
+            runCatching { prevFocusRequester.requestFocus() }
+        } else if (lastFocusedButton == "prev" && !canPrev && canNext) {
+            runCatching { nextFocusRequester.requestFocus() }
+        }
+    }
 
     Row(
         modifier = Modifier
@@ -1289,15 +1428,11 @@ private fun TvSearchPagerBar(
         TvSearchPagerChip(
             text = "上一页",
             enabled = canPrev,
+            isLoading = isLoading,
+            focusKey = "search_pager_prev",
+            onFocusChange = { if (it) lastFocusedButton = "prev" },
             onClick = onPrev,
-            modifier = Modifier
-                .focusRequester(prevFocusRequester)
-                .focusProperties {
-                    up = FocusRequester.Cancel
-                    down = FocusRequester.Cancel
-                    left = FocusRequester.Cancel
-                    right = nextFocusRequester
-                }
+            modifier = Modifier.focusRequester(prevFocusRequester)
         )
         Text(
             text = if (isLoading) "第 $page 页 · 加载中" else "第 $page 页",
@@ -1309,15 +1444,11 @@ private fun TvSearchPagerBar(
         TvSearchPagerChip(
             text = "下一页",
             enabled = canNext,
+            isLoading = isLoading,
+            focusKey = "search_pager_next",
+            onFocusChange = { if (it) lastFocusedButton = "next" },
             onClick = onNext,
-            modifier = Modifier
-                .focusRequester(nextFocusRequester)
-                .focusProperties {
-                    up = FocusRequester.Cancel
-                    down = FocusRequester.Cancel
-                    left = prevFocusRequester
-                    right = FocusRequester.Cancel
-                }
+            modifier = Modifier.focusRequester(nextFocusRequester)
         )
     }
 }
@@ -1326,6 +1457,9 @@ private fun TvSearchPagerBar(
 private fun TvSearchPagerChip(
     text: String,
     enabled: Boolean,
+    isLoading: Boolean = false,
+    focusKey: String? = null,
+    onFocusChange: (Boolean) -> Unit = {},
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -1344,7 +1478,13 @@ private fun TvSearchPagerChip(
         modifier = modifier.tvFocusable(
             shape = RoundedCornerShape(50),
             enabled = enabled,
-            onClick = onClick
+            focusKey = focusKey,
+            onFocusChange = onFocusChange,
+            onClick = {
+                if (!isLoading) {
+                    onClick()
+                }
+            }
         )
     ) {
         Text(

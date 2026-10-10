@@ -32,8 +32,8 @@ android {
         applicationId = "com.lm.player.tv"
         minSdk = 23
         targetSdk = 34
-        versionCode = 60
-        versionName = "1.10.13"
+        versionCode = 72
+        versionName = "1.10.25"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -70,7 +70,7 @@ android {
             // findByName 而非 getByName：没有本地密钥时返回 null，产出未签名 APK 而不是让构建失败
             signingConfig = signingConfigs.findByName("release")
             proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
+                getDefaultProguardFile("proguard-android.txt"),
                 "proguard-rules.pro"
             )
         }

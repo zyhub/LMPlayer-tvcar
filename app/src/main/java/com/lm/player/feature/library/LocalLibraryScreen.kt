@@ -13,6 +13,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -49,6 +50,8 @@ import com.lm.player.core.designsystem.component.DownloadQualityChoiceDialog
 import com.lm.player.core.designsystem.component.MosaicArtworkCollage
 import com.lm.player.core.designsystem.component.ServerSwitchDropdownButton
 import com.lm.player.core.designsystem.component.tvButtonFocusable
+import com.lm.player.core.designsystem.component.TvRestoreFocusOnChange
+import com.lm.player.core.designsystem.component.tvFocusEntryAnchor
 import com.lm.player.core.designsystem.component.tvFocusable
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
@@ -129,6 +132,7 @@ fun LocalLibraryScreen(
     // 下钻视图状态：当前正在查看的集合详情 (歌单、歌手、专辑、流派)
     var activeSubViewTitle by remember { mutableStateOf<String?>(null) }
     var activeSubViewSubtitle by remember { mutableStateOf<String>("") }
+    var activePlaylistId by remember { mutableStateOf<String?>(null) }
     var activeSubViewSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
     var isLoadingSubView by remember { mutableStateOf(false) }
     var isFromAllPlaylists by remember { mutableStateOf(false) }
@@ -184,14 +188,15 @@ fun LocalLibraryScreen(
         }.sortedByDescending { it.songCount }
     }
 
-    // 本地下载离线歌曲聚合：直接关联外部已下载全量曲目（与下载管理器对齐），若未传入则从 allSongs 纯内存快速聚合（禁止主线程同步 File.exists()）
+    // 本地下载离线歌曲聚合：直接关联外部已下载全量曲目（与下载管理器对齐），若未传入则从 allSongs 纯内存快速聚合
     val finalDownloadedSongs = remember(allSongs, downloadedSongs) {
+        val validLocal = { s: UnifiedSong ->
+            !s.localFilePath.isNullOrBlank() && (s.localFilePath!!.startsWith("content://") || java.io.File(s.localFilePath!!).exists())
+        }
         if (downloadedSongs.isNotEmpty()) {
-            downloadedSongs
+            downloadedSongs.filter(validLocal)
         } else {
-            allSongs.filter { 
-                !it.localFilePath.isNullOrBlank() && (it.localFilePath!!.startsWith("content://") || java.io.File(it.localFilePath!!).exists())
-            }
+            allSongs.filter(validLocal)
         }
     }
     // 最近播放聚合：优先使用宿主注入的真实播放足迹，退回本地库前 30 首兜底展示
@@ -292,6 +297,7 @@ fun LocalLibraryScreen(
             isFromAllAlbums = false
         } else {
             activeSubViewTitle = null
+            activePlaylistId = null
             isFromAllPlaylists = false
             isFromAllFolders = false
             isFromAllArtists = false
@@ -407,6 +413,35 @@ fun LocalLibraryScreen(
         }
     }
 
+    // 列表滚动状态必须建在 if 分支**之外**：分支内创建会随子树销毁而丢失，
+    // 表现为「下钻后返回，滚动位置回到顶部」；而且焦点恢复依赖目标项在视口内 ——
+    // 目标项不在视口内时 LazyList 里根本没有该节点，requestFocus 必然失败。
+    val mainListState = rememberLazyListState()
+    val subViewListState = rememberLazyListState()
+    // 横向板块同理：不提升 state 时，下钻返回后横向滚动位置也会丢，
+    // 目标胶囊若被滚出视口则无法恢复焦点。
+    val artistRowState = rememberLazyListState()
+
+    // 下钻进入侧锚点令牌（**派生**）。
+    //
+    // 需求：光标点击文件夹/歌手/专辑/歌单展开列表时，焦点自动落到**列表第一项**。
+    //
+    // 为什么必须派生而不是「点击时自增」：部分下钻（歌单）的曲目是异步拉取的，
+    // 点击那一刻 activeSubViewSongs 还是空的，列表里没有可聚焦的行，锚点必然失败；
+    // 等数据回来时令牌早已不再变化。派生令牌恰好在「列表首次真正有内容」的那次重组变化。
+    //
+    // 用 isLoadingSubView 作为门控：加载中不抢焦点，避免把焦点丢在空列表上。
+    // 令牌只反映「进入了某个下钻视图且内容已就绪」，**不带曲目数量**。
+    // 带数量会导致列表增删（多选删除、下载状态刷新）时令牌变化、锚点被再次触发，
+    // 把用户正在浏览的焦点抢回首行。锚点的语义只是「进入时的落点」。
+    val subViewEntryToken by remember {
+        derivedStateOf {
+            if (activeSubViewTitle != null && !isLoadingSubView && activeSubViewSongs.isNotEmpty()) {
+                activeSubViewTitle
+            } else null
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
         val isLocalMode = activeServerConfig == null || currentServerName.contains("本地") || currentServerName.contains("已下载")
         // 主视图：浏览「我的 (融合在线曲库与本地缓存)」各大板块 (当没有进入二级下钻时展示)
@@ -415,6 +450,7 @@ fun LocalLibraryScreen(
             val cardBg = if (isDark) Color(0xFF212532).copy(alpha = 0.92f) else MaterialTheme.colorScheme.surface.copy(alpha = 0.94f)
 
             LazyColumn(
+                state = mainListState,
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(
                     top = 2.dp,
@@ -1278,9 +1314,11 @@ fun LocalLibraryScreen(
                                 ) { _, pl ->
                                     PlaylistCardItem(
                                         playlist = pl,
+                                        focusKey = "mine_plrow_${pl.name}",
                                         onClick = {
                                             isFromAllPlaylists = false
                                             activeSubViewTitle = pl.name
+                                            activePlaylistId = pl.id
                                             activeSubViewSubtitle = if (isLocalMode) {
                                                 "本地已缓存 · 在线共 ${pl.songCount} 首"
                                             } else {
@@ -1403,6 +1441,7 @@ fun LocalLibraryScreen(
                                 }
                             } else {
                                 LazyRow(
+                                    state = artistRowState,
                                     horizontalArrangement = Arrangement.spacedBy(18.dp),
                                     contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
                                 ) {
@@ -1417,6 +1456,11 @@ fun LocalLibraryScreen(
                                                     shape = RoundedCornerShape(14.dp),
                                                     focusedScale = 1.06f,
                                                     focusedBorderColor = goldColor,
+                                                    // 焦点记忆键：必须带区块前缀。
+                                                    // 同一歌手可能同时出现在「歌手胶囊流」与「全部歌手」网格里，
+                                                    // 若共用同一个 key，后注册者会覆盖前者，恢复时会落到另一个实例
+                                                    // （甚至可能不在视口内，导致恢复失败）。
+                                                    focusKey = "mine_artist_pill_${artist.name}",
                                                     onClick = {
                                                         isFromAllArtists = false
                                                         val artistSongs = allSongs.filter { it.artist == artist.name }
@@ -1668,6 +1712,11 @@ fun LocalLibraryScreen(
             }
         }
 
+        // 视图切换的焦点恢复：activeSubViewTitle 变化即触发。
+        // 进入下钻时由返回键的 tvFocusEntryAnchor 抢焦点（更高优先级）；
+        // 返回主语时这里把焦点还原到「用户刚才点击的那一项」（歌手胶囊/专辑卡/歌单卡）。
+        TvRestoreFocusOnChange(activeSubViewTitle == null)
+
         // 二级下钻详情视图 (页面内展示：歌单曲目、歌手曲目、专辑曲目，绝不遮挡底部播放栏)
         if (activeSubViewTitle != null) {
             Column(
@@ -1686,7 +1735,11 @@ fun LocalLibraryScreen(
                 ) {
                     IconButton(
                         onClick = handleSubViewBack,
-                        modifier = Modifier.tvButtonFocusable(shape = CircleShape, focusedScale = 1.1f)
+                        modifier = Modifier
+                            // 注意：这里**不再**挂进入侧锚点。
+                            // 需求是「展开列表后焦点落到列表第一项」，所以锚点交给下方首行歌曲；
+                            // 返回键仍可通过从首行往上按到达，符合电视端的浏览直觉。
+                            .tvButtonFocusable(shape = CircleShape, focusedScale = 1.1f)
                     ) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
@@ -1711,6 +1764,35 @@ fun LocalLibraryScreen(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                    }
+
+                    if (activePlaylistId != null) {
+                        var showDeleteConfirm by remember { mutableStateOf(false) }
+                        IconButton(
+                            onClick = { showDeleteConfirm = true },
+                            modifier = Modifier.tvButtonFocusable(shape = CircleShape)
+                        ) {
+                            Icon(Icons.Default.DeleteOutline, contentDescription = "删除歌单", tint = Color(0xFFFF3B30))
+                        }
+                        if (showDeleteConfirm) {
+                            AlertDialog(
+                                onDismissRequest = { showDeleteConfirm = false },
+                                title = { Text("删除歌单") },
+                                text = { Text("确定要删除歌单「$activeSubViewTitle」吗？此操作无法撤销。") },
+                                confirmButton = {
+                                    TextButton(onClick = {
+                                        showDeleteConfirm = false
+                                        val plId = activePlaylistId
+                                        activePlaylistId = null
+                                        activeSubViewTitle = null
+                                        if (plId != null) onDeletePlaylist(plId)
+                                    }) { Text("删除", color = Color(0xFFFF3B30)) }
+                                },
+                                dismissButton = {
+                                    TextButton(onClick = { showDeleteConfirm = false }) { Text("取消") }
+                                }
+                            )
+                        }
                     }
 
                     // 播放全部与管理按键
@@ -1950,9 +2032,11 @@ fun LocalLibraryScreen(
                         itemsIndexed(playlists, key = { _, pl -> "grid_pl_${pl.id}" }) { _, pl ->
                             PlaylistCardItem(
                                 playlist = pl,
+                                focusKey = "mine_plgrid_${pl.name}",
                                 onClick = {
                                     isFromAllPlaylists = true
                                     activeSubViewTitle = pl.name
+                                    activePlaylistId = pl.id
                                     activeSubViewSubtitle = if (isLocalMode) {
                                         "本地已缓存 · 在线共 ${pl.songCount} 首"
                                     } else {
@@ -2002,7 +2086,8 @@ fun LocalLibraryScreen(
                                     activeSubViewSubtitle = "本地目录 · 共 ${folder.songCount} 首歌曲"
                                     activeSubViewSongs = folder.songs
                                 },
-                                modifier = Modifier.fillMaxWidth()
+                                modifier = Modifier.fillMaxWidth(),
+                                focusKey = "mine_folder_${folder.name}"
                             )
                         }
                     }
@@ -2025,6 +2110,7 @@ fun LocalLibraryScreen(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .tvFocusable(
+                                                    focusKey = "mine_allartist_${artist.name}",
                                         shape = RoundedCornerShape(16.dp),
                                         focusedScale = 1.04f,
                                         onClick = {
@@ -2085,6 +2171,7 @@ fun LocalLibraryScreen(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .tvFocusable(
+                                                    focusKey = "mine_album_${album.title}",
                                         shape = RoundedCornerShape(14.dp),
                                         focusedScale = 1.04f,
                                         onClick = {
@@ -2158,7 +2245,7 @@ fun LocalLibraryScreen(
                             items = activeSubViewSongs,
                             key = { _, song -> "subsong_${song.id}" },
                             contentType = { _, _ -> "subview_song_row" }
-                        ) { _, song ->
+                        ) { idx, song ->
                             if (isDownloadManagementMode && activeSubViewTitle == "本地下载") {
                                 val isSelected = song.id in selectedDownloadSongIds
                                 Surface(
@@ -2202,6 +2289,11 @@ fun LocalLibraryScreen(
                             } else {
                                 val isSelected = song.id in selectedSubViewSongIds
                                 SongListItemRow(
+                                    // 进入侧锚点：**必须挂在可聚焦节点上**（SongListItemRow 内部即 tvFocusable）。
+                                    // 只在首行挂，且用派生令牌，保证「展开列表 → 焦点落到第一项」且不会反复抢焦点。
+                                    modifier = if (idx == 0) {
+                                        Modifier.tvFocusEntryAnchor(subViewEntryToken)
+                                    } else Modifier,
                                     song = song,
                                     activeDownloadTasks = activeDownloadTasks,
                                     isServerConnected = isServerOk,
@@ -2438,7 +2530,8 @@ fun LocalLibraryScreen(
 private fun FolderCardItem(
     folder: UnifiedFolder,
     onClick: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    focusKey: String? = null
 ) {
     val dimensions = LocalAppDimensions.current
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
@@ -2453,6 +2546,7 @@ private fun FolderCardItem(
             .tvFocusable(
                 shape = RoundedCornerShape(16.dp),
                 focusedScale = 1.04f,
+                focusKey = focusKey,
                 onClick = onClick
             )
     ) {
@@ -2570,7 +2664,8 @@ private fun PlaylistSpecialCard(
 private fun PlaylistCardItem(
     playlist: UnifiedPlaylist,
     onClick: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    focusKey: String? = null
 ) {
     val dimensions = LocalAppDimensions.current
     Column(
@@ -2579,6 +2674,7 @@ private fun PlaylistCardItem(
             .tvFocusable(
                 shape = RoundedCornerShape(14.dp),
                 focusedScale = 1.05f,
+                focusKey = focusKey,
                 onClick = onClick
             )
             .padding(4.dp)

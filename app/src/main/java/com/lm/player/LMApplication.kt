@@ -54,8 +54,12 @@ class LMApplication : Application(), ImageLoaderFactory {
             }
         }
 
-        // 2. 预初始化全局 Room 数据库单例
-        ZdsDatabase.getInstance(this)
+        // 2. 预初始化全局 Room 数据库单例。
+        //    Room 首次 open 要建库/校验 schema，是实打实的磁盘操作，
+        //    放在 onCreate 主线程会拖慢电视冷启动首帧，因此挪进上面的 IO 协程统一处理。
+        CoroutineScope(Dispatchers.IO).launch {
+            ZdsDatabase.getInstance(this@LMApplication)
+        }
     }
 
     /**
@@ -75,7 +79,9 @@ class LMApplication : Application(), ImageLoaderFactory {
             .diskCache {
                 DiskCache.Builder()
                     .directory(cacheDir.resolve("image_cache"))
-                    .maxSizeBytes(128L * 1024 * 1024)
+                    // 图片磁盘缓存 96MB（原 128MB）：与流媒体缓存、OkHttp 缓存合计
+                    // 不应把 cacheDir 撑到 GB 级；Coil 内存缓存已覆盖绝大多数滚动场景
+                    .maxSizeBytes(96L * 1024 * 1024)
                     .build()
             }
             .bitmapConfig(Bitmap.Config.RGB_565)

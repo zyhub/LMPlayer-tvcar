@@ -8,6 +8,7 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import android.view.KeyEvent
 import android.widget.Toast
@@ -26,6 +27,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.windowsizeclass.ExperimentalMaterial3WindowSizeClassApi
 import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
 import androidx.compose.runtime.*
+import com.lm.player.core.designsystem.component.collectAsStateLifecycleAware
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.changedToUp
@@ -43,9 +45,16 @@ import androidx.media3.exoplayer.ExoPlayer
 import com.lm.player.core.database.ZdsDatabase
 import com.lm.player.core.database.entity.ServerEntity
 import com.lm.player.core.database.entity.SongEntity
+import androidx.room.invalidationTrackerFlow
+import kotlinx.coroutines.flow.map
 import com.lm.player.core.designsystem.theme.AppThemeMode
 import com.lm.player.core.designsystem.component.CrashReportDialog
+import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import com.lm.player.core.designsystem.component.LocalPlatformMode
+import com.lm.player.core.model.PLATFORM_MODE_PREF_KEY
+import com.lm.player.core.model.PlatformMode
 import com.lm.player.core.designsystem.component.LocalTvBackgroundFocusEnabled
 import com.lm.player.core.designsystem.component.isSongOnLemonServer
 import com.lm.player.core.designsystem.theme.DefaultUiScalePercent
@@ -118,10 +127,51 @@ class MainActivity : ComponentActivity() {
     // 任务只捕获 applicationContext 与数值，不持有 Activity 引用。
     private val persistScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    /** 收藏切换去抖表：同一首歌 600ms 内只处理一次，避免并发写 Room 与远端整表同步互相覆盖 */
+    private val favoriteToggleGuard = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * 运行平台模式的 Activity 级可观察状态（null = 尚未选择）。
+     *
+     * 放在 Activity 而不是 composable 内，是为了让 [dispatchKeyEvent] 这个**组合之外**的
+     * 逃生通道能在长按返回键时把模式切回电视，并即时驱动 Compose 侧重组
+     * （Compose 读同一个 MutableState 实例，无需额外事件总线）。
+     */
+    private var platformModeState: MutableState<PlatformMode?> = mutableStateOf(null)
+
+    /** 车机模式下长按返回键切回电视模式的按键计时（-1 = 当前没有按住返回键） */
+    private var carEscapeBackDownAt = -1L
+
     // 运行时权限申请器 (兼容 Android 6.0 ~ Android 14+)
+    // 结果必须被处理：此前回调是空的（{ _ -> }），用户拒绝后没有任何说明，
+    // 表现为「本地音乐扫不到、还没有任何提示」—— 权限问题因此长期无人察觉。
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { _ -> }
+    ) { result ->
+        val denied = result.filterValues { granted -> !granted }.keys
+        if (denied.isEmpty()) return@registerForActivityResult
+        val readable = denied.joinToString("、") { permission ->
+            when {
+                permission.endsWith("READ_MEDIA_AUDIO") -> "读取本地音乐"
+                permission.endsWith("READ_EXTERNAL_STORAGE") -> "读取存储（U盘/移动硬盘扫描）"
+                permission.endsWith("POST_NOTIFICATIONS") -> "发送通知"
+                else -> permission.substringAfterLast('.')
+            }
+        }
+        val permanentlyDenied = denied.any { permission ->
+            !shouldShowRequestPermissionRationale(permission)
+        }
+        val tip = buildString {
+            append("以下权限被拒绝：")
+            append(readable)
+            append("。")
+            if (denied.any { it.endsWith("READ_MEDIA_AUDIO") || it.endsWith("READ_EXTERNAL_STORAGE") }) {
+                append("本地/U盘音乐扫描将无法工作，可在系统设置中开启对应权限后重试。")
+            }
+            if (permanentlyDenied) append("（系统已不再弹窗，需前往系统设置手动开启）")
+        }
+        android.widget.Toast.makeText(this, tip, android.widget.Toast.LENGTH_LONG).show()
+    }
 
     private var onChooseDownloadFolderResult: ((android.net.Uri) -> Unit)? = null
     private val chooseDownloadDirectoryLauncher = registerForActivityResult(
@@ -229,9 +279,15 @@ class MainActivity : ComponentActivity() {
             // 运行平台模式：首次启动由不可跳过的向导强制选择，之后可在设置中切换。
             // null = 尚未选择 → 弹出向导；向导期间按 TV 模式渲染（见 effectivePlatformMode），
             // 保证没有触屏的设备也能用遥控器方向键完成选择。
-            var platformMode by remember {
-                mutableStateOf(PlatformMode.fromKey(uiPrefs.getString(PLATFORM_MODE_PREF_KEY, null)))
+            // 读 Activity 级状态（见 platformModeState 注释）：dispatchKeyEvent 的
+            // 「长按返回键切回电视」逃生通道要在组合之外改动它。
+            // 首次组合时从偏好恢复一次，避免 Activity 被系统回收重建后向导重复弹出。
+            LaunchedEffect(Unit) {
+                if (platformModeState.value == null) {
+                    platformModeState.value = PlatformMode.fromKey(uiPrefs.getString(PLATFORM_MODE_PREF_KEY, null))
+                }
             }
+            val platformMode by platformModeState
             val effectivePlatformMode = platformMode ?: PlatformMode.TV
             val isCarPlatform = effectivePlatformMode == PlatformMode.CAR
 
@@ -281,7 +337,15 @@ class MainActivity : ComponentActivity() {
             }
 
             // UI 状态机与多层级页面回退历史栈
-            var currentScreen by remember { mutableStateOf(Screen.HOME) }
+            // 进程被系统回收后重建时要回到用户原来所在的页面，而不是永远弹回首页。
+            // Screen 是枚举，用 Saver 把它当作字符串存取，读写都是同一个状态对象，
+            // 因此 `currentScreen = xxx` 这类赋值点无需改动。
+            var currentScreen by rememberSaveable(
+                stateSaver = androidx.compose.runtime.saveable.Saver(
+                    save = { it.name },
+                    restore = { name -> try { Screen.valueOf(name) } catch (_: Exception) { Screen.HOME } }
+                )
+            ) { mutableStateOf(Screen.HOME) }
             val screenHistoryStack = remember { mutableStateListOf<Screen>() }
             var isChildSubViewActive by remember { mutableStateOf(false) }
             var favoritesRefreshTrigger by remember { mutableStateOf(0) }
@@ -314,7 +378,7 @@ class MainActivity : ComponentActivity() {
             var activeServerName by remember { mutableStateOf("本地 · 已下载") }
             var activeServerId by remember { mutableStateOf("") }
             var serversList by remember { mutableStateOf<List<ServerConfig>>(emptyList()) }
-            var isSearchDialogOpen by remember { mutableStateOf(false) }
+            var isSearchDialogOpen by rememberSaveable { mutableStateOf(false) }
 
             // 首页展示自定义配置 (支持本地持久化记忆)
             var homeDisplayConfig by remember {
@@ -389,7 +453,7 @@ class MainActivity : ComponentActivity() {
             // 之后所有"前移/合并服务器足迹"都走 manager 的方法，界面这里不再各自维护副本
             // —— 之前 6 处手工 `listOf(song) + filter` 正是顺序被反复打乱的原因。
             remember { PlaybackQueueManager.primeRecentPlayedSongs(this@MainActivity) }
-            val recentlyPlayedSongs by PlaybackQueueManager.recentPlayedSongsFlow.collectAsState()
+            val recentlyPlayedSongs by PlaybackQueueManager.recentPlayedSongsFlow.collectAsStateLifecycleAware()
 
             // 合并「服务端直下」与「本地查询」两路封面，供歌单卡片四宫格渲染
             val playlistsWithCovers = remember(playlistsList, playlistPreviewCovers) {
@@ -488,14 +552,14 @@ class MainActivity : ComponentActivity() {
             }
 
             // 全局播放状态委托至 PlaybackQueueManager
-            val currentSong by PlaybackQueueManager.currentSongFlow.collectAsState()
-            val isPlaying by PlaybackQueueManager.isPlayingFlow.collectAsState()
+            val currentSong by PlaybackQueueManager.currentSongFlow.collectAsStateLifecycleAware()
+            val isPlaying by PlaybackQueueManager.isPlayingFlow.collectAsStateLifecycleAware()
             val isShuffle by PlaybackQueueManager.isShuffleFlow.collectAsState()
             val isRepeat by PlaybackQueueManager.isRepeatFlow.collectAsState()
             val currentQueue by PlaybackQueueManager.playlistFlow.collectAsState()
 
             var currentLyrics by remember { mutableStateOf(LyricResult()) }
-            var isFullPlayerVisible by remember { mutableStateOf(false) }
+            var isFullPlayerVisible by rememberSaveable { mutableStateOf(false) }
             var isLyricsMode by remember { mutableStateOf(false) }
 
             // 播放页主题风格 (决定进入/退出播放页的转场方式：「全屏封面」走底部滑入滑出)
@@ -935,7 +999,12 @@ class MainActivity : ComponentActivity() {
             }
 
             LaunchedEffect(Unit) {
-                database.songDao().getAllSongsFlow().collect { songEntities ->
+                // 不再直接用 Room 的 getAllSongsFlow()（SELECT * 一次返回全表，
+                // 大曲库下 CursorWindow 2MB 放不下会抛 IllegalStateException 闪退），
+                // 改为 Room 官方 invalidationTrackerFlow 监听 songs 表变化 + 分页读取聚合
+                database.invalidationTrackerFlow("songs")
+                    .map { database.songDao().getAllSongsList() }
+                    .collect { songEntities ->
                     val (mappedSongs, recAdded) = withContext(Dispatchers.IO) {
                         val downloadsMap = try {
                             database.downloadDao().getAllDownloadsList().associateBy { it.songId }
@@ -1536,6 +1605,18 @@ class MainActivity : ComponentActivity() {
             }
 
             val handleToggleFavorite: (UnifiedSong) -> Unit = { songToFav ->
+                // 连点去抖：一次收藏会产生「Room 写入 + 服务器整表同步 + 歌单刷新 + 可能的下载任务」，
+                // 快速连点会让多个协程并发跑同一套流程，既浪费请求，也会因服务端 user-data 的
+                // 整表读改写而彼此覆盖（用户看到「点了没反应」）。同一首歌 600ms 内只处理一次。
+                val nowFavMs = System.currentTimeMillis()
+                val lastFavMs = favoriteToggleGuard[songToFav.id]
+                if (lastFavMs != null && nowFavMs - lastFavMs < 600L) {
+                    Log.i("MainActivity", "toggleFavorite debounced for ${songToFav.title}")
+                } else {
+                    favoriteToggleGuard[songToFav.id] = nowFavMs
+                    if (favoriteToggleGuard.size > 256) {
+                        favoriteToggleGuard.entries.removeAll { nowFavMs - it.value > 60_000L }
+                    }
                 val newFav = !songToFav.isFavorite
                 val isAutoCache = uiPrefs.getBoolean("auto_cache_on_favorite", false) ||
                     uiPrefs.getBoolean("auto_cache_to_server_on_favorite", false)
@@ -1659,6 +1740,7 @@ class MainActivity : ComponentActivity() {
                     } catch (e: Exception) {
                         Log.e("MainActivity", "handleToggleFavorite error", e)
                     }
+                }
                 }
             }
 
@@ -1949,16 +2031,28 @@ class MainActivity : ComponentActivity() {
                         val targetSong = currentSong
                         val resumePos = (exoPlayer?.currentPosition ?: 0L).coerceAtLeast(0L)
                         if (targetSong != null) {
+                            // 本地回退与音质降级必须**严格串行**：把整库磁盘 stat 放到 IO 线程
+                            // 并等它返回，命中本地版本即 return，避免与降级分支双重起播。
                             if (autoFallbackToLocal) {
                                 // 1. 优先尝试切换至本地离线音频文件并保留当前播放进度（严格核对版本与时长）
-                                val matchedLocalSong = (songList + completedDownloadedSongs).firstOrNull {
-                                    val hasFile = !it.localFilePath.isNullOrBlank() && java.io.File(it.localFilePath).let { f -> f.exists() && f.length() > 0 }
-                                    hasFile && (it.id == targetSong.id || SongMatchingResolver.isSongMatch(
-                                        it.title, it.artist, it.durationMs,
-                                        targetSong.title, targetSong.artist, targetSong.durationMs,
-                                        it.album, targetSong.album
-                                    ))
-                                }
+                                //   **必须在 IO 线程做**：候选集是整个曲库，逐条 File.exists() 是 O(n) 磁盘
+                                //   stat。onPlayerError 运行在 ExoPlayer 主线程，若在此同步遍历，
+                                //   大曲库 + 在线断流时会在主线程打出成百上千次 stat，直接掉帧甚至 ANR。
+                                //   这里改为「提交到 IO 线程池 + 取值」，既能避免主线程 stat，
+                                //   又保持了改造前的「串行决策」语义（先定本地、再决定是否降级）。
+                                val fallbackCandidates = songList + completedDownloadedSongs
+                                val matchedLocalSong = runCatching {
+                                    java.util.concurrent.CompletableFuture.supplyAsync({
+                                        fallbackCandidates.firstOrNull {
+                                            val hasFile = !it.localFilePath.isNullOrBlank() && java.io.File(it.localFilePath).let { f -> f.exists() && f.length() > 0 }
+                                            hasFile && (it.id == targetSong.id || SongMatchingResolver.isSongMatch(
+                                                it.title, it.artist, it.durationMs,
+                                                targetSong.title, targetSong.artist, targetSong.durationMs,
+                                                it.album, targetSong.album
+                                            ))
+                                        }
+                                    }, java.util.concurrent.Executors.newSingleThreadExecutor()).get(3, java.util.concurrent.TimeUnit.SECONDS)
+                                }.getOrNull()
                                 if (matchedLocalSong != null && matchedLocalSong.localFilePath != targetSong.localFilePath) {
                                     Toast.makeText(this@MainActivity, "在线音频缓冲受阻，已无缝切换至本地离线版本", Toast.LENGTH_SHORT).show()
                                     val localSong = targetSong.copy(
@@ -1971,7 +2065,7 @@ class MainActivity : ComponentActivity() {
                                         context = this@MainActivity,
                                         startPositionMs = resumePos
                                     )
-                                    return
+                                    return   // 已切到本地版本，后续降级分支不再执行
                                 }
                             }
 
@@ -2887,7 +2981,7 @@ class MainActivity : ComponentActivity() {
                                             // 写 prefs 后更新状态：LocalPlatformMode 变更会让两个焦点修饰符重算，
                                             // 以及 dispatchKeyEvent 的按键闸门立即生效，无需重启。
                                             uiPrefs.edit().putString(PLATFORM_MODE_PREF_KEY, mode.key).apply()
-                                            platformMode = mode
+                                            platformModeState.value = mode
                                         },
                                         onStreamQualityChanged = {
                                             LemonMusicProtocol.notifyStreamQualityConfigChanged()
@@ -3164,7 +3258,6 @@ class MainActivity : ComponentActivity() {
                                 isLyricsMode = isLyricsMode,
                                 isShuffle = isShuffle,
                                 isRepeat = isRepeat,
-                                playbackSpeed = playbackSpeed,
                                 allPlaylists = playlistsList,
                                 isServerConnected = (serversList.any { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }),
                                 onTogglePlayPause = togglePlayPause,
@@ -3183,11 +3276,6 @@ class MainActivity : ComponentActivity() {
                                 },
                                 onToggleShuffle = { PlaybackQueueManager.setShuffle(!isShuffle) },
                                 onToggleRepeat = { PlaybackQueueManager.setRepeat(!isRepeat) },
-                                onChangePlaybackSpeed = { speed ->
-                                    playbackSpeed = speed
-                                    uiPrefs.edit().putFloat("playback_speed", speed).apply()
-                                    exoPlayer?.playbackParameters = androidx.media3.common.PlaybackParameters(speed)
-                                },
                                 onDownloadSong = handleDownloadSong,
                                 onDownloadSongWithOptions = handleDownloadWithOptions,
                                 onAddToPlaylist = handleAddToPlaylist,
@@ -3245,6 +3333,10 @@ class MainActivity : ComponentActivity() {
                                         AppUpdateManager.downloadApk(
                                             context = this@MainActivity,
                                             downloadUrl = info.downloadUrl,
+                                            // 传服务端声明的大小与哈希：下载完成后做完整性校验，
+                                            // 短包 / 被替换的安装包会在落盘后被识别并删除
+                                            expectedSizeBytes = info.apkSizeBytes,
+                                            expectedSha256 = info.apkSha256,
                                             onProgress = { progress, _, _ -> downloadStartupProgress = progress }
                                         ).onSuccess { apkFile ->
                                             isDownloadingStartupApk = false
@@ -3274,7 +3366,7 @@ class MainActivity : ComponentActivity() {
                         PlatformModeWizard(
                             onSelect = { mode ->
                                 uiPrefs.edit().putString(PLATFORM_MODE_PREF_KEY, mode.key).apply()
-                                platformMode = mode
+                                platformModeState.value = mode
                                 navigateToScreen(Screen.MINE)
                             }
                         )
@@ -3362,6 +3454,20 @@ class MainActivity : ComponentActivity() {
      */
     private val isCarPlatformActive: Boolean
         get() = PlatformMode.fromKey(settingsPrefs.getString(PLATFORM_MODE_PREF_KEY, null)) == PlatformMode.CAR
+
+    /**
+     * 车机模式长按返回键的逃生入口：切回电视模式并恢复遥控焦点体系。
+     * 同时更新偏好与 Activity 级状态，立即生效、无需重启。
+     */
+    private fun switchBackToTvPlatformMode() {
+        try {
+            settingsPrefs.edit().putString(PLATFORM_MODE_PREF_KEY, PlatformMode.TV.key).apply()
+            platformModeState.value = PlatformMode.TV
+            Toast.makeText(this, "已通过长按返回键切回「电视 / 机顶盒」模式，遥控器已恢复", Toast.LENGTH_LONG).show()
+        } catch (e: Throwable) {
+            e.printStackTrace()
+        }
+    }
 
     /** 电视导航键：车机模式下需要被整体掐断的按键集合（不含 BACK、媒体键、音量键）。 */
     private fun isTvNavKey(keyCode: Int): Boolean {
@@ -3553,6 +3659,24 @@ class MainActivity : ComponentActivity() {
         // 不能保证有节点持有焦点，挂在 Compose 上的拦截器可能根本收不到事件。
         // BACK、媒体键、音量键一概不受影响，陀螺仪外的手势与触控也照常。
         if (isCarPlatformActive && isTvNavKey(event.keyCode)) return true
+
+        // 车机模式的**遥控器逃生通道**：长按返回键 2 秒切回电视模式。
+        // 车机模式会停用整套 Compose 焦点体系并在此处吞掉全部 D-Pad 事件，无触屏电视/盒子
+        // 一旦被切到车机（设置页误按、他人误操作）就再也进不了任何界面。BACK 键是本模式下
+        // 唯一仍被放行的按键，因此用它承载逃生入口，且短按返回的原有语义完全不受影响。
+        if (isCarPlatformActive && event.keyCode == KeyEvent.KEYCODE_BACK) {
+            when (event.action) {
+                KeyEvent.ACTION_DOWN -> {
+                    if (carEscapeBackDownAt < 0L) carEscapeBackDownAt = SystemClock.elapsedRealtime()
+                    if (SystemClock.elapsedRealtime() - carEscapeBackDownAt >= 2000L) {
+                        carEscapeBackDownAt = -1L
+                        switchBackToTvPlatformMode()
+                        return true
+                    }
+                }
+                KeyEvent.ACTION_UP -> carEscapeBackDownAt = -1L
+            }
+        }
 
         // 车机模式下不认「频道 / 翻页 / 导航」这类电视遥控器的借位映射（见 isTvStyleMediaKey）：
         // 车机上这些键位常被旋钮、预置键占用，继续当切歌键判读会表现为"莫名跳歌"。

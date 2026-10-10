@@ -104,7 +104,6 @@ fun FullscreenPlayerSheet(
     isLyricsMode: Boolean,
     isShuffle: Boolean,
     isRepeat: Boolean,
-    playbackSpeed: Float = 1.0f,
     allPlaylists: List<UnifiedPlaylist> = emptyList(),
     // 原先这里有个 activeDownloadTasks: List<DownloadTask> 参数，但整个播放页从未读过它
     // (编译期 "Parameter is never used")。删掉它顺带消掉了根作用域对 3Hz 下载流的又一次读取 ——
@@ -119,7 +118,6 @@ fun FullscreenPlayerSheet(
     onToggleFavorite: () -> Unit,
     onToggleShuffle: () -> Unit,
     onToggleRepeat: () -> Unit,
-    onChangePlaybackSpeed: (Float) -> Unit = {},
     onDownloadSong: (UnifiedSong) -> Unit = {},
     onDownloadSongWithOptions: (UnifiedSong, DownloadTarget, AudioQuality) -> Unit = { s, _, _ -> onDownloadSong(s) },
     onAddToPlaylist: (UnifiedPlaylist, UnifiedSong) -> Unit = { _, _ -> },
@@ -140,17 +138,25 @@ fun FullscreenPlayerSheet(
     // 横屏右侧视窗显示模式：0 为实时歌词，1 为待播队列
     var landscapeRightPaneMode by remember { mutableStateOf(0) }
 
-    // 监听外部歌词模式变化并联动 Pager
-    LaunchedEffect(isLyricsMode) {
+    // 监听外部歌词模式变化并联动 Pager。
+    // 注意：HorizontalPager 只存在于**竖屏分支**（isLandscape == false）中；横屏下 pagerState
+    // 没有对应的 Pager 节点，animateScrollToPage 会抛 IllegalStateException/空操作，
+    // 因此这里必须按 isLandscape 收敛。
+    LaunchedEffect(isLyricsMode, isLandscape) {
+        if (isLandscape) return@LaunchedEffect
         val targetPage = if (isLyricsMode) 1 else 0
         if (pagerState.currentPage != targetPage) {
             pagerState.animateScrollToPage(targetPage)
         }
     }
 
-    // 监听 Pager 滑动并反向同步状态
-    LaunchedEffect(pagerState.currentPage) {
-        onToggleLyricsMode(pagerState.currentPage == 1)
+    // 监听 Pager 滑动并反向同步状态。
+    // 只在竖屏分支生效：横屏没有 Pager，若仍反向回调会与上面的外部驱动形成双源同步环
+    // （外部改 isLyricsMode → effect 推 pager → pager 变化又回调 onToggleLyricsMode）。
+    LaunchedEffect(pagerState.currentPage, isLandscape) {
+        if (!isLandscape) {
+            onToggleLyricsMode(pagerState.currentPage == 1)
+        }
     }
 
     // 下拉滑动最小化手势位移
@@ -166,8 +172,84 @@ fun FullscreenPlayerSheet(
     var showDownloadMenu by remember { mutableStateOf(false) }
     var showLandscapeDownloadMenu by remember { mutableStateOf(false) }
     var showPlayerThemeMenu by remember { mutableStateOf(false) }
+    // 竖屏/横屏歌词区内部的「歌词调节」下拉浮层是否展开（由 LyricsScrollingView 回调上报）。
+    // 该浮层在自己的组件内部管理展开状态，此前完全没有纳入 anyPopupExpanded，
+    // 是「点开歌词调节后遥控器失灵」的直接原因。
+    var lyricsOverlayExpanded by remember { mutableStateOf(false) }
     var activeTimerMinutes by remember { mutableStateOf(0) }
     var localIsFavorite by remember(song.id, song.isFavorite) { mutableStateOf(song.isFavorite) }
+
+    // ===== 睡眠定时关闭：真正生效的实现 =====
+    // 此前这里只有 activeTimerMinutes 一个 remember 状态 + 一句 Toast，全工程没有任何消费者
+    // （grep activeTimerMinutes 仅出现在本文件 UI 层）—— 用户设置「15 分钟后停止播放」后
+    // 永远不会生效，属于典型的「界面看起来能用、实际无实现」。
+    // 现在：记录到期时间戳（可跨重组保留），到点调用播放/暂停回调停止播放。
+    var sleepTimerEndsAtMs by remember { mutableStateOf(0L) }
+    // 剩余秒数仅用于胶囊上的倒计时展示，1 秒一跳，不参与任何业务判定
+    var sleepTimerRemainingSec by remember { mutableStateOf(0L) }
+    // 每次设置/取消定时器都递增，作为 LaunchedEffect 的重启触发键
+    var sleepTimerRevision by remember { mutableStateOf(0) }
+    // 「播完当前曲」是预设里的 -1 档：它不是倒计时，而是等本曲结束再停，
+    // 因此必须单独标记，否则会被当成「已到期」立即停止播放。
+    var sleepTimerStopAfterCurrent by remember { mutableStateOf(false) }
+    // 「播完当前曲」在**设置那一刻**正在播的曲目 id。
+    // 关键：不能用 sleepTimerStopAfterCurrent 本身作为 LaunchedEffect 的 key ——
+    // applySleepTimer(-1) 把它置 true 会立刻重启该 effect，脚本当即判定「本曲已播完」，
+    // 表现为「一选播完当前曲就马上停播」。改为记录当时曲目、只在 song.id 变化时才结算。
+    var sleepTimerArmedSongId by remember { mutableStateOf("") }
+
+    LaunchedEffect(sleepTimerRevision, sleepTimerEndsAtMs) {
+        if (sleepTimerEndsAtMs <= 0L) {
+            sleepTimerRemainingSec = 0L
+            return@LaunchedEffect
+        }
+        while (true) {
+            val remain = sleepTimerEndsAtMs - System.currentTimeMillis()
+            if (remain <= 0L) break
+            sleepTimerRemainingSec = (remain + 999L) / 1000L
+            kotlinx.coroutines.delay(1000L)
+        }
+        // 到期：只有确实在播放时才需要停止，避免把用户手动暂停的状态反转成播放
+        sleepTimerRemainingSec = 0L
+        sleepTimerEndsAtMs = 0L
+        activeTimerMinutes = 0
+        if (isPlaying) {
+            onTogglePlayPause()
+        }
+        Toast.makeText(context, "睡眠定时已到，已停止播放", Toast.LENGTH_SHORT).show()
+    }
+
+    /** 统一的定时器设置入口：min > 0 为分钟数；min == -1 为「播完当前曲」；min == 0 为取消 */
+    fun applySleepTimer(min: Int) {
+        activeTimerMinutes = min
+        sleepTimerStopAfterCurrent = min == -1
+        // 记录「设置那一刻正在播的曲目」：只有它被换掉才算播完
+        sleepTimerArmedSongId = if (min == -1) song.id else ""
+        sleepTimerEndsAtMs = if (min > 0) System.currentTimeMillis() + min * 60_000L else 0L
+        sleepTimerRemainingSec = 0L
+        sleepTimerRevision++
+        when {
+            min > 0 -> Toast.makeText(context, "已设置：${min}分钟后停止播放", Toast.LENGTH_SHORT).show()
+            min == -1 -> Toast.makeText(context, "已设置：播完当前曲目后停止", Toast.LENGTH_SHORT).show()
+            else -> Toast.makeText(context, "已关闭定时器", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // 「播完当前曲」的落地：只有「设置时正在播的那首歌」真的换了，才算播完。
+    // key 里**不能**包含 sleepTimerStopAfterCurrent 本身，否则设置动作会立刻触发结算。
+    LaunchedEffect(song.id) {
+        if (sleepTimerStopAfterCurrent && sleepTimerArmedSongId.isNotBlank() && song.id != sleepTimerArmedSongId) {
+            sleepTimerStopAfterCurrent = false
+            sleepTimerArmedSongId = ""
+            activeTimerMinutes = 0
+            sleepTimerRemainingSec = 0L
+            // 到点时如果用户已经手动暂停，不要再反转成播放
+            if (isPlaying) {
+                onTogglePlayPause()
+            }
+            Toast.makeText(context, "当前曲目已播完，已停止播放", Toast.LENGTH_SHORT).show()
+        }
+    }
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
 
     // 进度条拖动中的临时比例：拖动期间由手势接管显示，松手后才真正 seek，
@@ -368,7 +450,13 @@ fun FullscreenPlayerSheet(
     // 进度状态在这里才被读取：订阅范围收窄到本播放页，不再牵连调用方的整棵组合树
     val progressMs = progressMsProvider()
 
-    val anyPopupExpanded = showLandscapeAddToPlaylistMenu || showLandscapeDownloadMenu || showSleepTimerPanel || showAudioSpecsPanel || showPlayerThemeMenu
+    // 浮层总开关：**必须包含页面上所有会抢焦点的浮层**。
+    // 此前漏掉了 showQueueSheet / showPortraitAddToPlaylistMenu / showDownloadMenu / 歌词调节浮层，
+    // 导致这些浮层抢走焦点后 sheetHasFocus=false，下面的「焦点防丢守护协程」在 120ms 后
+    // 把焦点强行拉回播放键 —— 浮层明明弹出来了却收不到按键（表现为「菜单点开就卡住」）。
+    val anyPopupExpanded = showLandscapeAddToPlaylistMenu || showLandscapeDownloadMenu ||
+        showPortraitAddToPlaylistMenu || showDownloadMenu || showQueueSheet ||
+        showSleepTimerPanel || showAudioSpecsPanel || showPlayerThemeMenu || lyricsOverlayExpanded
 
     LaunchedEffect(lastUserInteractionTick, isNeteaseCoverMode, isNeteaseControlsVisible, anyPopupExpanded, landscapeRightPaneMode) {
         if (isNeteaseCoverMode && isNeteaseControlsVisible && !anyPopupExpanded && landscapeRightPaneMode == 0) {
@@ -555,7 +643,7 @@ fun FullscreenPlayerSheet(
                 )
             }
     ) {
-        if (true) {
+        if (isLandscape) {
             // =========================================================================
             // TV 横屏客厅影院级布局：支持「经典黑胶分屏 (MODERN)」与「网易云全屏封面 (NETEASE_TV_COVER)」一键切换
             // =========================================================================
@@ -1130,8 +1218,13 @@ fun FullscreenPlayerSheet(
                                         }
 
                                         // 4. 下载与缓存
-                                        val hasPhysicalLocal = !song.localFilePath.isNullOrBlank() && 
-                                            (song.localFilePath!!.startsWith("content://") || runCatching { java.io.File(song.localFilePath!!).let { it.exists() && it.length() > 0L } }.getOrDefault(false))
+                                        // 播放页在播放期间会因进度刷新持续重组，这里的磁盘 stat 必须 remember，
+                                        // 否则播放中会在主线程不断做 File.exists()（U-4）。同时去掉 !! 脆弱写法。
+                                        val hasPhysicalLocal = remember(song.id, song.localFilePath) {
+                                            val path = song.localFilePath
+                                            !path.isNullOrBlank() && (path.startsWith("content://") ||
+                                                runCatching { java.io.File(path).let { it.exists() && it.length() > 0L } }.getOrDefault(false))
+                                        }
                                         Box {
                                             Box(
                                                 modifier = Modifier
@@ -1456,8 +1549,13 @@ fun FullscreenPlayerSheet(
                             }
 
                             // 缓存与下载
-                            val hasPhysicalLocal = !song.localFilePath.isNullOrBlank() && 
-                                (song.localFilePath!!.startsWith("content://") || runCatching { java.io.File(song.localFilePath!!).let { it.exists() && it.length() > 0L } }.getOrDefault(false))
+                            // 播放页在播放期间会因进度刷新持续重组，这里的磁盘 stat 必须 remember，
+                            // 否则播放中会在主线程不断做 File.exists()（U-4）。同时去掉 !! 脆弱写法。
+                            val hasPhysicalLocal = remember(song.id, song.localFilePath) {
+                                val path = song.localFilePath
+                                !path.isNullOrBlank() && (path.startsWith("content://") ||
+                                    runCatching { java.io.File(path).let { it.exists() && it.length() > 0L } }.getOrDefault(false))
+                            }
                             Box {
                                 Box(
                                     modifier = Modifier
@@ -2118,14 +2216,8 @@ fun FullscreenPlayerSheet(
                                         try { timerBtnFocusRequester.requestFocus() } catch (_: Exception) {}
                                     },
                                     activeTimerMinutes = activeTimerMinutes,
-                                    onSelectTimer = { min ->
-                                        activeTimerMinutes = min
-                                        if (min > 0) {
-                                            Toast.makeText(context, "已设置：${min}分钟后停止播放", Toast.LENGTH_SHORT).show()
-                                        } else {
-                                            Toast.makeText(context, "已关闭定时器", Toast.LENGTH_SHORT).show()
-                                        }
-                                    }
+                                    remainingSeconds = sleepTimerRemainingSec,
+                                    onSelectTimer = { min -> applySleepTimer(min) }
                                 )
                             }
 
@@ -2292,6 +2384,7 @@ fun FullscreenPlayerSheet(
                                         upFocusRequester = lyricsTabFocusRequester,
                                         leftFocusRequester = repeatFocusRequester,
                                         downFocusRequester = infoBtnFocusRequester,
+                                        onOverlayStateChanged = { lyricsOverlayExpanded = it },
                                         modifier = Modifier.fillMaxSize()
                                     )
                                 } else {
@@ -2549,6 +2642,7 @@ fun FullscreenPlayerSheet(
                             onOffsetChange = updateOffset,
                             onThemeChange = updateTheme,
                             showAdjustButton = true,
+                            onOverlayStateChanged = { lyricsOverlayExpanded = it },
                             modifier = Modifier.fillMaxSize()
                         )
                     }
@@ -2630,8 +2724,13 @@ fun FullscreenPlayerSheet(
                         }
 
                         // 下载与缓存选择按钮 (支持本地/服务器/双端同步选择)
-                        val hasPhysicalLocal = !song.localFilePath.isNullOrBlank() && 
-                            (song.localFilePath!!.startsWith("content://") || runCatching { java.io.File(song.localFilePath!!).let { it.exists() && it.length() > 0L } }.getOrDefault(false))
+                        // 播放页在播放期间会因进度刷新持续重组，这里的磁盘 stat 必须 remember，
+                        // 否则播放中会在主线程不断做 File.exists()（U-4）。同时去掉 !! 脆弱写法。
+                        val hasPhysicalLocal = remember(song.id, song.localFilePath) {
+                            val path = song.localFilePath
+                            !path.isNullOrBlank() && (path.startsWith("content://") ||
+                                runCatching { java.io.File(path).let { it.exists() && it.length() > 0L } }.getOrDefault(false))
+                        }
                         Box {
                             Box(
                                 modifier = Modifier
@@ -2826,14 +2925,8 @@ fun FullscreenPlayerSheet(
                             expanded = showSleepTimerPanel,
                             onDismissRequest = { showSleepTimerPanel = false },
                             activeTimerMinutes = activeTimerMinutes,
-                            onSelectTimer = { min ->
-                                activeTimerMinutes = min
-                                if (min > 0) {
-                                    Toast.makeText(context, "已设置：${min}分钟后停止播放", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    Toast.makeText(context, "已关闭定时器", Toast.LENGTH_SHORT).show()
-                                }
-                            }
+                            remainingSeconds = sleepTimerRemainingSec,
+                            onSelectTimer = { min -> applySleepTimer(min) }
                         )
                     }
 
@@ -2960,6 +3053,8 @@ fun SleepTimerDropdownMenu(
     expanded: Boolean,
     onDismissRequest: () -> Unit,
     activeTimerMinutes: Int,
+    /** 剩余秒数：由宿主每秒更新，用于展示真实倒计时（0 表示未设置或已到期） */
+    remainingSeconds: Long = 0L,
     onSelectTimer: (Int) -> Unit
 ) {
     val firstItemFocusRequester = remember { FocusRequester() }
@@ -2979,7 +3074,15 @@ fun SleepTimerDropdownMenu(
         modifier = Modifier.widthIn(min = 220.dp, max = 280.dp)
     ) {
         Text(
-            text = if (activeTimerMinutes > 0) "已设置：${activeTimerMinutes}分钟后停止" else "睡眠定时关闭",
+            text = if (activeTimerMinutes > 0 && remainingSeconds > 0L) {
+                val m = remainingSeconds / 60
+                val s = remainingSeconds % 60
+                "将在 %d:%02d 后停止播放".format(java.util.Locale.US, m, s)
+            } else if (activeTimerMinutes > 0) {
+                "已设置：${activeTimerMinutes}分钟后停止"
+            } else {
+                "睡眠定时关闭"
+            },
             style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant),
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
         )

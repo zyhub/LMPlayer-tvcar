@@ -1548,7 +1548,7 @@ fun SettingsScreen(
                             SettingDropdownRow(
                                 title = "使用平台模式",
                                 subtitle = if (currentPlatformMode == PlatformMode.CAR) {
-                                    "车机 / 中控：以触控为主，已停用遥控器焦点光环与方向键操作，降低车机资源占用"
+                                    "车机 / 中控：以触控为主，已停用遥控器焦点光环与方向键操作。\n无触屏设备如需切回电视模式：长按遥控器「返回键」2 秒。"
                                 } else {
                                     "电视 / 机顶盒：完整启用遥控器焦点光环、方向键导航与菜单键快捷键"
                                 },
@@ -1556,6 +1556,11 @@ fun SettingsScreen(
                                 selectedValue = currentPlatformMode,
                                 options = PlatformMode.entries.toList(),
                                 getLabel = { it.displayName },
+                                // 关键：平台模式绝不能被左右方向键「顺手」改掉。
+                                // 车机模式会停用整套遥控焦点体系（tvFocusable 的 canFocus=false）
+                                // 并在 Activity 层吞掉全部 D-Pad 事件，无触屏电视/盒子一旦误切就
+                                // 再也进不了设置页 —— 此前遥控器扫过这一行按一次左右键即触发。
+                                allowHorizontalKeyChange = false,
                                 onSelect = onPlatformModeChange
                             )
                         }
@@ -2550,9 +2555,15 @@ fun SettingsScreen(
                     isDownloadingUpdate = true
                     updateDownloadProgress = 0f
                     coroutineScope.launch {
+                        val info = activeUpdateInfo
+                        if (info == null) {
+                            isDownloadingUpdate = false
+                        } else {
                         AppUpdateManager.downloadApk(
                             context = context,
-                            downloadUrl = activeUpdateInfo!!.downloadUrl,
+                            downloadUrl = info.downloadUrl,
+                            expectedSizeBytes = info.apkSizeBytes,
+                            expectedSha256 = info.apkSha256,
                             onProgress = { progress, _, _ -> updateDownloadProgress = progress }
                         ).onSuccess { apkFile ->
                             isDownloadingUpdate = false
@@ -2563,6 +2574,7 @@ fun SettingsScreen(
                         }.onFailure { error ->
                             isDownloadingUpdate = false
                             Toast.makeText(context, "下载更新失败: ${error.message ?: "网络异常"}", Toast.LENGTH_LONG).show()
+                        }
                         }
                     }
                 }
@@ -2836,6 +2848,12 @@ private fun <T> SettingDropdownRow(
     options: List<T>,
     getLabel: (T) -> String,
     getSubtitle: ((T) -> String)? = null,
+    /**
+     * 是否允许左右方向键直接切换取值。默认开启（快捷）。
+     * 对「改错会带来不可逆后果」的选项（如平台模式切到车机会停用整套遥控焦点体系）必须传 false，
+     * 强制用户按 OK 展开下拉菜单确认选择。
+     */
+    allowHorizontalKeyChange: Boolean = true,
     onSelect: (T) -> Unit
 ) {
     val dimensions = LocalAppDimensions.current
@@ -2859,6 +2877,7 @@ private fun <T> SettingDropdownRow(
             .tvFocusable(
                 shape = RoundedCornerShape(12.dp),
                 focusedScale = 1.015f,
+                allowHorizontalKeyChange = allowHorizontalKeyChange,
                 onLeftKey = { _ ->
                     if (options.isNotEmpty()) {
                         val curIdx = options.indexOf(selectedValue).coerceAtLeast(0)

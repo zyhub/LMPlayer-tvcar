@@ -11,29 +11,79 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface SongDao {
+    @Deprecated("大曲库下全量查询 Flow 会导致 CursorWindow 2MB 崩溃，请使用 getAllSongsList() 游标分页或定向条件查询")
     @Query("SELECT * FROM songs ORDER BY lastPlayedTimestamp DESC")
     fun getAllSongsFlow(): Flow<List<SongEntity>>
 
+    @Deprecated("大曲库下全量查询 Flow 会导致 CursorWindow 2MB 崩溃，请使用游标分页或定向条件查询")
     @Query("SELECT * FROM songs WHERE serverId = :serverId ORDER BY addedTimestamp DESC")
     fun getSongsByServerFlow(serverId: String): Flow<List<SongEntity>>
 
+    @Deprecated("大曲库下全量查询 Flow 会导致 CursorWindow 2MB 崩溃，请使用游标分页或定向条件查询")
     @Query("SELECT * FROM songs WHERE downloadStatus = 'DOWNLOADED' ORDER BY addedTimestamp DESC")
     fun getDownloadedSongsFlow(): Flow<List<SongEntity>>
 
+    @Deprecated("大曲库下全量查询 Flow 会导致 CursorWindow 2MB 崩溃，请使用游标分页或定向条件查询")
     @Query("SELECT * FROM songs WHERE isFavorite = 1 ORDER BY addedTimestamp DESC")
     fun getFavoriteSongsFlow(): Flow<List<SongEntity>>
 
     @Query("SELECT * FROM songs WHERE id = :songId LIMIT 1")
     suspend fun getSongById(songId: String): SongEntity?
 
+    /**
+     * 播放路由定向候选匹配：按歌曲 ID 与标题精准/模糊筛选，严禁拉取全库导致起播卡顿与内存膨胀
+     */
+    @Query("SELECT * FROM songs WHERE id = :songId OR title = :title OR (length(:title) >= 2 AND title LIKE '%' || :title || '%') LIMIT 40")
+    suspend fun findCandidatesForPlayback(songId: String, title: String): List<SongEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertSongs(songs: List<SongEntity>)
+    suspend fun insertSongsRaw(songs: List<SongEntity>)
+
+    /**
+     * 分块写入歌曲 —— **大曲库必须走这里，不要直接调用 insertSongsRaw**。
+     *
+     * Room 的 @Insert(List) 会把整个列表放进**一个事务**；songs 表有 8 个索引，
+     * 2 万行 = 16 万次索引更新，SQLite 在单事务中会把脏页累积在内存里直到 commit。
+     * 整库同步时这一步的峰值内存可达上百 MB，叠加同一时刻仍在内存里的原始 JSON 与
+     * 入库前的实体列表，很容易在 192~256MB 堆的设备（含电视盒子）上直接 OOM。
+     * 电视盒子的堆上限通常比手机更紧，因此这里的分块尤其重要。
+     */
+    suspend fun insertSongs(songs: List<SongEntity>) {
+        if (songs.isEmpty()) return
+        val chunk = 500
+        var index = 0
+        while (index < songs.size) {
+            val end = minOf(index + chunk, songs.size)
+            insertSongsRaw(songs.subList(index, end))
+            index = end
+        }
+    }
 
     @Update
     suspend fun updateSong(song: SongEntity)
 
-    @Query("SELECT * FROM songs")
-    suspend fun getAllSongsList(): List<SongEntity>
+    // 大曲库一次性 SELECT * 会撑爆 CursorWindow 2MB 上限（歌曲过多时必现
+    // "Couldn't read row N from CursorWindow" 崩溃），因此分页读取后聚合。
+    //
+    // 分页方式改为**主键游标**而不是 LIMIT/OFFSET：
+    //  - LIMIT/OFFSET 在深分页时逐页扫描量线性增长（第 N 页要跳过前 N-1 页），大曲库下退化为 O(n²)；
+    //  - 且 OFFSET 分页没有稳定排序键，分页期间若有并发写入（同步入库 / 扫描）会漏读或重读同一行。
+    // 用 id > lastId ORDER BY id 既能走主键索引，也不受并发插入影响。
+    @Query("SELECT * FROM songs WHERE id > :lastId ORDER BY id ASC LIMIT :limit")
+    suspend fun getSongsPageByCursor(lastId: String, limit: Int): List<SongEntity>
+
+    suspend fun getAllSongsList(): List<SongEntity> {
+        val result = ArrayList<SongEntity>()
+        val pageSize = 200
+        var lastId = ""
+        while (true) {
+            val page = getSongsPageByCursor(lastId, pageSize)
+            result.addAll(page)
+            if (page.size < pageSize) break
+            lastId = page.last().id
+        }
+        return result
+    }
 
     @Query("UPDATE songs SET downloadStatus = :status, localFilePath = :localPath WHERE id = :songId")
     suspend fun updateDownloadStatus(songId: String, status: DownloadStatus, localPath: String?)
@@ -53,11 +103,30 @@ interface SongDao {
     @Query("UPDATE songs SET isFavorite = :isFavorite WHERE id = :idOrPath OR localFilePath = :idOrPath")
     suspend fun updateFavoriteByIdOrPath(idOrPath: String, isFavorite: Boolean)
 
+    @Query("UPDATE songs SET isFavorite = 0 WHERE serverId NOT IN ('local_storage', 'local_folder', 'local_saf')")
+    suspend fun clearServerFavorites()
+
     @Query("UPDATE songs SET lastPlayedTimestamp = :timestamp WHERE id = :songId")
     suspend fun updateLastPlayed(songId: String, timestamp: Long)
 
     @Query("DELETE FROM songs WHERE id IN (:songIds)")
-    suspend fun deleteSongsByIds(songIds: List<String>)
+    suspend fun deleteSongsByIdsRaw(songIds: List<String>)
+
+    /**
+     * 分块删除歌曲 —— **不要直接调用 deleteSongsByIdsRaw**。
+     *
+     * Room 会把 `IN (:songIds)` 展开成 N 个绑定参数，而 SQLite 的变量上限是
+     * API<30 为 999、API>=30 为 32766。服务端重命名/移动目录后 md5(filePath) 变化，
+     * 旧 id 会**成批**变成孤儿，一次传入上千个 id 就会抛
+     * `SQLiteException: too many SQL variables`。
+     * 该异常此前落在没有 try/catch 的同步链路里 → 未捕获异常 → 进程崩溃；
+     * 在 purgeLegacyResidualData 里则被 catch(Exception) 吞掉 → 一条都删不掉（静默失效）。
+     */
+    suspend fun deleteSongsByIds(songIds: List<String>) {
+        if (songIds.isEmpty()) return
+        // 500 远低于 API<30 的 999 上限，留足余量
+        songIds.chunked(500).forEach { deleteSongsByIdsRaw(it) }
+    }
 
     @Query("DELETE FROM songs WHERE id = :songId")
     suspend fun deleteSongById(songId: String)
@@ -172,6 +241,9 @@ interface PlaylistDao {
 
     @Query("DELETE FROM playlist_songs WHERE playlistId = :playlistId")
     suspend fun clearSongsForPlaylist(playlistId: String)
+
+    @Query("DELETE FROM playlist_songs WHERE songId = :songId")
+    suspend fun removeSongFromAllPlaylists(songId: String)
 
     @Query("SELECT s.* FROM songs s INNER JOIN playlist_songs ps ON s.id = ps.songId WHERE ps.playlistId = :playlistId ORDER BY ps.orderIndex ASC")
     fun getSongsForPlaylistFlow(playlistId: String): Flow<List<SongEntity>>

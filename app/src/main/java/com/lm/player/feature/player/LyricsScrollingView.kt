@@ -74,6 +74,13 @@ fun LyricsScrollingView(
     upFocusRequester: FocusRequester? = null,
     leftFocusRequester: FocusRequester? = null,
     downFocusRequester: FocusRequester? = null,
+    /**
+     * 「歌词调节」下拉浮层展开状态上报。
+     * 该浮层由本组件内部管理展开状态，但它是**独立 Popup 窗口并会抢走焦点**；
+     * 宿主播放页的「焦点防丢守护协程」若不知道它已展开，就会在 120ms 后把焦点拉回播放键，
+     * 表现为浮层弹出来了却收不到遥控器按键。宿主需把该状态并入 anyPopupExpanded。
+     */
+    onOverlayStateChanged: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -98,6 +105,8 @@ fun LyricsScrollingView(
 
     val activeColor = overrideActiveColor ?: if (isDark) lyricTheme.activeColorDark else lyricTheme.activeColorLight
     val inactiveColor = overrideInactiveColor ?: if (isDark) lyricTheme.inactiveColorDark else lyricTheme.inactiveColorLight
+    val karaokeBaseColor = overrideInactiveColor ?: lyricTheme.getKaraokeBaseColor(isDark)
+    val karaokeOverlayColor = overrideActiveColor ?: lyricTheme.getKaraokeOverlayColor(isDark)
 
     val listState = rememberLazyListState()
 
@@ -113,9 +122,10 @@ fun LyricsScrollingView(
         lastTickUptime = android.os.SystemClock.uptimeMillis()
     }
 
+    val isPlaying by com.lm.player.core.media.PlaybackQueueManager.isPlayingFlow.collectAsState()
     var frameTick by remember { mutableLongStateOf(0L) }
-    LaunchedEffect(isKaraokeEnabled) {
-        if (isKaraokeEnabled) {
+    LaunchedEffect(isKaraokeEnabled, isPlaying) {
+        if (isKaraokeEnabled && isPlaying) {
             while (true) {
                 withFrameMillis { frameTick = it }
             }
@@ -293,7 +303,7 @@ fun LyricsScrollingView(
                                             fontFamily = lyricFontFamily,
                                             fontSize = currentSize,
                                             fontWeight = fontWeight,
-                                            color = inactiveColor.copy(alpha = 0.55f),
+                                            color = karaokeBaseColor,
                                             lineHeight = (currentSize.value * 1.16f).sp
                                         ),
                                         maxLines = if (lines <= 5) 1 else 2,
@@ -306,7 +316,7 @@ fun LyricsScrollingView(
                                             fontFamily = lyricFontFamily,
                                             fontSize = currentSize,
                                             fontWeight = fontWeight,
-                                            color = activeColor,
+                                            color = karaokeOverlayColor,
                                             lineHeight = (currentSize.value * 1.16f).sp
                                         ),
                                         maxLines = if (lines <= 5) 1 else 2,
@@ -545,6 +555,18 @@ fun LyricsScrollingView(
                 }
 
                 // 原位浮层音频共享展出卡片
+                // 浮层展开状态上报给宿主（并入 anyPopupExpanded），避免焦点守护协程把焦点抢走
+                LaunchedEffect(showAdjustDialog) {
+                    onOverlayStateChanged(showAdjustDialog)
+                }
+                // 关键兜底：本组件可能**在浮层展开期间被移出组合**（切右侧视窗、换主题、
+                // 播放页最小化）。此时 LaunchedEffect 不会再用 false 触发上报，
+                // 宿主侧的 anyPopupExpanded 会**永久卡在 true** —— 焦点防丢守护与 5 秒自动隐藏
+                // 全部失效，症状退回到「遥控器失灵」。onDispose 负责把状态复位。
+                DisposableEffect(Unit) {
+                    onDispose { onOverlayStateChanged(false) }
+                }
+
                 LyricsAdjustDropdownMenu(
                     expanded = showAdjustDialog,
                     onDismissRequest = {

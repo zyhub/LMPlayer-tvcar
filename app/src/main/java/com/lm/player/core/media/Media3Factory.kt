@@ -71,10 +71,18 @@ object Media3Factory {
 
     /**
      * 运行时解码降级标记：为 true 时后续重建的播放器只使用软件解码器。
-     * 一旦置位则在整个进程生命周期内保持，避免反复在硬解/软解之间抖动。
+     *
+     * **不是永久标记**：置位后若连续 [HARDWARE_RETRY_SUCCESS_THRESHOLD] 首曲目在软解下
+     * 稳定播放，会调用 [noteSuccessfulPlayback] 自动尝试回到硬解 —— 原先「一旦置位进程内
+     * 不再复位」会导致一次偶发错误（音频设备热插拔、单个损坏文件）就让此后**所有**歌曲
+     * （包括 MP3/AAC）永久走软解，在盒子上表现为高解析度卡顿、发热与耗电。
      */
     @Volatile
     private var forceSoftwareDecoding = false
+
+    /** 软解模式下稳定播放的曲目计数，达到阈值后尝试回升硬解 */
+    @Volatile
+    private var softwareModeSuccessStreak = 0
 
     /** 播放器实例被重建 (解码降级) 时的订阅者，供 MediaSession 等持有方换绑新实例 */
     private val playerSwapListeners = CopyOnWriteArrayList<(ExoPlayer) -> Unit>()
@@ -92,6 +100,52 @@ object Media3Factory {
         playerSwapListeners.remove(listener)
     }
 
+    /** 软解模式下需要连续稳定播放多少首才尝试回升硬解 */
+    private const val HARDWARE_RETRY_SUCCESS_THRESHOLD = 3
+
+    /**
+     * 硬解回升的失败记忆。
+     *
+     * 原实现只看「buildPlayer 是否抛异常」来判定回升成功，而硬解真正损坏时
+     * 只有后续 onPlayerError 才能反馈 —— 于是「软解稳 3 首 → 回升 → 又报错 → 再软解」
+     * 会无限循环，在硬解确实坏掉的盒子上表现为**每 3 首就静音重建一次**。
+     * 这里记录连续失败次数，做指数退避：失败越多，下次尝试越晚。
+     */
+    @Volatile
+    private var hardwareRetryFailures = 0
+    @Volatile
+    private var nextHardwareRetryAtMs = 0L
+
+    /**
+     * 由播放层在「一首曲目稳定播放了一段时间」时调用。
+     *
+     * 处于软解模式时累计成功次数，达到阈值就自动尝试重建回硬解 —— 这是
+     * 「一次偶发解码错误导致整机永久软解」的自愈路径。回升失败会再次降级，
+     * 不会造成反复抖动（每次回升都要再攒够 3 首成功）。
+     *
+     * 返回 true 表示本次调用触发了回升重建（调用方需要处理换绑后的续播）。
+     */
+    @Synchronized
+    fun noteSuccessfulPlayback(context: Context): Boolean {
+        if (!forceSoftwareDecoding) return false
+        softwareModeSuccessStreak++
+        if (softwareModeSuccessStreak < HARDWARE_RETRY_SUCCESS_THRESHOLD) return false
+        // 指数退避：连续失败 1/2/3/4+ 次分别等 5/10/20/40 分钟（上限 40 分钟），
+        // 避免在硬解确实不可用的设备上反复 release/rebuild（每次都会静音数秒）
+        val now = System.currentTimeMillis()
+        if (now < nextHardwareRetryAtMs) return false
+        Log.i(TAG, "软解下已连续稳定播放 $softwareModeSuccessStreak 首，尝试回升硬件解码（累计失败 $hardwareRetryFailures 次）")
+        softwareModeSuccessStreak = 0
+        val swapped = rebuildWithSoftwareDecoding(context, forceSoftware = false) != null
+        if (swapped) {
+            // 回升动作本身成功：真正的成败要等后续是否再次报解码错误来判定，
+            // 但先把退避时间推后，避免紧接着又重建一次
+            hardwareRetryFailures = 0
+            nextHardwareRetryAtMs = 0L
+        }
+        return swapped
+    }
+
     @Synchronized
     fun getSimpleCache(context: Context): SimpleCache {
         if (simpleCacheInstance == null) {
@@ -99,8 +153,22 @@ object Media3Factory {
             if (!cacheDir.exists()) {
                 cacheDir.mkdirs()
             }
-            // 2GB 最大磁盘 LRU 缓存，超出时自动淘汰最早未命中的音轨缓存切片
-            val evictor = LeastRecentlyUsedCacheEvictor(2L * 1024 * 1024 * 1024)
+            // 流媒体缓存上限：**按可用空间动态取值**，上限 300MB。
+            // 此前硬编码 2GB —— 而 cacheDir 下还有图片缓存与 OkHttp 缓存，三者合计可达 2.3GB，
+            // 电视盒子/车机内置存储常为 8~16GB，会显著挤占空间；Android 只在存储告急时才回收
+            // 缓存目录且不保证。行业常规（ExoPlayer 官方示例）为 50~200MB。
+            val cacheBudgetBytes = run {
+                val capBytes = 300L * 1024 * 1024
+                try {
+                    val stat = android.os.StatFs(cacheDir.absolutePath)
+                    // 取「上限」与「可用空间的 1/10」中的较小值，最低保留 64MB 保证基本缓冲能力
+                    val dynamic = (stat.availableBytes / 10).coerceAtLeast(64L * 1024 * 1024)
+                    minOf(capBytes, dynamic)
+                } catch (_: Exception) {
+                    capBytes
+                }
+            }
+            val evictor = LeastRecentlyUsedCacheEvictor(cacheBudgetBytes)
             val databaseProvider = StandaloneDatabaseProvider(context.applicationContext)
             simpleCacheInstance = SimpleCache(cacheDir, evictor, databaseProvider)
         }
@@ -156,6 +224,29 @@ object Media3Factory {
         }
     }
 
+    /**
+     * 释放进程级共享播放器（彻底退出播放时调用）。
+     *
+     * 此前 TV 端也没有任何一处 release()：播放器一旦 build 过就会一直持有
+     * setWakeMode(C.WAKE_MODE_NETWORK) 带来的 PARTIAL_WAKE_LOCK、解码器与 AudioTrack。
+     * 电视长期插电虽不敏感，但「用户明确关闭播放」后仍攥着音频资源并不合理，
+     * 也会让厂商省电策略把本应用判为常驻耗电应用。
+     *
+     * 注意：释放后 sharedExoPlayer 为 null，下次 getSharedExoPlayer 会重建；
+     * PlaybackQueueManager 通过 playerSwapListeners 换绑监听，MediaSession 由
+     * PlaybackService 的 playerSwapListener 换绑，两处都能自动跟上新实例。
+     */
+    @Synchronized
+    fun releaseSharedPlayer() {
+        val player = sharedExoPlayer ?: return
+        sharedExoPlayer = null
+        try {
+            player.release()
+            Log.i(TAG, "Shared ExoPlayer released")
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed to release shared ExoPlayer", e)
+        }
+    }
     @Synchronized
     fun getSharedExoPlayer(context: Context): ExoPlayer {
         sharedExoPlayer?.let { return it }
@@ -171,12 +262,41 @@ object Media3Factory {
      */
     @Synchronized
     fun rebuildWithSoftwareDecoding(context: Context): ExoPlayer {
+        return rebuildWithSoftwareDecoding(context, forceSoftware = true)!!
+    }
+
+    /**
+     * 重建播放器内核并换绑所有订阅者。
+     *
+     * @param forceSoftware true = 切到纯软件解码（降级）；false = 尝试回升硬件解码。
+     * @return 新播放器实例；无需重建时返回现有实例；重建失败返回 null。
+     */
+    @Synchronized
+    private fun rebuildWithSoftwareDecoding(context: Context, forceSoftware: Boolean): ExoPlayer? {
         val appContext = context.applicationContext
         val existing = sharedExoPlayer
-        if (forceSoftwareDecoding && existing != null) return existing
+        // 已是目标状态则无需重建（避免反复 release/rebuild 造成播放中断）
+        if (forceSoftwareDecoding == forceSoftware && existing != null) return existing
 
-        forceSoftwareDecoding = true
-        Log.w(TAG, "音频硬件解码不可用，正在重建播放器为纯软件解码模式")
+        // 换绑前保存播放器级状态：rebuild 会换掉整个播放器实例，
+        // 若不回写，用户设置的**倍速会静默回落到 1.0**（TV-C17），音量同理。
+        val savedPlaybackParameters = runCatching { existing?.playbackParameters }.getOrNull()
+        val savedVolume = runCatching { existing?.volume }.getOrNull()
+
+        // 从硬解降级到软解时累加失败次数并设置退避窗口
+        if (forceSoftware) {
+            hardwareRetryFailures++
+            val backoffMinutes = minOf(40L, 5L shl minOf(3, hardwareRetryFailures - 1))
+            nextHardwareRetryAtMs = System.currentTimeMillis() + backoffMinutes * 60_000L
+            Log.w(TAG, "硬解降级第 $hardwareRetryFailures 次，下次回升尝试推迟 $backoffMinutes 分钟")
+        }
+        forceSoftwareDecoding = forceSoftware
+        softwareModeSuccessStreak = 0
+        Log.w(
+            TAG,
+            if (forceSoftware) "音频硬件解码不可用，正在重建播放器为纯软件解码模式"
+            else "正在尝试回升硬件解码（软解下已稳定播放若干首）"
+        )
         try {
             existing?.release()
         } catch (e: Exception) {
@@ -184,16 +304,40 @@ object Media3Factory {
         }
         sharedExoPlayer = null
 
-        val fresh = buildPlayer(appContext)
+        val fresh = try {
+            buildPlayer(appContext)
+        } catch (e: Throwable) {
+            Log.e(TAG, "重建播放器失败，回退到上一个解码策略", e)
+            // 重建失败时回退：回升硬解失败就退回软解，保证「至少能播」
+            forceSoftwareDecoding = !forceSoftware
+            return try {
+                val fallback = buildPlayer(appContext)
+                sharedExoPlayer = fallback
+                notifySwap(fallback)
+                fallback
+            } catch (e2: Throwable) {
+                Log.e(TAG, "回退重建同样失败", e2)
+                null
+            }
+        }
         sharedExoPlayer = fresh
+        // 回写播放器级状态，保证换绑对用户完全无感（倍速、音量不丢）
+        runCatching {
+            if (savedPlaybackParameters != null) fresh.playbackParameters = savedPlaybackParameters
+            if (savedVolume != null) fresh.volume = savedVolume
+        }
+        notifySwap(fresh)
+        return fresh
+    }
+
+    private fun notifySwap(player: ExoPlayer) {
         for (listener in playerSwapListeners) {
             try {
-                listener(fresh)
+                listener(player)
             } catch (e: Exception) {
                 Log.w(TAG, "播放器换绑回调异常", e)
             }
         }
-        return fresh
     }
 
     @Synchronized
@@ -297,16 +441,26 @@ object Media3Factory {
      * 清理流媒体缓存
      */
     fun clearStreamCache(context: Context) {
+        // 注意：本函数**不会**释放播放器或删除缓存目录。
         try {
-            simpleCacheInstance?.let { cache ->
+
+            // 关键点：DataSource 工厂在**构建播放器时**捕获了 SimpleCache 实例。
+            // 因此不能「一边使用、一边 release 并删除目录」——SimpleCache 内部的 released
+            // 断言会抛 IllegalStateException，内存索引与磁盘分片也会不一致。
+            //
+            // 但同样不能靠「先 releaseSharedPlayer()」来解决：那会让**正在播放的曲目直接中断**，
+            // 用户点一下「清理试听缓存」音乐就哑了，必须手动恢复 —— 为一个清理动作付这个代价是不可接受的。
+            //
+            // 正确做法：**不释放、不删目录**，只逐 key 清掉缓存内容。这样
+            //   ① 播放器的 DataSource 引用依旧有效，播放完全不受影响；
+            //   ② 磁盘上的分片文件被逐个删除，空间照常释放；
+            //   ③ SimpleCache 的索引与磁盘始终一致，不会抛异常。
+            // SimpleCache 自身的 LRU 上限（按可用空间动态取值，上限 300MB）负责后续回收。
+            val cache = simpleCacheInstance
+            if (cache != null) {
                 for (key in cache.keys.toSet()) {
                     try { cache.removeResource(key) } catch (_: Exception) {}
                 }
-            }
-            val cacheDir = File(context.applicationContext.cacheDir, "media3_lru_stream_cache")
-            if (cacheDir.exists()) {
-                cacheDir.deleteRecursively()
-                cacheDir.mkdirs()
             }
         } catch (_: Exception) {}
     }

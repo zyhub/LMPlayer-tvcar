@@ -88,6 +88,25 @@ fun Modifier.tvFocusable(
     onLongClick: (() -> Unit)? = null,
     onLeftKey: ((Int) -> Boolean)? = null,
     onRightKey: ((Int) -> Boolean)? = null,
+    /**
+     * 是否允许左右方向键直接触发 [onLeftKey] / [onRightKey]。
+     *
+     * 默认 true 适用于「进度条快进快退」这类安全的左右键语义；但对于会**直接改值**的
+     * 下拉选择行（如「使用平台模式」），左右键会在用户只是移动光标时静默改掉设置 ——
+     * 平台模式一旦被误切到车机，整套遥控焦点体系会被停用，无触屏设备当场失去操作能力。
+     * 这类行必须传 false，改为「按 OK 展开下拉菜单后再选择」。
+     */
+    allowHorizontalKeyChange: Boolean = true,
+    /**
+     * 焦点记忆键（**业务稳定标识**，不要用索引或 hashCode）。
+     *
+     * 传入后，本节点获得焦点时会被记为「当前作用域的最后焦点位置」；
+     * 当它因页面/视图切换被移出组合后，宿主页面可通过 [TvRestoreFocusOnChange]
+     * 把焦点恢复到用户刚才点击的那一项，而不是让系统重置到左上角第一个节点。
+     *
+     * 留空则不参与焦点记忆（保持原有行为）。
+     */
+    focusKey: String? = null,
     onClick: () -> Unit
 ): Modifier = composed {
     val backgroundFocusEnabled = LocalTvBackgroundFocusEnabled.current
@@ -118,7 +137,27 @@ fun Modifier.tvFocusable(
         label = "tv_focus_scale"
     )
 
-    this
+    // 焦点记忆：把 FocusRequester 挂到本焦点节点上，并在获得焦点时记录位置。
+    // 这样当本节点因页面切换被移出组合后，宿主可以用 TvRestoreFocusOnChange 把
+    // 焦点恢复到「用户刚才点的那一项」，而不是让系统默认跳到左上角第一个节点。
+    val focusScope = LocalTvFocusScope.current
+    val focusMemoryRequester = remember(focusKey) {
+        if (focusKey.isNullOrBlank()) null else FocusRequester()
+    }
+    val memoryRequester = focusMemoryRequester
+    if (memoryRequester != null && focusKey != null) {
+        DisposableEffect(focusKey, focusScope) {
+            TvFocusMemory.register(focusKey, memoryRequester)
+            // 必须传入 requester 做身份比对：LazyList 重排时会出现
+            // 「新节点先注册、旧节点后 dispose」，无条件删除会抹掉新注册。
+            onDispose { TvFocusMemory.unregister(focusKey, memoryRequester) }
+        }
+    }
+    var focusChain = this
+    if (focusMemoryRequester != null) {
+        focusChain = focusChain.focusRequester(focusMemoryRequester)
+    }
+    focusChain
         .focusProperties {
             canFocus = focusEnabled
         }
@@ -132,6 +171,8 @@ fun Modifier.tvFocusable(
             val focused = (state.isFocused || state.hasFocus) && focusEnabled
             if (isFocused != focused) {
                 isFocused = focused
+                // 焦点记忆：记录「用户把光标停在了哪一项」
+                if (focused && !focusKey.isNullOrBlank()) TvFocusMemory.rememberFocus(focusScope, focusKey)
                 if (!focused) {
                     longPressJob?.cancel()
                     centerDownReceived = false
@@ -144,14 +185,15 @@ fun Modifier.tvFocusable(
             val native = event.nativeKeyEvent
             when (native.keyCode) {
                 KeyEvent.KEYCODE_DPAD_LEFT -> {
-                    if (native.action == KeyEvent.ACTION_DOWN && onLeftKey != null) {
+                    if (allowHorizontalKeyChange && native.action == KeyEvent.ACTION_DOWN && onLeftKey != null) {
                         onLeftKey(native.repeatCount)
                     } else {
+                        // 未授权左右键改值时必须放行，让方向键继续执行焦点导航
                         false
                     }
                 }
                 KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                    if (native.action == KeyEvent.ACTION_DOWN && onRightKey != null) {
+                    if (allowHorizontalKeyChange && native.action == KeyEvent.ACTION_DOWN && onRightKey != null) {
                         onRightKey(native.repeatCount)
                     } else {
                         false
@@ -276,7 +318,9 @@ fun Modifier.tvButtonFocusable(
     focusedScale: Float = 1.04f,
     focusedBorderColor: Color = Color(0xFFFFD60A),
     borderWidth: Dp = 2.5.dp,
-    onFocusChange: (Boolean) -> Unit = {}
+    onFocusChange: (Boolean) -> Unit = {},
+    /** 焦点记忆键（业务稳定标识）。传空则不参与记忆。 */
+    focusKey: String? = null
 ): Modifier = composed {
     val backgroundFocusEnabled = LocalTvBackgroundFocusEnabled.current
     // 车机模式：本修饰符只负责焦点视觉强化，车机下整条链一并失效（按钮自身的 clickable 触控不受影响）。
@@ -292,7 +336,25 @@ fun Modifier.tvButtonFocusable(
         label = "tv_btn_focus_scale"
     )
 
-    this
+    // 与 tvFocusable 一致：把焦点位置记入 TvFocusMemory，供页面切换后恢复
+    val focusScope = LocalTvFocusScope.current
+    val focusMemoryRequester = remember(focusKey) {
+        if (focusKey.isNullOrBlank()) null else FocusRequester()
+    }
+    val memoryRequester = focusMemoryRequester
+    if (memoryRequester != null && focusKey != null) {
+        DisposableEffect(focusKey, focusScope) {
+            TvFocusMemory.register(focusKey, memoryRequester)
+            // 必须传入 requester 做身份比对：LazyList 重排时会出现
+            // 「新节点先注册、旧节点后 dispose」，无条件删除会抹掉新注册。
+            onDispose { TvFocusMemory.unregister(focusKey, memoryRequester) }
+        }
+    }
+    var focusChain = this
+    if (focusMemoryRequester != null) {
+        focusChain = focusChain.focusRequester(focusMemoryRequester)
+    }
+    focusChain
         .focusProperties { canFocus = focusEnabled }
         .zIndex(if (isFocused && focusEnabled) 2f else 0f)
         .graphicsLayer {
@@ -304,6 +366,7 @@ fun Modifier.tvButtonFocusable(
             val focused = (state.isFocused || state.hasFocus) && focusEnabled
             if (isFocused != focused) {
                 isFocused = focused
+                if (focused && !focusKey.isNullOrBlank()) TvFocusMemory.rememberFocus(focusScope, focusKey)
                 onFocusChange(focused)
             }
         }
