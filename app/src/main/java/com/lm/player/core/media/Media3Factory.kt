@@ -193,6 +193,9 @@ object Media3Factory {
 
     fun isCacheEnabled(): Boolean = isCacheEnabled
 
+    @Volatile
+    private var cachedDataSourceFactory: CacheDataSource.Factory? = null
+
     /**
      * 构建双协议自适应数据源工厂：
      * 1. 使用 DefaultDataSource.Factory 智能分发：
@@ -203,21 +206,29 @@ object Media3Factory {
      */
     fun buildDataSourceFactory(context: Context, okHttpClient: OkHttpClient): DataSource.Factory {
         val httpDataSourceFactory = OkHttpDataSource.Factory(okHttpClient)
-
         val upstreamFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
 
         return DataSource.Factory {
             if (isCacheEnabled) {
-                val cache = getSimpleCache(context)
-                val cacheDataSinkFactory = CacheDataSink.Factory()
-                    .setCache(cache)
-                    .setFragmentSize(20L * 1024 * 1024) // 20MB 单切片，避免默认 5MB 频繁断开重连触发服务端代理并发限制
-                CacheDataSource.Factory()
-                    .setCache(cache)
-                    .setUpstreamDataSourceFactory(upstreamFactory)
-                    .setCacheWriteDataSinkFactory(cacheDataSinkFactory)
-                    .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
-                    .createDataSource()
+                var factory = cachedDataSourceFactory
+                if (factory == null) {
+                    synchronized(this) {
+                        factory = cachedDataSourceFactory
+                        if (factory == null) {
+                            val cache = getSimpleCache(context)
+                            val cacheDataSinkFactory = CacheDataSink.Factory()
+                                .setCache(cache)
+                                .setFragmentSize(20L * 1024 * 1024)
+                            factory = CacheDataSource.Factory()
+                                .setCache(cache)
+                                .setUpstreamDataSourceFactory(upstreamFactory)
+                                .setCacheWriteDataSinkFactory(cacheDataSinkFactory)
+                                .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+                            cachedDataSourceFactory = factory
+                        }
+                    }
+                }
+                factory!!.createDataSource()
             } else {
                 upstreamFactory.createDataSource()
             }
@@ -238,6 +249,7 @@ object Media3Factory {
      */
     @Synchronized
     fun releaseSharedPlayer() {
+        cachedDataSourceFactory = null
         val player = sharedExoPlayer ?: return
         sharedExoPlayer = null
         try {

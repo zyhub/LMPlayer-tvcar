@@ -79,6 +79,50 @@ object PlaybackQueueManager {
     private val _isRepeatFlow = MutableStateFlow(false)
     val isRepeatFlow: StateFlow<Boolean> = _isRepeatFlow.asStateFlow()
 
+    private val _sleepTimerMinutesFlow = MutableStateFlow(0)
+    val sleepTimerMinutesFlow: StateFlow<Int> = _sleepTimerMinutesFlow.asStateFlow()
+
+    private val _sleepTimerRemainingSecFlow = MutableStateFlow(0L)
+    val sleepTimerRemainingSecFlow: StateFlow<Long> = _sleepTimerRemainingSecFlow.asStateFlow()
+
+    private var sleepTimerJob: Job? = null
+    var sleepTimerStopAfterCurrent: Boolean = false
+        private set
+
+    fun setSleepTimer(minutes: Int, context: Context? = null) {
+        sleepTimerJob?.cancel()
+        sleepTimerJob = null
+        if (minutes == 0) {
+            _sleepTimerMinutesFlow.value = 0
+            _sleepTimerRemainingSecFlow.value = 0L
+            sleepTimerStopAfterCurrent = false
+            return
+        }
+        _sleepTimerMinutesFlow.value = minutes
+        if (minutes == -1) {
+            sleepTimerStopAfterCurrent = true
+            _sleepTimerRemainingSecFlow.value = 0L
+            return
+        }
+        sleepTimerStopAfterCurrent = false
+        val totalSec = minutes * 60L
+        _sleepTimerRemainingSecFlow.value = totalSec
+        sleepTimerJob = coroutineScope.launch {
+            var rem = totalSec
+            while (rem > 0 && isActive) {
+                delay(1000L)
+                rem--
+                _sleepTimerRemainingSecFlow.value = rem
+            }
+            if (isActive && rem <= 0) {
+                _sleepTimerMinutesFlow.value = 0
+                _sleepTimerRemainingSecFlow.value = 0L
+                val ctx = context?.applicationContext ?: appContext
+                ctx?.let { pause(it) }
+            }
+        }
+    }
+
     /**
      * 「最近播放」的**唯一真源**。
      * 全系统没有任何"播放时间"字段，顺序 100% 依赖列表排列，因此任何一处手工拼接
@@ -739,26 +783,23 @@ object PlaybackQueueManager {
 
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED) {
+                    if (sleepTimerStopAfterCurrent) {
+                        setSleepTimer(0)
+                        pause(context)
+                        return
+                    }
                     val list = _playlistFlow.value
                     val current = _currentSongFlow.value
                     if (_isRepeatFlow.value && current != null) {
                         // 单曲循环：原地重播
                         playSong(current, context)
-                    } else if (list.size <= 1) {
-                        // 「不循环」且队列只有一首：播完即停，绝不原地无限重播。
-                        // 电视是 24 小时常开的设备，原先这里无条件 playNext() → playNext 在列表末尾
-                        // 又会 list.first() 回绕，等于「永远在响」。
+                    } else if (list.size <= 1 && !_isShuffleFlow.value) {
+                        // 「不循环」且队列只有一首：播完即停
                         Log.i(TAG, "Playback ended and queue has only one item, stopping (repeat=off)")
                         savePlaybackState(context, current, positionMs = 0L, commitSync = false)
                     } else {
-                        val idx = list.indexOfFirst { it.id == current?.id }
-                        if (idx >= 0 && idx < list.size - 1) {
-                            playNext(context)
-                        } else {
-                            // 列表末尾且未开循环：停在 ENDED（播放器保持就绪，用户可手动选曲）
-                            Log.i(TAG, "Playback reached end of queue, stopping (repeat=off)")
-                            savePlaybackState(context, current, positionMs = 0L, commitSync = false)
-                        }
+                        // 列表循环或随机播放模式：调用 playNext 继续连播下一首 (TV-P1-03)
+                        playNext(context)
                     }
                 }
             }
@@ -971,7 +1012,16 @@ object PlaybackQueueManager {
         }
     }
 
+    private var lastSkipElapsedRealtime = 0L
+
     fun playNext(context: Context) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastSkipElapsedRealtime < 400L) {
+            Log.w(TAG, "playNext debounced: ignore fast repeat skip (${now - lastSkipElapsedRealtime}ms)")
+            return
+        }
+        lastSkipElapsedRealtime = now
+
         ensurePlayerListener(context)
         val list = _playlistFlow.value
         if (list.isEmpty()) {
@@ -999,6 +1049,13 @@ object PlaybackQueueManager {
     }
 
     fun playPrevious(context: Context) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastSkipElapsedRealtime < 400L) {
+            Log.w(TAG, "playPrevious debounced: ignore fast repeat skip (${now - lastSkipElapsedRealtime}ms)")
+            return
+        }
+        lastSkipElapsedRealtime = now
+
         ensurePlayerListener(context)
         val list = _playlistFlow.value
         if (list.isEmpty()) {
@@ -1038,6 +1095,15 @@ object PlaybackQueueManager {
             } else {
                 player.play()
             }
+        }
+    }
+
+    fun pause(context: Context) {
+        try {
+            val player = Media3Factory.getSharedExoPlayer(context)
+            player.pause()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error pausing player", e)
         }
     }
 }

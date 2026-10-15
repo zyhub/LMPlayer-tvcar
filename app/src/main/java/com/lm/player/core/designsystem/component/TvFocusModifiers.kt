@@ -147,10 +147,10 @@ fun Modifier.tvFocusable(
     val memoryRequester = focusMemoryRequester
     if (memoryRequester != null && focusKey != null) {
         DisposableEffect(focusKey, focusScope) {
-            TvFocusMemory.register(focusKey, memoryRequester)
+            TvFocusMemory.register(focusScope, focusKey, memoryRequester)
             // 必须传入 requester 做身份比对：LazyList 重排时会出现
             // 「新节点先注册、旧节点后 dispose」，无条件删除会抹掉新注册。
-            onDispose { TvFocusMemory.unregister(focusKey, memoryRequester) }
+            onDispose { TvFocusMemory.unregister(focusScope, focusKey, memoryRequester) }
         }
     }
     var focusChain = this
@@ -204,11 +204,20 @@ fun Modifier.tvFocusable(
                 KeyEvent.KEYCODE_NUMPAD_ENTER -> {
                     val longClickHandler = currentOnLongClick
                     if (longClickHandler == null) {
-                        if (native.action == KeyEvent.ACTION_DOWN && native.repeatCount == 0) {
-                            currentOnClick()
+                        if (native.action == KeyEvent.ACTION_DOWN) {
+                            if (native.repeatCount == 0) {
+                                centerDownReceived = true
+                            }
+                            true
+                        } else if (native.action == KeyEvent.ACTION_UP) {
+                            val shouldClick = centerDownReceived
+                            centerDownReceived = false
+                            if (shouldClick) {
+                                currentOnClick()
+                            }
                             true
                         } else {
-                            native.action == KeyEvent.ACTION_DOWN || native.action == KeyEvent.ACTION_UP
+                            false
                         }
                     } else {
                         if (native.action == KeyEvent.ACTION_DOWN) {
@@ -344,10 +353,10 @@ fun Modifier.tvButtonFocusable(
     val memoryRequester = focusMemoryRequester
     if (memoryRequester != null && focusKey != null) {
         DisposableEffect(focusKey, focusScope) {
-            TvFocusMemory.register(focusKey, memoryRequester)
+            TvFocusMemory.register(focusScope, focusKey, memoryRequester)
             // 必须传入 requester 做身份比对：LazyList 重排时会出现
             // 「新节点先注册、旧节点后 dispose」，无条件删除会抹掉新注册。
-            onDispose { TvFocusMemory.unregister(focusKey, memoryRequester) }
+            onDispose { TvFocusMemory.unregister(focusScope, focusKey, memoryRequester) }
         }
     }
     var focusChain = this

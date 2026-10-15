@@ -135,6 +135,7 @@ fun LocalLibraryScreen(
     var activePlaylistId by remember { mutableStateOf<String?>(null) }
     var activeSubViewSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
     var isLoadingSubView by remember { mutableStateOf(false) }
+    var subViewLoadJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     var isFromAllPlaylists by remember { mutableStateOf(false) }
     var isFromAllFolders by remember { mutableStateOf(false) }
     var isFromAllArtists by remember { mutableStateOf(false) }
@@ -188,16 +189,24 @@ fun LocalLibraryScreen(
         }.sortedByDescending { it.songCount }
     }
 
-    // 本地下载离线歌曲聚合：直接关联外部已下载全量曲目（与下载管理器对齐），若未传入则从 allSongs 纯内存快速聚合
-    val finalDownloadedSongs = remember(allSongs, downloadedSongs) {
-        val validLocal = { s: UnifiedSong ->
-            !s.localFilePath.isNullOrBlank() && (s.localFilePath!!.startsWith("content://") || java.io.File(s.localFilePath!!).exists())
+    // 本地下载离线歌曲聚合：异步在 IO 线程核验真实文件，杜绝主线程卡顿
+    val finalDownloadedSongs by produceState(
+        initialValue = downloadedSongs.ifEmpty { allSongs.filter { it.downloadStatus == DownloadStatus.DOWNLOADED } },
+        key1 = allSongs,
+        key2 = downloadedSongs
+    ) {
+        val filtered = withContext(Dispatchers.IO) {
+            val validLocal = { s: UnifiedSong ->
+                val path = s.localFilePath
+                !path.isNullOrBlank() && (path.startsWith("content://") || java.io.File(path).exists())
+            }
+            if (downloadedSongs.isNotEmpty()) {
+                downloadedSongs.filter(validLocal)
+            } else {
+                allSongs.filter(validLocal)
+            }
         }
-        if (downloadedSongs.isNotEmpty()) {
-            downloadedSongs.filter(validLocal)
-        } else {
-            allSongs.filter(validLocal)
-        }
+        value = filtered
     }
     // 最近播放聚合：优先使用宿主注入的真实播放足迹，退回本地库前 30 首兜底展示
     // 最近播放：只用真实播放足迹 (在线时为服务器记录，离线时为本地持久化记录)，
@@ -1326,7 +1335,8 @@ fun LocalLibraryScreen(
                                             }
                                             if (onFetchPlaylistSongs != null) {
                                                 isLoadingSubView = true
-                                                coroutineScope.launch {
+                                                subViewLoadJob?.cancel()
+                                                subViewLoadJob = coroutineScope.launch {
                                                     val loaded = onFetchPlaylistSongs(pl.id, pl.isOnline)
                                                     activeSubViewSongs = loaded
                                                     if (isLocalMode) {
@@ -1664,7 +1674,7 @@ fun LocalLibraryScreen(
                 } else {
                     itemsIndexed(
                         items = filteredSongs,
-                        key = { _, song -> "libsong_${song.id}" },
+                        key = { idx, song -> "libsong_${idx}_${song.id}" },
                         contentType = { _, _ -> "library_song_item" }
                     ) { idx, song ->
                         val isSelected = song.id in selectedMainSongIds
@@ -1953,17 +1963,7 @@ fun LocalLibraryScreen(
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
                         verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
-                        // A. 新建歌单快捷卡片
-                        item {
-                            CreatePlaylistActionCard(
-                                onClick = { isCreatePlaylistDialogOpen = true },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .aspectRatio(0.85f)
-                            )
-                        }
-
-                        // B. 我喜欢的音乐
+                        // A. 我喜欢的音乐
                         item {
                             PlaylistSpecialCard(
                                 title = "我喜欢的音乐",
@@ -2044,7 +2044,8 @@ fun LocalLibraryScreen(
                                     }
                                     if (onFetchPlaylistSongs != null) {
                                         isLoadingSubView = true
-                                        coroutineScope.launch {
+                                        subViewLoadJob?.cancel()
+                                        subViewLoadJob = coroutineScope.launch {
                                             val loaded = onFetchPlaylistSongs(pl.id, pl.isOnline)
                                             activeSubViewSongs = loaded
                                             if (isLocalMode) {
@@ -2235,6 +2236,7 @@ fun LocalLibraryScreen(
                     }
                 } else {
                     LazyColumn(
+                        state = subViewListState,
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(
                             bottom = contentPadding.calculateBottomPadding() + 24.dp
@@ -2243,7 +2245,7 @@ fun LocalLibraryScreen(
                     ) {
                         itemsIndexed(
                             items = activeSubViewSongs,
-                            key = { _, song -> "subsong_${song.id}" },
+                            key = { idx, song -> "subsong_${idx}_${song.id}" },
                             contentType = { _, _ -> "subview_song_row" }
                         ) { idx, song ->
                             if (isDownloadManagementMode && activeSubViewTitle == "本地下载") {

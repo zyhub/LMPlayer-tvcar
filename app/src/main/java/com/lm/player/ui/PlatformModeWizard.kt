@@ -156,7 +156,7 @@ fun PlatformModeWizard(
 
             Spacer(modifier = Modifier.height(dimensions.scale(24.dp)))
             Text(
-                text = "提示：误选后可在设置中改回；若设备无触屏又误选了「车机 / 中控」，将无法再操作界面。",
+                text = "提示：误选后可在设置中改回；若无触屏设备误选了「车机 / 中控」，可长按遥控器【返回键】2 秒立即切回电视模式。",
                 fontSize = dimensions.captionSize,
                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
                 textAlign = TextAlign.Center,

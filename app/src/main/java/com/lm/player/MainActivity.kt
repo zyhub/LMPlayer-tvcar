@@ -121,7 +121,6 @@ class MainActivity : ComponentActivity() {
     private var playNextAction: (() -> Unit)? = null
     private var playPreviousAction: (() -> Unit)? = null
     private var togglePlayAction: (() -> Unit)? = null
-    private var mediaCommandReceiver: BroadcastReceiver? = null
 
     // 播放进度落盘专用作用域：不绑定 Activity 生命周期，避免 onDestroy 时任务被取消而丢掉最后进度。
     // 任务只捕获 applicationContext 与数值，不持有 Activity 引用。
@@ -234,7 +233,6 @@ class MainActivity : ComponentActivity() {
         startPlaybackService()
 
         // 3. 注册方向盘按键与车载控制广播监听器
-        registerMediaCommandReceiver()
 
         // 4. 申请 Android 6.0 / 13+ 运行时权限
         requestAppPermissions()
@@ -638,22 +636,6 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
                             database.playlistDao().insertPlaylists(plEntities)
-                            for (pl in plList) {
-                                try {
-                                    val plSongs = activeProto.getPlaylistSongs(pl.id).getOrNull()
-                                    if (!plSongs.isNullOrEmpty()) {
-                                        plSongs.forEachIndexed { idx, s ->
-                                            database.playlistDao().addSongToPlaylist(
-                                                com.lm.player.core.database.entity.PlaylistSongEntity(
-                                                    playlistId = pl.id,
-                                                    songId = s.id,
-                                                    orderIndex = idx
-                                                )
-                                            )
-                                        }
-                                    }
-                                } catch (_: Exception) {}
-                            }
                             Log.i("MainActivity", "Successfully synced ${plEntities.size} server playlists for server ${config.id}")
                         }
                     } catch (e: Exception) {
@@ -743,7 +725,8 @@ class MainActivity : ComponentActivity() {
                                         // 服务器文件时间 (getSongList 里由 mtime 推得)：曲库「按加入时间」
                                         // 在线模式即以此为准。此前这里漏传，导致全部退化成 SongEntity 的
                                         // 默认值 = 同步那一刻，所有歌时间并列，排序自然看不出"最近添加"。
-                                        addedTimestamp = it.addedTimestamp
+                                        addedTimestamp = it.addedTimestamp,
+                                        rawMetaJson = it.rawMetaJson
                                     )
                                 }
                                 // 智能保护性同步：保留已有本地已下载路径、收藏与层级，杜绝覆盖重置，并进行差量清理
@@ -1049,7 +1032,7 @@ class MainActivity : ComponentActivity() {
                                 format = resolvedFormat,
                                 isFavorite = entity.isFavorite,
                                 relativeFolderPath = entity.relativeFolderPath,
-                                rawMetaJson = entity.relativeFolderPath?.takeIf { it.trim().startsWith("{") },
+                                rawMetaJson = entity.rawMetaJson ?: entity.relativeFolderPath?.takeIf { it.trim().startsWith("{") },
                                 addedTimestamp = resolvedTimestamp
                             )
                         }
@@ -2028,44 +2011,37 @@ class MainActivity : ComponentActivity() {
                 val listener = object : Player.Listener {
                     override fun onPlayerError(error: PlaybackException) {
                         Log.e("MainActivity", "Player Error encountered: ${error.message}", error)
-                        val targetSong = currentSong
+                        val targetSong = currentSong ?: return
                         val resumePos = (exoPlayer?.currentPosition ?: 0L).coerceAtLeast(0L)
-                        if (targetSong != null) {
-                            // 本地回退与音质降级必须**严格串行**：把整库磁盘 stat 放到 IO 线程
-                            // 并等它返回，命中本地版本即 return，避免与降级分支双重起播。
+
+                        lifecycleScope.launch(Dispatchers.IO) {
+                            // 1. 优先尝试切换至本地离线音频文件并保留当前播放进度（严格核对版本与时长）
+                            // 纯异步 IO 线程池检测，杜绝主线程磁盘 stat 阻塞与单线程池泄漏 (TV-P0-02)
                             if (autoFallbackToLocal) {
-                                // 1. 优先尝试切换至本地离线音频文件并保留当前播放进度（严格核对版本与时长）
-                                //   **必须在 IO 线程做**：候选集是整个曲库，逐条 File.exists() 是 O(n) 磁盘
-                                //   stat。onPlayerError 运行在 ExoPlayer 主线程，若在此同步遍历，
-                                //   大曲库 + 在线断流时会在主线程打出成百上千次 stat，直接掉帧甚至 ANR。
-                                //   这里改为「提交到 IO 线程池 + 取值」，既能避免主线程 stat，
-                                //   又保持了改造前的「串行决策」语义（先定本地、再决定是否降级）。
                                 val fallbackCandidates = songList + completedDownloadedSongs
-                                val matchedLocalSong = runCatching {
-                                    java.util.concurrent.CompletableFuture.supplyAsync({
-                                        fallbackCandidates.firstOrNull {
-                                            val hasFile = !it.localFilePath.isNullOrBlank() && java.io.File(it.localFilePath).let { f -> f.exists() && f.length() > 0 }
-                                            hasFile && (it.id == targetSong.id || SongMatchingResolver.isSongMatch(
-                                                it.title, it.artist, it.durationMs,
-                                                targetSong.title, targetSong.artist, targetSong.durationMs,
-                                                it.album, targetSong.album
-                                            ))
-                                        }
-                                    }, java.util.concurrent.Executors.newSingleThreadExecutor()).get(3, java.util.concurrent.TimeUnit.SECONDS)
-                                }.getOrNull()
+                                val matchedLocalSong = fallbackCandidates.firstOrNull {
+                                    val hasFile = !it.localFilePath.isNullOrBlank() && java.io.File(it.localFilePath).let { f -> f.exists() && f.length() > 0 }
+                                    hasFile && (it.id == targetSong.id || SongMatchingResolver.isSongMatch(
+                                        it.title, it.artist, it.durationMs,
+                                        targetSong.title, targetSong.artist, targetSong.durationMs,
+                                        it.album, targetSong.album
+                                    ))
+                                }
                                 if (matchedLocalSong != null && matchedLocalSong.localFilePath != targetSong.localFilePath) {
-                                    Toast.makeText(this@MainActivity, "在线音频缓冲受阻，已无缝切换至本地离线版本", Toast.LENGTH_SHORT).show()
-                                    val localSong = targetSong.copy(
-                                        localFilePath = matchedLocalSong.localFilePath,
-                                        streamUrl = matchedLocalSong.localFilePath ?: "",
-                                        downloadStatus = DownloadStatus.DOWNLOADED
-                                    )
-                                    PlaybackQueueManager.playSong(
-                                        targetSong = localSong,
-                                        context = this@MainActivity,
-                                        startPositionMs = resumePos
-                                    )
-                                    return   // 已切到本地版本，后续降级分支不再执行
+                                    withContext(Dispatchers.Main) {
+                                        Toast.makeText(this@MainActivity, "在线音频缓冲受阻，已无缝切换至本地离线版本", Toast.LENGTH_SHORT).show()
+                                        val localSong = targetSong.copy(
+                                            localFilePath = matchedLocalSong.localFilePath,
+                                            streamUrl = matchedLocalSong.localFilePath ?: "",
+                                            downloadStatus = DownloadStatus.DOWNLOADED
+                                        )
+                                        PlaybackQueueManager.playSong(
+                                            targetSong = localSong,
+                                            context = this@MainActivity,
+                                            startPositionMs = resumePos
+                                        )
+                                    }
+                                    return@launch
                                 }
                             }
 
@@ -2076,25 +2052,27 @@ class MainActivity : ComponentActivity() {
                             val currentDowngradeIdx = if (lastStreamRetrySongId == targetSong.id) lastStreamRetryQualityIdx else 0
                             val nextQualityIdx = currentDowngradeIdx + 1
                             if (nextQualityIdx < fallbackQualities.size) {
-                                lastStreamRetrySongId = targetSong.id
-                                lastStreamRetryTimeMs = System.currentTimeMillis()
-                                lastStreamRetryQualityIdx = nextQualityIdx
-                                val nextQualityKey = fallbackQualities[nextQualityIdx]
-                                val nextQualityLabel = AudioQuality.fromKey(nextQualityKey).label
-                                Log.i("MainActivity", "Auto-downgrading quality for ${targetSong.title} to $nextQualityKey ($nextQualityLabel) at ${resumePos}ms")
-                                Toast.makeText(this@MainActivity, "当前音质无法缓冲，已自动为您换源降至【$nextQualityLabel】播放", Toast.LENGTH_SHORT).show()
-                                PlaybackQueueManager.playSong(
-                                    targetSong = targetSong,
-                                    context = this@MainActivity,
-                                    startPositionMs = resumePos,
-                                    forceRefresh = true,
-                                    overrideQuality = nextQualityKey
-                                )
-                                return
+                                withContext(Dispatchers.Main) {
+                                    lastStreamRetrySongId = targetSong.id
+                                    lastStreamRetryTimeMs = System.currentTimeMillis()
+                                    lastStreamRetryQualityIdx = nextQualityIdx
+                                    val nextQualityKey = fallbackQualities[nextQualityIdx]
+                                    val nextQualityLabel = AudioQuality.fromKey(nextQualityKey).label
+                                    Log.i("MainActivity", "Auto-downgrading quality for ${targetSong.title} to $nextQualityKey ($nextQualityLabel) at ${resumePos}ms")
+                                    Toast.makeText(this@MainActivity, "当前音质无法缓冲，已自动为您换源降至【$nextQualityLabel】播放", Toast.LENGTH_SHORT).show()
+                                    PlaybackQueueManager.playSong(
+                                        targetSong = targetSong,
+                                        context = this@MainActivity,
+                                        startPositionMs = resumePos,
+                                        forceRefresh = true,
+                                        overrideQuality = nextQualityKey
+                                    )
+                                }
+                                return@launch
                             }
 
+                            // 3. 若降级仍失败，尝试回退至服务器资料库内同版本已归档曲目并保留播放进度
                             if (autoFallbackToLocal) {
-                                // 3. 若降级仍失败，尝试回退至服务器资料库内同版本已归档曲目并保留播放进度
                                 val matchedServerSong = songList.firstOrNull {
                                     it.id != targetSong.id &&
                                     it.streamUrl != targetSong.streamUrl &&
@@ -2106,17 +2084,22 @@ class MainActivity : ComponentActivity() {
                                     )
                                 }
                                 if (matchedServerSong != null) {
-                                    Toast.makeText(this@MainActivity, "在线音源缓冲受阻，已自动切换至服务器资料库同名版本", Toast.LENGTH_SHORT).show()
-                                    PlaybackQueueManager.playSong(
-                                        targetSong = matchedServerSong,
-                                        context = this@MainActivity,
-                                        startPositionMs = resumePos
-                                    )
-                                    return
+                                    withContext(Dispatchers.Main) {
+                                        Toast.makeText(this@MainActivity, "在线音源缓冲受阻，已自动切换至服务器资料库同名版本", Toast.LENGTH_SHORT).show()
+                                        PlaybackQueueManager.playSong(
+                                            targetSong = matchedServerSong,
+                                            context = this@MainActivity,
+                                            startPositionMs = resumePos
+                                        )
+                                    }
+                                    return@launch
                                 }
                             }
+
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(this@MainActivity, "当前歌曲《${targetSong.title.ifBlank { "未知" }}》音频无法缓冲，请检查网络或服务端连接", Toast.LENGTH_SHORT).show()
+                            }
                         }
-                        Toast.makeText(this@MainActivity, "当前歌曲《${currentSong?.title ?: "未知"}》音频无法缓冲，请检查网络或服务端连接", Toast.LENGTH_SHORT).show()
                     }
                 }
                 exoPlayer?.addListener(listener)
@@ -2307,6 +2290,10 @@ class MainActivity : ComponentActivity() {
                         },
                         onSelectLocalServer = {
                             activeServerName = "本地 · 已下载"
+                            activeServerId = ""
+                            lifecycleScope.launch(Dispatchers.IO) {
+                                database.serverDao().clearActiveServer()
+                            }
                         },
                         onSelectServer = { selectedServer ->
                             activeServerName = selectedServer.name
@@ -2414,8 +2401,9 @@ class MainActivity : ComponentActivity() {
                                 }
 
                                 Screen.HOME -> {
-                                    val activeServer = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
-                                        ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
+                                    val isLocalMode = activeServerName.contains("本地")
+                                    val activeServer = if (isLocalMode) null else (serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
+                                        ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC })
 
                                     if (activeServer != null) {
                                         LemonDiscoverHomeScreen(
@@ -2437,6 +2425,10 @@ class MainActivity : ComponentActivity() {
                                             onBatchDownloadSongsWithOptions = handleBatchDownloadWithOptions,
                                             onSelectLocalServer = {
                                                 activeServerName = "本地 · 已下载"
+                                                activeServerId = ""
+                                                lifecycleScope.launch(Dispatchers.IO) {
+                                                    database.serverDao().clearActiveServer()
+                                                }
                                             },
                                             onSelectServer = { selectedServer ->
                                                 activeServerName = selectedServer.name
@@ -2511,7 +2503,11 @@ class MainActivity : ComponentActivity() {
                                             onDownloadSongWithOptions = handleDownloadWithOptions,
                                             onBatchDownloadSongsWithOptions = handleBatchDownloadWithOptions,
                                             onSelectLocalServer = {
-                                                activeServerName = "本地模式"
+                                                activeServerName = "本地 · 已下载"
+                                                activeServerId = ""
+                                                lifecycleScope.launch(Dispatchers.IO) {
+                                                    database.serverDao().clearActiveServer()
+                                                }
                                             },
                                             onSelectServer = { selectedServer ->
                                                 activeServerName = selectedServer.name
@@ -2623,6 +2619,10 @@ class MainActivity : ComponentActivity() {
                                         isPlaying = isPlaying,
                                         onSelectLocalServer = {
                                             activeServerName = "本地 · 已下载"
+                                            activeServerId = ""
+                                            lifecycleScope.launch(Dispatchers.IO) {
+                                                database.serverDao().clearActiveServer()
+                                            }
                                         },
                                         onSelectServer = { selectedServer ->
                                             activeServerName = selectedServer.name
@@ -3007,12 +3007,17 @@ class MainActivity : ComponentActivity() {
                                             onlinePrefs.edit().putString("selected_source", newSrc.name).apply()
                                         },
                                         onSelectServer = { server ->
+                                            activeServerName = server.name
+                                            activeServerId = server.id
                                             lifecycleScope.launch(Dispatchers.IO) {
                                                 database.serverDao().setActiveServer(server.id)
+                                                syncServerPlaylists(server)
                                                 syncServerSongs(server)
                                             }
                                         },
                                         onAddOrUpdateServer = { serverConfig ->
+                                            activeServerName = serverConfig.name
+                                            activeServerId = serverConfig.id
                                             lifecycleScope.launch(Dispatchers.IO) {
                                                 database.serverDao().insertServer(
                                                     ServerEntity(
@@ -3028,12 +3033,22 @@ class MainActivity : ComponentActivity() {
                                                     )
                                                 )
                                                 database.serverDao().setActiveServer(serverConfig.id)
+                                                syncServerPlaylists(serverConfig)
                                                 syncServerSongs(serverConfig)
                                             }
                                         },
                                         onDeleteServer = { serverIdToDelete ->
                                             lifecycleScope.launch(Dispatchers.IO) {
                                                 database.serverDao().deleteServer(serverIdToDelete)
+                                                database.songDao().deleteSongsByServer(serverIdToDelete)
+                                                database.playlistDao().deletePlaylistsByServer(serverIdToDelete)
+                                            }
+                                            if (activeServerId == serverIdToDelete) {
+                                                activeServerName = "本地 · 已下载"
+                                                activeServerId = ""
+                                                lifecycleScope.launch(Dispatchers.IO) {
+                                                    database.serverDao().clearActiveServer()
+                                                }
                                             }
                                         },
                                         onOpenDownloads = {
@@ -3394,39 +3409,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun registerMediaCommandReceiver() {
-        try {
-            mediaCommandReceiver = object : BroadcastReceiver() {
-                override fun onReceive(context: Context?, intent: Intent?) {
-                    // 刻意**不执行任何动作**。
-                    //
-                    // PlaybackService 的四处按键处理都是「先执行动作、再广播一次」，而本接收器位于
-                    // 同一个进程、共享同一个 ExoPlayer 实例。此前这里再执行一遍，等于一次按键切两次歌
-                    // （前景态叠加 UP 泄漏后实测连跳 3 首）。现在以服务端为唯一执行点，本接收器只保留
-                    // 通道不再消费，避免扩大改动面（服务端广播仍在发）。
-                    //
-                    // 播放状态本来就通过 PlaybackQueueManager 的 StateFlow 与 ExoPlayer 回调
-                    // 自动回流到 UI，不依赖这条广播刷新界面。
-                    if (intent != null) {
-                        // 仅留日志以便真机核对通道连通性，不执行任何播放动作
-                        Log.d(
-                            "MainActivity",
-                            "media command ignored (service is the single executor): " +
-                                intent.getStringExtra(PlaybackService.EXTRA_COMMAND)
-                        )
-                    }
-                }
-            }
-            val filter = IntentFilter(PlaybackService.ACTION_MEDIA_COMMAND)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                registerReceiver(mediaCommandReceiver, filter, RECEIVER_NOT_EXPORTED)
-            } else {
-                registerReceiver(mediaCommandReceiver, filter)
-            }
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Failed to register mediaCommandReceiver", e)
-        }
-    }
+
 
     /**
      * 媒体键 / 音量键的**按键级**防抖时间戳。
@@ -3758,9 +3741,6 @@ class MainActivity : ComponentActivity() {
         // 必须先摘掉换绑回调：Media3Factory 的监听列表是进程级静态的，
         // 不移除会让旧 Activity 一直被持有
         try { Media3Factory.removePlayerSwapListener(playerSwapListener) } catch (_: Exception) {}
-        mediaCommandReceiver?.let {
-            try { unregisterReceiver(it) } catch (_: Exception) {}
-        }
         if (isFinishing) {
             try {
                 persistPlaybackStateSync()

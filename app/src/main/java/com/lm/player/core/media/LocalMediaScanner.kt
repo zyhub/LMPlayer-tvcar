@@ -15,6 +15,7 @@ import com.lm.player.core.database.ZdsDatabase
 import com.lm.player.core.database.entity.DownloadEntity
 import com.lm.player.core.database.entity.SongEntity
 import com.lm.player.core.model.DownloadStatus
+import com.lm.player.core.network.LemonMusicProtocol
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -125,9 +126,9 @@ object LocalMediaScanner {
                                     id = songId,
                                     title = title,
                                     artist = if (artist.contains("<unknown>", ignoreCase = true)) "本地艺术家" else artist,
-                                    artistId = "local_artist_${artist.hashCode()}",
+                                    artistId = "local_artist_${LemonMusicProtocol.md5(artist)}",
                                     album = if (album.contains("<unknown>", ignoreCase = true)) "本地专辑" else album,
-                                    albumId = "local_album_${album.hashCode()}",
+                                    albumId = "local_album_${LemonMusicProtocol.md5(album)}",
                                     durationMs = durationMs,
                                     coverUrl = coverUrl,
                                     streamUrl = path,
@@ -136,7 +137,8 @@ object LocalMediaScanner {
                                     downloadStatus = DownloadStatus.DOWNLOADED,
                                     bitRate = 320,
                                     format = ext,
-                                    isFavorite = false
+                                    isFavorite = false,
+                                    addedTimestamp = File(path).lastModified().takeIf { it > 0L } ?: System.currentTimeMillis()
                                 )
                             )
                             count++
@@ -199,7 +201,7 @@ object LocalMediaScanner {
                     val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                     val durationMs = durationStr?.toLongOrNull() ?: 0L
                     val ext = file.extension.lowercase().ifBlank { "flac" }
-                    val songId = "local_dir_${file.absolutePath.hashCode()}"
+                    val songId = "local_dir_${LemonMusicProtocol.md5(file.absolutePath)}"
 
                     // 提取并保存内嵌专辑封面
                     val coverUrl = extractAndCacheArtwork(context, file.absolutePath, songId, retriever)
@@ -209,9 +211,9 @@ object LocalMediaScanner {
                             id = songId,
                             title = title,
                             artist = artist,
-                            artistId = "local_artist_${artist.hashCode()}",
+                            artistId = "local_artist_${LemonMusicProtocol.md5(artist)}",
                             album = album,
-                            albumId = "local_album_${album.hashCode()}",
+                            albumId = "local_album_${LemonMusicProtocol.md5(album)}",
                             durationMs = durationMs,
                             coverUrl = coverUrl,
                             streamUrl = file.absolutePath,
@@ -220,7 +222,8 @@ object LocalMediaScanner {
                             downloadStatus = DownloadStatus.DOWNLOADED,
                             bitRate = 320,
                             format = ext,
-                            isFavorite = false
+                            isFavorite = false,
+                            addedTimestamp = file.lastModified().takeIf { it > 0L } ?: System.currentTimeMillis()
                         )
                     )
                     count++
@@ -276,7 +279,7 @@ object LocalMediaScanner {
                             val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                             val durationMs = durationStr?.toLongOrNull() ?: 0L
                             val ext = file.extension.lowercase().ifBlank { "mp3" }
-                            val songId = "local_dir_${file.absolutePath.hashCode()}"
+                            val songId = "local_dir_${LemonMusicProtocol.md5(file.absolutePath)}"
                             val parentDir = file.parentFile?.absolutePath ?: customFolderPath
 
                             val coverUrl = extractAndCacheArtwork(context, file.absolutePath, songId, retriever)
@@ -285,9 +288,9 @@ object LocalMediaScanner {
                                 id = songId,
                                 title = title,
                                 artist = artist,
-                                artistId = "local_artist_${artist.hashCode()}",
+                                artistId = "local_artist_${LemonMusicProtocol.md5(artist)}",
                                 album = album,
-                                albumId = "local_album_${album.hashCode()}",
+                                albumId = "local_album_${LemonMusicProtocol.md5(album)}",
                                 durationMs = durationMs,
                                 coverUrl = coverUrl,
                                 streamUrl = file.absolutePath,
@@ -297,7 +300,8 @@ object LocalMediaScanner {
                                 bitRate = 320,
                                 format = ext,
                                 isFavorite = false,
-                                relativeFolderPath = file.parentFile?.name
+                                relativeFolderPath = file.parentFile?.name,
+                                addedTimestamp = file.lastModified().takeIf { it > 0L } ?: System.currentTimeMillis()
                             )
                             groupedMap.getOrPut(parentDir) { mutableListOf() }.add(entity)
                         } catch (_: Exception) {}
@@ -360,9 +364,9 @@ object LocalMediaScanner {
                                 id = songId,
                                 title = title,
                                 artist = if (artist.contains("<unknown>", ignoreCase = true)) "本地艺术家" else artist,
-                                artistId = "local_artist_${artist.hashCode()}",
+                                artistId = "local_artist_${LemonMusicProtocol.md5(artist)}",
                                 album = if (album.contains("<unknown>", ignoreCase = true)) "本地专辑" else album,
-                                albumId = "local_album_${album.hashCode()}",
+                                albumId = "local_album_${LemonMusicProtocol.md5(album)}",
                                 durationMs = durationMs,
                                 coverUrl = coverUrl,
                                 streamUrl = path,
@@ -372,7 +376,8 @@ object LocalMediaScanner {
                                 bitRate = 320,
                                 format = ext,
                                 isFavorite = false,
-                                relativeFolderPath = file.parentFile?.name
+                                relativeFolderPath = file.parentFile?.name,
+                                addedTimestamp = file.lastModified().takeIf { it > 0L } ?: System.currentTimeMillis()
                             )
                             groupedMap.getOrPut(parentDir) { mutableListOf() }.add(entity)
                         }
@@ -403,7 +408,7 @@ object LocalMediaScanner {
                                         val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                                         val durationMs = durationStr?.toLongOrNull() ?: 0L
                                         val ext = f.extension.lowercase().ifBlank { "mp3" }
-                                        val songId = "local_dir_${f.absolutePath.hashCode()}"
+                                        val songId = "local_dir_${LemonMusicProtocol.md5(f.absolutePath)}"
                                         val parentDir = f.parentFile?.absolutePath ?: cand.absolutePath
 
                                         val coverUrl = extractAndCacheArtwork(context, f.absolutePath, songId, retriever)
@@ -412,9 +417,9 @@ object LocalMediaScanner {
                                             id = songId,
                                             title = title,
                                             artist = artist,
-                                            artistId = "local_artist_${artist.hashCode()}",
+                                            artistId = "local_artist_${LemonMusicProtocol.md5(artist)}",
                                             album = album,
-                                            albumId = "local_album_${album.hashCode()}",
+                                            albumId = "local_album_${LemonMusicProtocol.md5(album)}",
                                             durationMs = durationMs,
                                             coverUrl = coverUrl,
                                             streamUrl = f.absolutePath,
@@ -424,7 +429,8 @@ object LocalMediaScanner {
                                             bitRate = 320,
                                             format = ext,
                                             isFavorite = false,
-                                            relativeFolderPath = f.parentFile?.name
+                                            relativeFolderPath = f.parentFile?.name,
+                                            addedTimestamp = f.lastModified().takeIf { it > 0L } ?: System.currentTimeMillis()
                                         )
                                         groupedMap.getOrPut(parentDir) { mutableListOf() }.add(entity)
                                     } catch (_: Exception) {}
@@ -520,14 +526,14 @@ object LocalMediaScanner {
                                 val artist = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)?.ifBlank { null } ?: "本地音乐"
                                 val album = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM)?.ifBlank { null } ?: (dir.name ?: "本地文件夹")
                                 val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-                                val songId = "saf_doc_${file.uri.toString().hashCode()}"
+                                val songId = "saf_doc_${LemonMusicProtocol.md5(file.uri.toString())}"
 
                                 // 提取封面字节并缓存为本地文件
                                 val pictureBytes = try { retriever.embeddedPicture } catch (_: Exception) { null }
                                 var coverUrl = ""
                                 if (pictureBytes != null && pictureBytes.isNotEmpty()) {
                                     val artDir = File(context.cacheDir, "album_art").apply { if (!exists()) mkdirs() }
-                                    val artFile = File(artDir, "${songId.hashCode()}.jpg")
+                                    val artFile = File(artDir, "${LemonMusicProtocol.md5(songId)}.jpg")
                                     artFile.writeBytes(pictureBytes)
                                     coverUrl = artFile.absolutePath
                                 }
@@ -537,9 +543,9 @@ object LocalMediaScanner {
                                         id = songId,
                                         title = title,
                                         artist = artist,
-                                        artistId = "saf_artist_${artist.hashCode()}",
+                                        artistId = "saf_artist_${LemonMusicProtocol.md5(artist)}",
                                         album = album,
-                                        albumId = "saf_album_${album.hashCode()}",
+                                        albumId = "saf_album_${LemonMusicProtocol.md5(album)}",
                                         durationMs = durationMs,
                                         coverUrl = coverUrl,
                                         streamUrl = file.uri.toString(),
@@ -548,7 +554,8 @@ object LocalMediaScanner {
                                         downloadStatus = DownloadStatus.DOWNLOADED,
                                         bitRate = 320,
                                         format = ext.ifBlank { "mp3" },
-                                        isFavorite = false
+                                        isFavorite = false,
+                                        addedTimestamp = file.lastModified().takeIf { it > 0L } ?: System.currentTimeMillis()
                                     )
                                 )
                                 count++
@@ -584,7 +591,7 @@ object LocalMediaScanner {
         try {
             val artDir = File(context.cacheDir, "album_art")
             if (!artDir.exists()) artDir.mkdirs()
-            val outFile = File(artDir, "${songId.hashCode()}.jpg")
+            val outFile = File(artDir, "${LemonMusicProtocol.md5(songId)}.jpg")
             if (outFile.exists() && outFile.length() > 0) {
                 return outFile.absolutePath
             }
@@ -888,8 +895,13 @@ object LocalMediaScanner {
                     claimedPhysicalPaths.add(currentPath)
                     val finalTs = if (server.addedTimestamp > 0) server.addedTimestamp else (downloadRec?.completedTimestamp ?: System.currentTimeMillis())
                     val (realFmt, realBr) = resolveLocalSpecs(currentPath, server.format, server.bitRate, server.durationMs)
-                    database.songDao().updateDownloadStatusSpecsAndTimestamp(server.id, DownloadStatus.DOWNLOADED, currentPath, realFmt, realBr, finalTs)
-                    if (server.downloadStatus != DownloadStatus.DOWNLOADED || server.format != realFmt) {
+                    val needsUpdate = server.downloadStatus != DownloadStatus.DOWNLOADED ||
+                            server.localFilePath != currentPath ||
+                            server.format != realFmt ||
+                            server.bitRate != realBr ||
+                            (server.addedTimestamp <= 0 && finalTs > 0)
+                    if (needsUpdate) {
+                        database.songDao().updateDownloadStatusSpecsAndTimestamp(server.id, DownloadStatus.DOWNLOADED, currentPath, realFmt, realBr, finalTs)
                         updatedCount++
                     }
                     continue
@@ -911,8 +923,13 @@ object LocalMediaScanner {
                     claimedPhysicalPaths.add(recPath)
                     val finalTs = if (server.addedTimestamp > 0) server.addedTimestamp else (downloadRec?.completedTimestamp ?: System.currentTimeMillis())
                     val (realFmt, realBr) = resolveLocalSpecs(recPath, server.format, server.bitRate, server.durationMs)
-                    database.songDao().updateDownloadStatusSpecsAndTimestamp(server.id, DownloadStatus.DOWNLOADED, recPath, realFmt, realBr, finalTs)
-                    if (server.downloadStatus != DownloadStatus.DOWNLOADED || server.format != realFmt) {
+                    val needsUpdate = server.downloadStatus != DownloadStatus.DOWNLOADED ||
+                            server.localFilePath != recPath ||
+                            server.format != realFmt ||
+                            server.bitRate != realBr ||
+                            (server.addedTimestamp <= 0 && finalTs > 0)
+                    if (needsUpdate) {
+                        database.songDao().updateDownloadStatusSpecsAndTimestamp(server.id, DownloadStatus.DOWNLOADED, recPath, realFmt, realBr, finalTs)
                         updatedCount++
                     }
                     continue

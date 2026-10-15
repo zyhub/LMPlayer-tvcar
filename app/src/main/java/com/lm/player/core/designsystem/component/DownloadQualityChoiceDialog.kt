@@ -712,7 +712,10 @@ fun SongSyncStatusTrailing(
             color = AppleRed.copy(alpha = 0.12f),
             modifier = modifier
                 .clip(RoundedCornerShape(12.dp))
-                .clickable { onOpenDownloads() }
+                .tvFocusable(
+                    shape = RoundedCornerShape(12.dp),
+                    onClick = { onOpenDownloads() }
+                )
         ) {
             Row(
                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
@@ -739,7 +742,10 @@ fun SongSyncStatusTrailing(
             Row(
                 modifier = Modifier
                     .clip(RoundedCornerShape(8.dp))
-                    .clickable { isMenuOpen = true }
+                    .tvFocusable(
+                        shape = RoundedCornerShape(8.dp),
+                        onClick = { isMenuOpen = true }
+                    )
                     .padding(horizontal = 4.dp, vertical = 2.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -783,7 +789,10 @@ fun SongSyncStatusTrailing(
             Row(
                 modifier = Modifier
                     .clip(RoundedCornerShape(8.dp))
-                    .clickable { isMenuOpen = true }
+                    .tvFocusable(
+                        shape = RoundedCornerShape(8.dp),
+                        onClick = { isMenuOpen = true }
+                    )
                     .padding(horizontal = 4.dp, vertical = 2.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -824,7 +833,9 @@ fun SongSyncStatusTrailing(
         Box(modifier = modifier) {
             IconButton(
                 onClick = { isMenuOpen = true },
-                modifier = Modifier.size(36.dp)
+                modifier = Modifier
+                    .size(36.dp)
+                    .tvButtonFocusable(shape = RoundedCornerShape(18.dp))
             ) {
                 Icon(
                     imageVector = Icons.Default.ArrowCircleDown,

@@ -64,9 +64,16 @@ object TvFocusMemory {
     @Volatile
     private var restoring = false
 
-    fun register(key: String, requester: FocusRequester) {
+    fun scopedKey(scope: String, key: String): String =
+        if (scope.isBlank() || scope == "root") key else "$scope#$key"
+
+    fun register(scope: String = "", key: String, requester: FocusRequester) {
         if (key.isBlank()) return
-        requesters[key] = requester
+        requesters[scopedKey(scope, key)] = requester
+    }
+
+    fun register(key: String, requester: FocusRequester) {
+        register("", key, requester)
     }
 
     /**
@@ -76,9 +83,13 @@ object TvFocusMemory {
      * 若无条件按 key 删除，旧节点的 dispose 会把新节点的注册抹掉，
      * 导致该 key 永久无法恢复。
      */
-    fun unregister(key: String, requester: FocusRequester) {
+    fun unregister(scope: String = "", key: String, requester: FocusRequester) {
         if (key.isBlank()) return
-        requesters.remove(key, requester)
+        requesters.remove(scopedKey(scope, key), requester)
+    }
+
+    fun unregister(key: String, requester: FocusRequester) {
+        unregister("", key, requester)
     }
 
     fun rememberFocus(scope: String, key: String) {
@@ -91,8 +102,11 @@ object TvFocusMemory {
 
     /** 清空某层级及其所有子层级的记忆（例如该页面整体退出时） */
     fun clearScope(scope: String) {
+        if (scope.isBlank() || scope == "root") return
         val targets = memoryByScope.keys.filter { it == scope || it.startsWith("$scope::") }
         targets.forEach { memoryByScope.remove(it) }
+        val requesterTargets = requesters.keys.filter { it.startsWith("$scope#") || it.startsWith("$scope::") }
+        requesterTargets.forEach { requesters.remove(it) }
     }
 
     /**
@@ -108,8 +122,10 @@ object TvFocusMemory {
         var scopeCursor = scope
         while (true) {
             val key = memoryByScope[scopeCursor]
-            if (key != null && requesters.containsKey(key)) {
-                if (awaitFocus(key)) return true
+            if (key != null) {
+                val fullKey = scopedKey(scopeCursor, key)
+                val targetKey = if (requesters.containsKey(fullKey)) fullKey else if (requesters.containsKey(key)) key else null
+                if (targetKey != null && awaitFocus(targetKey)) return true
             }
             val parent = scopeCursor.substringBeforeLast("::", "")
             if (parent.isBlank()) break
@@ -173,6 +189,11 @@ fun tvFocusChildScope(parent: String, child: String): String =
 fun TvFocusScope(name: String, content: @Composable () -> Unit) {
     val parent = LocalTvFocusScope.current
     val scope = remember(parent, name) { tvFocusChildScope(parent, name) }
+    DisposableEffect(scope) {
+        onDispose {
+            TvFocusMemory.clearScope(scope)
+        }
+    }
     CompositionLocalProvider(LocalTvFocusScope provides scope) { content() }
 }
 

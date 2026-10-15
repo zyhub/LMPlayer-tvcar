@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -368,8 +369,16 @@ class DownloadEngine(
             }
         }
 
-        val existing = songDao.getSongById(song.id)
-        if (existing != null) {
+        val existingById = songDao.getSongById(song.id)
+        val existingByPath = songDao.getSongByLocalPath(localFilePath)
+
+        // 避免物理文件在本地库中存在多个不同 ID 的冗余条目：若按路径已查到老实体且其 ID != song.id，清理老冗余条目 (TV-P0-06)
+        if (existingByPath != null && existingByPath.id != song.id) {
+            songDao.deleteSongById(existingByPath.id)
+            downloadDao.deleteDownload(existingByPath.id)
+        }
+
+        if (existingById != null) {
             songDao.updateDownloadStatusSpecsAndTimestamp(
                 songId = song.id,
                 status = DownloadStatus.DOWNLOADED,
@@ -399,7 +408,8 @@ class DownloadEngine(
                 format = detectedExt,
                 isFavorite = song.isFavorite,
                 relativeFolderPath = safeRelativePath,
-                addedTimestamp = System.currentTimeMillis()
+                addedTimestamp = System.currentTimeMillis(),
+                rawMetaJson = song.rawMetaJson
             )
             songDao.insertSongs(listOf(newEntity))
         }
@@ -1163,14 +1173,14 @@ class DownloadEngine(
     }
 
     private fun updateTask(task: DownloadTask) {
-        val map = _activeTasksMap.value.toMutableMap()
-        map[task.song.id] = task
-        _activeTasksMap.value = map
+        _activeTasksMap.update { current ->
+            current + (task.song.id to task)
+        }
     }
 
     private fun removeTask(songId: String) {
-        val map = _activeTasksMap.value.toMutableMap()
-        map.remove(songId)
-        _activeTasksMap.value = map
+        _activeTasksMap.update { current ->
+            current - songId
+        }
     }
 }

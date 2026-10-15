@@ -45,16 +45,31 @@ object NetworkClientFactory {
     @Volatile
     private var activeAuthToken: String = ""
 
-    fun setActiveAuthToken(token: String) {
+    private val authTokenHosts = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    fun setActiveAuthToken(token: String, serverHost: String? = null) {
         if (token.isNotBlank()) {
             activeAuthToken = token.trim()
+            if (!serverHost.isNullOrBlank()) {
+                val cleanHost = serverHost.removePrefix("http://").removePrefix("https://").substringBefore("/").substringBefore(":")
+                if (cleanHost.isNotBlank()) {
+                    authTokenHosts.add(cleanHost.lowercase())
+                }
+            }
         }
+    }
+
+    fun isTokenHostAllowed(host: String): Boolean {
+        if (authTokenHosts.isEmpty()) return true
+        val target = host.lowercase()
+        return authTokenHosts.any { allowed -> target == allowed || target.endsWith(".$allowed") }
     }
 
     fun getActiveAuthToken(): String = activeAuthToken
 
     fun clearActiveAuthToken() {
         activeAuthToken = ""
+        authTokenHosts.clear()
     }
 
     fun createOkHttpClient(context: Context): OkHttpClient {
@@ -121,11 +136,12 @@ object NetworkClientFactory {
                 reqBuilder.cacheControl(okhttp3.CacheControl.FORCE_NETWORK)
             }
             // 若 URL 中携带 token 参数或访问柠檬服务端 API 且未显式指定 Authorization 请求头，自动补充 Bearer Token
+            // 严格做 Host 白名单核验，避免把柠檬服务端 Bearer Token 泄露给第三方 /api/ 接口 (TV-P0-01)
             val tokenParam = request.url.queryParameter("token")
             if (request.header("Authorization").isNullOrBlank()) {
-                if (!tokenParam.isNullOrBlank()) {
+                if (!tokenParam.isNullOrBlank() && isTokenHostAllowed(request.url.host)) {
                     reqBuilder.header("Authorization", "Bearer $tokenParam")
-                } else if (activeAuthToken.isNotBlank() && encodedPath.startsWith("/api/")) {
+                } else if (activeAuthToken.isNotBlank() && encodedPath.startsWith("/api/") && isTokenHostAllowed(request.url.host)) {
                     reqBuilder.header("Authorization", "Bearer $activeAuthToken")
                 }
             }

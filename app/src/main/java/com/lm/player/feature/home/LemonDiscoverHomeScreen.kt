@@ -121,6 +121,7 @@ fun LemonDiscoverHomeScreen(
     val discoverListState = rememberLazyListState()
     val collectionListState = rememberLazyListState()
     var isLoadingCollection by remember { mutableStateOf(false) }
+    var collectionLoadJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
 
     LaunchedEffect(activeCollectionTitle) {
         onSubViewActiveChange(activeCollectionTitle != null)
@@ -607,7 +608,8 @@ fun LemonDiscoverHomeScreen(
                                                 activeCollectionSongs = emptyList()
                                                 isLoadingCollection = true
                                                 val tlId = "lemon_toplist_${targetToplist.source}_${targetToplist.id}"
-                                                coroutineScope.launch(Dispatchers.IO) {
+                                                collectionLoadJob?.cancel()
+                                                collectionLoadJob = coroutineScope.launch(Dispatchers.IO) {
                                                     val fetched = runCatching { onFetchCollectionSongs(tlId, currentSource) }.getOrDefault(emptyList())
                                                     withContext(Dispatchers.Main) {
                                                         activeCollectionSongs = fetched
@@ -676,7 +678,8 @@ fun LemonDiscoverHomeScreen(
                                                 activeCollectionCover = topAlbum.coverUrl
                                                 activeCollectionSongs = emptyList()
                                                 isLoadingCollection = true
-                                                coroutineScope.launch(Dispatchers.IO) {
+                                                collectionLoadJob?.cancel()
+                                                collectionLoadJob = coroutineScope.launch(Dispatchers.IO) {
                                                     val fetched = runCatching { onFetchCollectionSongs(topAlbum.id, currentSource) }.getOrDefault(emptyList())
                                                     withContext(Dispatchers.Main) {
                                                         activeCollectionSongs = fetched
@@ -770,7 +773,8 @@ fun LemonDiscoverHomeScreen(
                                                 activeCollectionSongs = emptyList()
                                                 isLoadingCollection = true
                                                 val plId = playlist.id
-                                                coroutineScope.launch(Dispatchers.IO) {
+                                                collectionLoadJob?.cancel()
+                                                collectionLoadJob = coroutineScope.launch(Dispatchers.IO) {
                                                     val fetched = runCatching { onFetchCollectionSongs(plId, currentSource) }.getOrDefault(emptyList())
                                                     withContext(Dispatchers.Main) {
                                                         activeCollectionSongs = fetched
@@ -813,7 +817,8 @@ fun LemonDiscoverHomeScreen(
                                                 activeCollectionSongs = emptyList()
                                                 isLoadingCollection = true
                                                 val tlId = "lemon_toplist_${toplist.source}_${toplist.id}"
-                                                coroutineScope.launch(Dispatchers.IO) {
+                                                collectionLoadJob?.cancel()
+                                                collectionLoadJob = coroutineScope.launch(Dispatchers.IO) {
                                                     val fetched = runCatching { onFetchCollectionSongs(tlId, currentSource) }.getOrDefault(emptyList())
                                                     withContext(Dispatchers.Main) {
                                                         activeCollectionSongs = fetched

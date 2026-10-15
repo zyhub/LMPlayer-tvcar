@@ -200,6 +200,9 @@ interface ServerDao {
     @Query("UPDATE servers SET isCurrentActive = (id = :activeServerId)")
     suspend fun setActiveServer(activeServerId: String)
 
+    @Query("UPDATE servers SET isCurrentActive = 0")
+    suspend fun clearActiveServer()
+
     @Query("DELETE FROM servers WHERE id = :serverId")
     suspend fun deleteServer(serverId: String)
 }

@@ -105,7 +105,11 @@ class PlaybackRouter(
         val currentPreferredQuality = overrideQuality ?: LemonMusicProtocol.getPreferredStreamQuality(context)
         val targetQuality = com.lm.player.core.model.AudioQuality.fromKey(currentPreferredQuality)
         val targetBitRate = targetQuality.bitrate
-        val isStaleQuality = (song.bitRate != targetBitRate && song.localFilePath.isNullOrBlank() && song.downloadStatus != DownloadStatus.DOWNLOADED) || overrideQuality != null
+        val isStaleQuality = if (streamPreResolved && song.streamUrl.startsWith("http")) {
+            false
+        } else {
+            (song.bitRate != targetBitRate && song.localFilePath.isNullOrBlank() && song.downloadStatus != DownloadStatus.DOWNLOADED) || overrideQuality != null
+        }
 
         var finalStreamUrl = if (forceRefresh || isStaleQuality) {
             ""

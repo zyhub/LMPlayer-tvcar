@@ -371,9 +371,15 @@ fun LibrarySearchDialog(
         if (onlinePage != 1) onlinePage = 1
     }
 
-    // 首字母智能联想词（当用户输入如 ZJL 时自动映射“周杰伦”用于联想芯片及在线搜索优化）
-    val smartSuggestions = remember(query, allSongs) {
-        TvPinyinSearchHelper.buildSmartSuggestions(query, allSongs)
+    // 首字母智能联想词（后台协程计算，消除主线程卡顿）
+    val smartSuggestions by produceState(initialValue = emptyList<String>(), key1 = query, key2 = allSongs) {
+        if (query.isNotBlank()) {
+            delay(80L)
+        }
+        val res = withContext(Dispatchers.Default) {
+            TvPinyinSearchHelper.buildSmartSuggestions(query, allSongs)
+        }
+        value = res
     }
 
     // 在线全网搜索协程（运行在 Dispatchers.IO，当输入纯首字母缩写且命中 KTV 预设或曲库歌手时自动使用展开词或原词检索）
@@ -463,15 +469,21 @@ fun LibrarySearchDialog(
             allCachedSongs = allSongs,
             activeTasks = tasks
         )
-        // 消除全网在线搜索结果里的重复歌曲（按歌名和歌手去重，保留最高音质/首个版本）
-        rawList.distinctBy { "${it.title.trim().lowercase()}_${it.artist.trim().lowercase()}" }
+        // 消除全网在线搜索结果里的重复歌曲：双重排重（按歌名和歌手去重，同时保证 song.id 唯一）
+        val seenSongIds = HashSet<String>()
+        rawList
+            .distinctBy { "${it.title.trim().lowercase()}_${it.artist.trim().lowercase()}" }
+            .filter { seenSongIds.add(it.id) }
     }
 
-    // 本地/NAS 曲库搜索结果（按匹配精密度权重打分排序：首字母完全对齐优先，字数少者靠前，去重并限制最多展示150首）
-    val searchResults = remember(query, allSongs) {
+    // 本地/NAS 曲库搜索结果（后台协程计算，按匹配精密度权重打分排序）
+    val searchResults by produceState(initialValue = emptyList<UnifiedSong>(), key1 = query, key2 = allSongs) {
         if (query.isBlank()) {
-            emptyList()
-        } else {
+            value = emptyList()
+            return@produceState
+        }
+        delay(80L)
+        val res = withContext(Dispatchers.Default) {
             allSongs.asSequence()
                 .map { song -> song to TvPinyinSearchHelper.scoreSong(song, query) }
                 .filter { it.second > 0 }
@@ -481,6 +493,7 @@ fun LibrarySearchDialog(
                 .take(150)
                 .toList()
         }
+        value = res
     }
 
     // 进入侧锚点令牌（**派生**，不是命令式自增）。
@@ -821,7 +834,7 @@ fun LibrarySearchDialog(
                             ) {
                                 itemsIndexed(
                                     items = searchHistory,
-                                    key = { _, word -> "hist_$word" }
+                                    key = { index, word -> "hist_${index}_$word" }
                                 ) { _, word ->
                                     Surface(
                                         shape = RoundedCornerShape(12.dp),
@@ -1227,7 +1240,7 @@ fun LibrarySearchDialog(
                             }
                             itemsIndexed(
                                 items = resolvedOnlineResults,
-                                key = { _, song -> "search_online_${song.id}" },
+                                key = { index, song -> "search_online_${index}_${song.id}" },
                                 contentType = { _, _ -> "search_online_song_item" }
                             ) { index, song ->
                                 SongListItemRow(
@@ -1280,7 +1293,7 @@ fun LibrarySearchDialog(
                             }
                             itemsIndexed(
                                 items = searchResults,
-                                key = { _, song -> "search_local_${song.id}" },
+                                key = { index, song -> "search_local_${index}_${song.id}" },
                                 contentType = { _, _ -> "search_song_item" }
                             ) { _, song ->
                                 SongListItemRow(

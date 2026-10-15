@@ -122,12 +122,13 @@ class PlaybackService : MediaSessionService() {
                 }
             }
 
-            private var lastSeekTimestamp = 0L
+            private var lastNextTimestamp = 0L
+            private var lastPrevTimestamp = 0L
 
             override fun seekToNext() {
                 val now = System.currentTimeMillis()
-                if (now - lastSeekTimestamp < 300L) return
-                lastSeekTimestamp = now
+                if (now - lastNextTimestamp < 300L) return
+                lastNextTimestamp = now
                 PlaybackQueueManager.playNext(this@PlaybackService)
             }
 
@@ -137,8 +138,8 @@ class PlaybackService : MediaSessionService() {
 
             override fun seekToPrevious() {
                 val now = System.currentTimeMillis()
-                if (now - lastSeekTimestamp < 300L) return
-                lastSeekTimestamp = now
+                if (now - lastPrevTimestamp < 300L) return
+                lastPrevTimestamp = now
                 PlaybackQueueManager.playPrevious(this@PlaybackService)
             }
 
@@ -358,7 +359,6 @@ class PlaybackService : MediaSessionService() {
                                 KeyEvent.KEYCODE_NAVIGATE_NEXT,
                                 KeyEvent.KEYCODE_PAGE_DOWN -> {
                                     PlaybackQueueManager.playNext(this@PlaybackService)
-                                    dispatchBroadcast(CMD_NEXT)
                                     return true
                                 }
                                 KeyEvent.KEYCODE_MEDIA_PREVIOUS,
@@ -370,27 +370,23 @@ class PlaybackService : MediaSessionService() {
                                 KeyEvent.KEYCODE_NAVIGATE_PREVIOUS,
                                 KeyEvent.KEYCODE_PAGE_UP -> {
                                     PlaybackQueueManager.playPrevious(this@PlaybackService)
-                                    dispatchBroadcast(CMD_PREV)
                                     return true
                                 }
                                 KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
                                 KeyEvent.KEYCODE_HEADSETHOOK,
                                 KeyEvent.KEYCODE_BUTTON_START -> {
                                     PlaybackQueueManager.togglePlay(this@PlaybackService)
-                                    dispatchBroadcast(CMD_TOGGLE)
                                     return true
                                 }
                                 KeyEvent.KEYCODE_MEDIA_PLAY -> {
                                     val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
                                     if (!p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
-                                    dispatchBroadcast(CMD_PLAY)
                                     return true
                                 }
                                 KeyEvent.KEYCODE_MEDIA_PAUSE,
                                 KeyEvent.KEYCODE_MEDIA_STOP -> {
                                     val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
                                     if (p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
-                                    dispatchBroadcast(CMD_PAUSE)
                                     return true
                                 }
                             }
@@ -451,17 +447,7 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
-    private fun dispatchBroadcast(command: String) {
-        try {
-            val intent = Intent(ACTION_MEDIA_COMMAND).apply {
-                putExtra(EXTRA_COMMAND, command)
-                setPackage(packageName)
-            }
-            sendBroadcast(intent)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to send media command broadcast: $command", e)
-        }
-    }
+
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP_SERVICE) {

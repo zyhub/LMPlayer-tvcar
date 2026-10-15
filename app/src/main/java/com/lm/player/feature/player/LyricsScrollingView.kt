@@ -84,12 +84,13 @@ fun LyricsScrollingView(
     modifier: Modifier = Modifier
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val prefs = remember { context.getSharedPreferences("lemon_settings_prefs", android.content.Context.MODE_PRIVATE) }
+    val prefs = remember { context.getSharedPreferences("zds_lyrics_prefs", android.content.Context.MODE_PRIVATE) }
+    val fallbackPrefs = remember { context.getSharedPreferences("lemon_settings_prefs", android.content.Context.MODE_PRIVATE) }
     var isKaraokeEnabled by remember {
-        mutableStateOf(prefs.getBoolean("lyric_karaoke_enabled", true))
+        mutableStateOf(if (prefs.contains("lyric_karaoke_enabled")) prefs.getBoolean("lyric_karaoke_enabled", true) else fallbackPrefs.getBoolean("lyric_karaoke_enabled", true))
     }
     var useSystemFont by remember {
-        mutableStateOf(prefs.getBoolean("lyric_use_system_font", true))
+        mutableStateOf(if (prefs.contains("lyric_use_system_font")) prefs.getBoolean("lyric_use_system_font", true) else fallbackPrefs.getBoolean("lyric_use_system_font", true))
     }
     val lyricFontFamily = remember(useSystemFont) {
         SystemFontManager.getSystemFontFamily(useSystemFont)
@@ -613,7 +614,7 @@ fun LyricsAdjustDropdownMenu(
     onKaraokeChange: (Boolean) -> Unit = {},
     onFontModeChange: (Boolean) -> Unit = {}
 ) {
-    val isDark = isSystemInDarkTheme()
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val primaryText = if (isDark) Color.White else Color.Black
     val secondaryText = if (isDark) Color(0xFFAAAAAE) else Color(0xFF6C6C70)
     val firstFocusRequester = remember { FocusRequester() }
@@ -967,7 +968,7 @@ fun LyricsAdjustDialog(
     onFontModeChange: (Boolean) -> Unit = {},
     onDismiss: () -> Unit
 ) {
-    val isDark = isSystemInDarkTheme()
+    val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val primaryText = if (isDark) Color.White else Color.Black
     val secondaryText = if (isDark) Color(0xFFAAAAAE) else Color(0xFF6C6C70)
 

@@ -803,16 +803,18 @@ object SongMatchingResolver {
             val orphanedSongs = existingServerSongs.filter { !incomingIds.contains(it.id) && !it.isFavorite }
 
             if (orphanedSongs.isNotEmpty()) {
+                val claimedLocalPaths = preservedEntities.mapNotNull { it.localFilePath?.takeIf { p -> p.isNotBlank() } }.toSet()
                 val toDeleteIds = ArrayList<String>()
                 for (orphan in orphanedSongs) {
                     val localPath = orphan.localFilePath
                     val hasValidLocalFile = !localPath.isNullOrBlank() && File(localPath).let { it.exists() && it.length() > 0 }
-                    if (hasValidLocalFile) {
-                        // 本地已有有效物理下载文件：降级归属为 local_storage，保留本地离线播放，但不占在线服务器库名额
+                    if (hasValidLocalFile && !claimedLocalPaths.contains(localPath)) {
+                        // 本地已有有效物理下载文件且未被本次同步曲目抢占：降级归属为 local_storage，保留本地离线播放，但不占在线服务器库名额
                         database.songDao().updateServerId(orphan.id, "local_storage")
                     } else {
-                        // 本地无实体文件：彻底从数据库物理删除
+                        // 本地无实体文件或已被新曲目抢占：彻底从数据库物理删除并同步清理下载记录
                         toDeleteIds.add(orphan.id)
+                        database.downloadDao().deleteDownload(orphan.id)
                     }
                 }
                 if (toDeleteIds.isNotEmpty()) {

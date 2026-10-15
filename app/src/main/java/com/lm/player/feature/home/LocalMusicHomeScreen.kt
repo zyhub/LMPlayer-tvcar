@@ -51,8 +51,10 @@ import com.lm.player.core.model.UnifiedSong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
+private val realSpecsCache = object : android.util.LruCache<String, Triple<String, Int, String>>(500) {}
+
 /**
- * 精准解析本地已下载文件的真实封装格式 (支持魔数头 fLaC 校验)、真实码率与真实物理文件大小
+ * 精准解析本地已下载文件的真实封装格式 (支持魔数头 fLaC 校验)、真实码率与真实物理文件大小 (带内存 LruCache 缓存)
  */
 fun resolveRealLocalFormatAndSize(song: UnifiedSong): Triple<String, Int, String> {
     val localPath = song.localFilePath
@@ -61,6 +63,13 @@ fun resolveRealLocalFormatAndSize(song: UnifiedSong): Triple<String, Int, String
             java.io.File(localPath).takeIf { it.exists() && it.length() > 0L }
         } catch (_: Exception) { null }
     } else null
+
+    val cacheKey = if (localFile != null) {
+        "${song.id}_${localPath}_${localFile.lastModified()}_${localFile.length()}"
+    } else {
+        "${song.id}_${localPath ?: ""}_${song.format}_${song.bitRate}_${song.durationMs}"
+    }
+    realSpecsCache.get(cacheKey)?.let { return it }
 
     val detectedExt = if (localFile != null) {
         val magicExt = try {
@@ -98,8 +107,9 @@ fun resolveRealLocalFormatAndSize(song: UnifiedSong): Triple<String, Int, String
         val estMb = (durationSec * rate * 1000L / 8L) / (1024.0 * 1024.0)
         "%.1f MB".format(java.util.Locale.US, estMb)
     }
-
-    return Triple(detectedExt, realBitRate, sizeStr)
+    val result = Triple(detectedExt, realBitRate, sizeStr)
+    realSpecsCache.put(cacheKey, result)
+    return result
 }
 
 /**

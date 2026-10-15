@@ -1,4 +1,4 @@
-﻿package com.lm.player.core.database.entity
+package com.lm.player.core.database.entity
 
 import androidx.room.Entity
 import androidx.room.Index
@@ -38,7 +38,8 @@ data class SongEntity(
     val isFavorite: Boolean,
     val relativeFolderPath: String? = null,
     val lastPlayedTimestamp: Long = 0L,
-    val addedTimestamp: Long = System.currentTimeMillis()
+    val addedTimestamp: Long = System.currentTimeMillis(),
+    val rawMetaJson: String? = null
 )
 
 @Entity(

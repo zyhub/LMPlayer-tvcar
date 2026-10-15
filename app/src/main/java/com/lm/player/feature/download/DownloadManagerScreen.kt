@@ -251,8 +251,8 @@ fun DownloadManagerScreen(
                     }
                 }
 
-                // 仅在已下载 Tab 展示批量管理操作
-                if (selectedTab == 1 && completedSongs.isNotEmpty()) {
+                // 仅在已下载 Tab (Tab 2: 已完成) 展示批量管理操作 (TV-P0-03)
+                if (selectedTab == 2 && completedSongs.isNotEmpty()) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         if (isMultiSelectMode) {
                             TextButton(
@@ -491,7 +491,7 @@ fun DownloadManagerScreen(
                         ) {
                             itemsIndexed(
                                 items = activeTasks,
-                                key = { _, task -> "active_dl_${task.song.id}" },
+                                key = { index, task -> "active_dl_${index}_${task.song.id}" },
                                 contentType = { _, _ -> "active_download_task" }
                             ) { _, task ->
                                 val isSelected = task.song.id in selectedActiveTaskIds
@@ -701,7 +701,7 @@ fun DownloadManagerScreen(
 
                         itemsIndexed(
                             items = completedSongs,
-                            key = { _, song -> "done_dl_${song.id}" },
+                            key = { index, song -> "done_dl_${index}_${song.id}" },
                             contentType = { _, _ -> "completed_download_song" }
                         ) { _, song ->
                             val isSelected = song.id in selectedSongIds
@@ -1391,7 +1391,7 @@ private fun CompletedDownloadSongRow(
     onDelete: () -> Unit,
     onShowDetails: () -> Unit
 ) {
-    val (realExt, _) = remember(song.id, song.localFilePath, song.format) {
+    val (realExt, realBitRate, realSize) = remember(song.id, song.localFilePath, song.format, song.bitRate, song.durationMs) {
         com.lm.player.feature.home.resolveRealLocalFormatAndSize(song)
     }
     Surface(
@@ -1462,7 +1462,7 @@ private fun CompletedDownloadSongRow(
                     }
                     Spacer(modifier = Modifier.width(5.dp))
                     Text(
-                        text = com.lm.player.feature.home.formatDownloadedSongSpecs(song),
+                        text = com.lm.player.feature.home.formatDownloadedSongSpecs(realExt, realBitRate, realSize),
                         style = TextStyle(fontSize = 11.sp, color = Color(0xFF34C759)),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis

@@ -59,7 +59,13 @@ object DownloadRequestPlanner {
     fun existingLocalFileSatisfies(song: UnifiedSong, quality: AudioQuality): Boolean {
         val targetLossless = quality.format.equals("flac", ignoreCase = true) || quality.bitrate >= 800
         val existingLossless = song.format.lowercase() in LOSSLESS_EXTS
-        return if (targetLossless) existingLossless else !existingLossless
+        return if (targetLossless) {
+            existingLossless
+        } else {
+            if (existingLossless) return false
+            if (quality.bitrate >= 320 && song.bitRate in 1..255) return false
+            true
+        }
     }
 
     /**

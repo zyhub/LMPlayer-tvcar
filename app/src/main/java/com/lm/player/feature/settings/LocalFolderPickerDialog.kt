@@ -1,4 +1,4 @@
-﻿package com.lm.player.feature.settings
+package com.lm.player.feature.settings
 
 import android.os.Environment
 import android.widget.Toast
@@ -24,6 +24,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.lm.player.core.designsystem.component.tvButtonFocusable
+import com.lm.player.core.designsystem.component.tvFocusable
 import com.lm.player.core.designsystem.theme.AppleRed
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -123,12 +125,13 @@ fun LocalFolderPickerDialog(
                         }
                     }
 
-                    // 新建文件夹按钮
+                    // 新建文件夹按钮 (TV-P1-01)
                     IconButton(
                         onClick = {
                             newDirName = ""
                             showCreateDirDialog = true
-                        }
+                        },
+                        modifier = Modifier.tvButtonFocusable(shape = RoundedCornerShape(10.dp))
                     ) {
                         Icon(
                             imageVector = Icons.Default.CreateNewFolder,
@@ -162,7 +165,9 @@ fun LocalFolderPickerDialog(
                                 }
                             },
                             enabled = canGoUp,
-                            modifier = Modifier.size(28.dp)
+                            modifier = Modifier
+                                .size(28.dp)
+                                .tvButtonFocusable(shape = RoundedCornerShape(8.dp))
                         ) {
                             Icon(
                                 imageVector = Icons.Default.ArrowBackIosNew,
@@ -242,9 +247,12 @@ fun LocalFolderPickerDialog(
                                         modifier = Modifier
                                             .fillMaxWidth()
                                             .clip(RoundedCornerShape(12.dp))
-                                            .clickable {
-                                                currentDir = item
-                                            }
+                                            .tvFocusable(
+                                                shape = RoundedCornerShape(12.dp),
+                                                onClick = {
+                                                    currentDir = item
+                                                }
+                                            )
                                             .padding(horizontal = 10.dp, vertical = 10.dp),
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
@@ -315,7 +323,7 @@ fun LocalFolderPickerDialog(
 
                 Spacer(modifier = Modifier.height(14.dp))
 
-                // 4. 底部操作栏
+                // 4. 底部操作栏 (TV-P1-01)
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = {
@@ -326,6 +334,7 @@ fun LocalFolderPickerDialog(
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(44.dp)
+                            .tvButtonFocusable(shape = RoundedCornerShape(12.dp))
                     ) {
                         Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
@@ -341,14 +350,18 @@ fun LocalFolderPickerDialog(
                                 onConfirm("") // 传空代表恢复默认目录
                             },
                             shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.weight(1f)
+                            modifier = Modifier
+                                .weight(1f)
+                                .tvButtonFocusable(shape = RoundedCornerShape(12.dp))
                         ) {
                             Text("恢复默认目录", fontSize = 13.sp)
                         }
 
                         TextButton(
                             onClick = onDismiss,
-                            modifier = Modifier.weight(1f)
+                            modifier = Modifier
+                                .weight(1f)
+                                .tvButtonFocusable(shape = RoundedCornerShape(12.dp))
                         ) {
                             Text("取消", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }

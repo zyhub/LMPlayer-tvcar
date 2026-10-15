@@ -30,6 +30,8 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -204,7 +206,7 @@ fun SettingsScreen(
     // 本地音乐路径管理状态
     val defaultLocalPaths = remember { setOf("/storage/emulated/0/Music", "/storage/emulated/0/Download") }
     var localMusicPaths by remember {
-        mutableStateOf(prefs.getStringSet("local_music_scan_folders", defaultLocalPaths) ?: defaultLocalPaths)
+        mutableStateOf(prefs.getStringSet("local_music_scan_folders", defaultLocalPaths)?.toSet() ?: defaultLocalPaths)
     }
     var isScanningLocalAndServer by remember { mutableStateOf(false) }
     var showAddLocalPathDialog by remember { mutableStateOf(false) }
@@ -216,11 +218,15 @@ fun SettingsScreen(
     LaunchedEffect(selectedTab, activeServer?.id, isScanningLocalAndServer, isPurgingLegacyData) {
         if (selectedTab == SettingsTab.SOURCES && activeServer?.type == ServerType.LEMON_MUSIC) {
             isLoadingScripts = true
-            val client = NetworkClientFactory.createOkHttpClient(context)
-            val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
-            val result = proto.fetchSourceList()
-            sourceScripts = result.getOrDefault(emptyList())
-            isLoadingScripts = false
+            try {
+                val client = NetworkClientFactory.createOkHttpClient(context)
+                val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
+                val result = proto.fetchSourceList()
+                sourceScripts = result.getOrDefault(emptyList())
+            } catch (_: Exception) {
+            } finally {
+                isLoadingScripts = false
+            }
         }
         if (selectedTab == SettingsTab.DOWNLOAD && activeServer?.type == ServerType.LEMON_MUSIC) {
             val client = NetworkClientFactory.createOkHttpClient(context)
@@ -408,14 +414,19 @@ fun SettingsScreen(
                                         onClick = {
                                             isTestingConnection = true
                                             coroutineScope.launch {
-                                                val client = NetworkClientFactory.createOkHttpClient(context)
-                                                val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
-                                                val res = proto.testConnection()
-                                                isTestingConnection = false
-                                                if (res.isSuccess) {
-                                                    Toast.makeText(context, "连接成功！服务端响应正常", Toast.LENGTH_SHORT).show()
-                                                } else {
-                                                    Toast.makeText(context, "连接失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                                                try {
+                                                    val client = NetworkClientFactory.createOkHttpClient(context)
+                                                    val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
+                                                    val res = proto.testConnection()
+                                                    if (res.isSuccess) {
+                                                        Toast.makeText(context, "连接成功！服务端响应正常", Toast.LENGTH_SHORT).show()
+                                                    } else {
+                                                        Toast.makeText(context, "连接失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                                                    }
+                                                } catch (e: Exception) {
+                                                    Toast.makeText(context, "连接异常: ${e.message}", Toast.LENGTH_LONG).show()
+                                                } finally {
+                                                    isTestingConnection = false
                                                 }
                                             }
                                         },
@@ -681,14 +692,19 @@ fun SettingsScreen(
                                             if (activeServer?.type == ServerType.LEMON_MUSIC) {
                                                 isLoadingScripts = true
                                                 coroutineScope.launch {
-                                                    val proto = LemonMusicProtocol(
-                                                        NetworkClientFactory.createOkHttpClient(context),
-                                                        activeServer.serverUrl,
-                                                        activeServer.username,
-                                                        activeServer.tokenOrApiKey
-                                                    )
-                                                    sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
-                                                    isLoadingScripts = false
+                                                    try {
+                                                        val proto = LemonMusicProtocol(
+                                                            NetworkClientFactory.createOkHttpClient(context),
+                                                            activeServer.serverUrl,
+                                                            activeServer.username,
+                                                            activeServer.tokenOrApiKey
+                                                        )
+                                                        sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
+                                                    } catch (e: Exception) {
+                                                        Toast.makeText(context, "刷新音源失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                                                    } finally {
+                                                        isLoadingScripts = false
+                                                    }
                                                 }
                                             } else {
                                                 Toast.makeText(context, "请先连接柠檬音乐服务端", Toast.LENGTH_SHORT).show()
@@ -1115,28 +1131,37 @@ fun SettingsScreen(
                                         if (!isScanningLocalAndServer) {
                                             isScanningLocalAndServer = true
                                             coroutineScope.launch {
-                                                withContext(Dispatchers.Main) {
-                                                    Toast.makeText(context, "正在全盘及配置目录扫描音频并与服务器比对...", Toast.LENGTH_SHORT).show()
-                                                }
-                                                var totalScanned = 0
-                                                // 1. 扫描配置目录
-                                                for (path in localMusicPaths) {
-                                                    if (java.io.File(path).exists()) {
-                                                        totalScanned += LocalMediaScanner.scanCustomDirectory(context, path, database)
+                                                try {
+                                                    withContext(Dispatchers.Main) {
+                                                        Toast.makeText(context, "正在全盘及配置目录扫描音频并与服务器比对...", Toast.LENGTH_SHORT).show()
                                                     }
-                                                }
-                                                // 2. 扫描系统媒体库
-                                                totalScanned += LocalMediaScanner.scanSystemMediaStore(context, database)
+                                                    var totalScanned = 0
+                                                    // 1. 扫描配置目录
+                                                    for (path in localMusicPaths) {
+                                                        if (java.io.File(path).exists()) {
+                                                            totalScanned += LocalMediaScanner.scanCustomDirectory(context, path, database)
+                                                        }
+                                                    }
+                                                    // 2. 扫描系统媒体库
+                                                    totalScanned += LocalMediaScanner.scanSystemMediaStore(context, database)
 
-                                                // 3. 与服务器曲库智能比对与真实性校验
-                                                val dlDir = java.io.File(downloadSettings.customDownloadPath.ifBlank { context.getExternalFilesDir(null)?.absolutePath ?: "" })
-                                                val matched = LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, dlDir)
-                                                LocalMediaScanner.matchAndMergeLocalWithServer(database)
+                                                    // 3. 与服务器曲库智能比对与真实性校验
+                                                    val dlDir = java.io.File(downloadSettings.customDownloadPath.ifBlank { context.getExternalFilesDir(null)?.absolutePath ?: "" })
+                                                    val matched = LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, dlDir)
+                                                    LocalMediaScanner.matchAndMergeLocalWithServer(database)
 
-                                                withContext(Dispatchers.Main) {
-                                                    Toast.makeText(context, "本地扫描与比对完成！已收录 $totalScanned 首本地歌曲，比对匹配 $matched 首服务器歌曲已标为本地已下载", Toast.LENGTH_LONG).show()
-                                                    onLocalScanCompleted()
-                                                    isScanningLocalAndServer = false
+                                                    withContext(Dispatchers.Main) {
+                                                        Toast.makeText(context, "本地扫描与比对完成！已收录 $totalScanned 首本地歌曲，比对匹配 $matched 首服务器歌曲已标为本地已下载", Toast.LENGTH_LONG).show()
+                                                        onLocalScanCompleted()
+                                                    }
+                                                } catch (e: Exception) {
+                                                    withContext(Dispatchers.Main) {
+                                                        Toast.makeText(context, "扫描比对异常: ${e.message}", Toast.LENGTH_SHORT).show()
+                                                    }
+                                                } finally {
+                                                    withContext(Dispatchers.Main) {
+                                                        isScanningLocalAndServer = false
+                                                    }
                                                 }
                                             }
                                         }
@@ -1834,22 +1859,26 @@ fun SettingsScreen(
                         showPurgeConfirmDialog = false
                         isPurgingLegacyData = true
                         coroutineScope.launch {
-                            // 存储不可读（U 盘/ SD 卡未挂载，或未授予音频读取权限）时不做物理文件校验：
-                            // 此时 File.exists() 会对外置目录下的所有曲目返回 false，
-                            // 执行下去会把整个本地曲库误判成"已删除"整批清掉。
-                            if (!LocalMediaScanner.isLocalStorageReadable(context)) {
+                            try {
+                                // 存储不可读（U 盘/ SD 卡未挂载，或未授予音频读取权限）时不做物理文件校验：
+                                // 此时 File.exists() 会对外置目录下的所有曲目返回 false，
+                                // 执行下去会把整个本地曲库误判成"已删除"整批清掉。
+                                if (!LocalMediaScanner.isLocalStorageReadable(context)) {
+                                    Toast.makeText(
+                                        context,
+                                        "未授予音频读取权限或外置存储未挂载，已跳过清理（未删除任何记录）",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                    return@launch
+                                }
+                                val purgedCount = LocalMediaScanner.purgeLegacyResidualData(database, emptyList(), context)
+                                onLocalScanCompleted()
+                                Toast.makeText(context, "资料库清理完成！成功清理 $purgedCount 条遗留记录", Toast.LENGTH_LONG).show()
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "清理异常: ${e.message}", Toast.LENGTH_SHORT).show()
+                            } finally {
                                 isPurgingLegacyData = false
-                                Toast.makeText(
-                                    context,
-                                    "未授予音频读取权限或外置存储未挂载，已跳过清理（未删除任何记录）",
-                                    Toast.LENGTH_LONG
-                                ).show()
-                                return@launch
                             }
-                            val purgedCount = LocalMediaScanner.purgeLegacyResidualData(database, emptyList(), context)
-                            isPurgingLegacyData = false
-                            onLocalScanCompleted()
-                            Toast.makeText(context, "资料库清理完成！成功清理 $purgedCount 条遗留记录", Toast.LENGTH_LONG).show()
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
@@ -2301,6 +2330,7 @@ fun SettingsScreen(
         var serverUrlInput by remember { mutableStateOf(editingServer?.serverUrl ?: "") }
         var usernameInput by remember { mutableStateOf(editingServer?.username ?: "") }
         var tokenInput by remember { mutableStateOf(editingServer?.tokenOrApiKey ?: "") }
+        var showPassword by remember { mutableStateOf(false) }
         var isTestingConnection by remember { mutableStateOf(false) }
         var isSavingAndConnecting by remember { mutableStateOf(false) }
         var testResultMsg by remember { mutableStateOf<String?>(null) }
@@ -2364,6 +2394,15 @@ fun SettingsScreen(
                         onValueChange = { tokenInput = it },
                         label = { Text("登录令牌 Token / 密码") },
                         singleLine = true,
+                        visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { showPassword = !showPassword }) {
+                                Icon(
+                                    imageVector = if (showPassword) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                    contentDescription = if (showPassword) "隐藏密码" else "显示密码"
+                                )
+                            }
+                        },
                         modifier = Modifier.fillMaxWidth()
                     )
 
