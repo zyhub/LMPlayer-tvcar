@@ -6,9 +6,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.SystemClock
+import android.provider.Settings
 import android.util.Log
 import android.view.KeyEvent
 import android.widget.Toast
@@ -3058,23 +3061,41 @@ class MainActivity : ComponentActivity() {
                                             // 触发歌曲刷新
                                         },
                                         onChooseDownloadDirectory = {
-                                            onChooseDownloadFolderResult = { uri ->
-                                                val resolvedPath = DownloadEngine.resolveFilesystemPath(uri.toString())
-                                                val updated = downloadEngine.downloadSettings.value.copy(customDownloadPath = resolvedPath)
-                                                downloadEngine.updateSettings(updated)
-                                                Toast.makeText(this@MainActivity, "已成功设定并保存下载存储目录：$resolvedPath", Toast.LENGTH_SHORT).show()
+                                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+                                                try {
+                                                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                                                        data = Uri.parse("package:$packageName")
+                                                    }
+                                                    startActivity(intent)
+                                                } catch (_: Exception) {
+                                                    try {
+                                                        startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                                                    } catch (_: Exception) {}
+                                                }
                                             }
-                                            try {
-                                                chooseDownloadDirectoryLauncher.launch(null)
-                                            } catch (_: Exception) {
-                                                showCustomFolderPickerForDownload = true
+                                            showCustomFolderPickerForDownload = true
+                                        },
+                                        onOpenLocalFolderPicker = {
+                                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+                                                try {
+                                                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                                                        data = Uri.parse("package:$packageName")
+                                                    }
+                                                    startActivity(intent)
+                                                } catch (_: Exception) {
+                                                    try {
+                                                        startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                                                    } catch (_: Exception) {}
+                                                }
                                             }
+                                            showCustomFolderPickerForImport = true
                                         },
                                         onImportCustomFolder = {
                                             onImportFolderResult = { uri ->
                                                 val resolvedFolder = DownloadEngine.resolveFilesystemPath(uri.toString())
                                                 if (resolvedFolder.isNotBlank()) {
-                                                    val existingFolders = uiPrefs.getStringSet("local_music_scan_folders", emptySet())?.toSet() ?: emptySet()
+                                                    val defaultScanFolders = setOf("/storage/emulated/0/Music", "/storage/emulated/0/Download")
+                                                    val existingFolders = uiPrefs.getStringSet("local_music_scan_folders", defaultScanFolders)?.toSet() ?: defaultScanFolders
                                                     val updatedFolders = existingFolders + resolvedFolder
                                                     uiPrefs.edit().remove("local_music_scan_folders").apply()
                                                     uiPrefs.edit().putStringSet("local_music_scan_folders", updatedFolders).apply()
@@ -3175,7 +3196,8 @@ class MainActivity : ComponentActivity() {
                                 onConfirm = { selectedPath ->
                                     showCustomFolderPickerForImport = false
                                     if (selectedPath.isNotBlank()) {
-                                        val existingFolders = uiPrefs.getStringSet("local_music_scan_folders", emptySet())?.toSet() ?: emptySet()
+                                        val defaultScanFolders = setOf("/storage/emulated/0/Music", "/storage/emulated/0/Download")
+                                        val existingFolders = uiPrefs.getStringSet("local_music_scan_folders", defaultScanFolders)?.toSet() ?: defaultScanFolders
                                         val updatedFolders = existingFolders + selectedPath
                                         uiPrefs.edit().remove("local_music_scan_folders").apply()
                                         uiPrefs.edit().putStringSet("local_music_scan_folders", updatedFolders).apply()

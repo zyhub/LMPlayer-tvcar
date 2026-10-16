@@ -49,6 +49,8 @@ import com.lm.player.core.network.LemonMusicProtocol
 import com.lm.player.core.network.NetworkClientFactory
 import com.lm.player.core.update.AppUpdateManager
 import com.lm.player.core.update.UpdateInfo
+import com.lm.player.core.util.StorageVolumeHelper
+import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -97,6 +99,7 @@ fun SettingsScreen(
     onStreamQualityChanged: () -> Unit = {},
     onChooseDownloadDirectory: () -> Unit = {},
     onImportCustomFolder: () -> Unit = {},
+    onOpenLocalFolderPicker: () -> Unit = {},
     onLocalScanCompleted: () -> Unit = {},
     onOpenDownloads: () -> Unit,
     onExitAppCompletely: () -> Unit = {},
@@ -208,6 +211,19 @@ fun SettingsScreen(
     var localMusicPaths by remember {
         mutableStateOf(prefs.getStringSet("local_music_scan_folders", defaultLocalPaths)?.toSet() ?: defaultLocalPaths)
     }
+
+    DisposableEffect(prefs) {
+        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == "local_music_scan_folders") {
+                localMusicPaths = prefs.getStringSet("local_music_scan_folders", defaultLocalPaths)?.toSet() ?: defaultLocalPaths
+            }
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose {
+            prefs.unregisterOnSharedPreferenceChangeListener(listener)
+        }
+    }
+
     var isScanningLocalAndServer by remember { mutableStateOf(false) }
     var showAddLocalPathDialog by remember { mutableStateOf(false) }
     var newLocalPathInput by remember { mutableStateOf("") }
@@ -2069,13 +2085,27 @@ fun SettingsScreen(
                     )
                     Spacer(modifier = Modifier.height(14.dp))
 
-                    val quickPresets = listOf(
-                        "/storage/emulated/0/Music",
-                        "/storage/emulated/0/Download",
-                        "/storage/emulated/0/Download/LMPlayer",
-                        "/storage/emulated/0/Tencent/QQfile_recv",
-                        "/storage/emulated/0/NetEase/CloudMusic"
-                    )
+                    val mountedVolumes = remember { StorageVolumeHelper.getMountedVolumes(context) }
+                    val quickPresets = remember(mountedVolumes) {
+                        val list = mutableListOf<String>()
+                        // 优先加入所有检测到的外接 U 盘 / SD 卡根目录及常见音乐子目录
+                        for (vol in mountedVolumes) {
+                            if (vol.isRemovable) {
+                                list.add(vol.path)
+                                val musicSub = File(vol.path, "Music")
+                                if (musicSub.exists()) {
+                                    list.add(musicSub.absolutePath)
+                                }
+                            }
+                        }
+                        // 默认内置存储路径
+                        list.add("/storage/emulated/0/Music")
+                        list.add("/storage/emulated/0/Download")
+                        list.add("/storage/emulated/0/Download/LMPlayer")
+                        list.add("/storage/emulated/0/Tencent/QQfile_recv")
+                        list.add("/storage/emulated/0/NetEase/CloudMusic")
+                        list.distinct()
+                    }
 
                     Text(
                         text = "快捷预设目录：",
@@ -2089,9 +2119,11 @@ fun SettingsScreen(
                         verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
                         items(quickPresets) { preset ->
+                            val isUsb = preset.startsWith("/storage/") && !preset.startsWith("/storage/emulated")
                             Surface(
                                 shape = RoundedCornerShape(8.dp),
-                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                color = if (isUsb) AppleRed.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                border = if (isUsb) BorderStroke(1.dp, AppleRed.copy(alpha = 0.4f)) else null,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .tvFocusable(
@@ -2101,9 +2133,19 @@ fun SettingsScreen(
                                     )
                             ) {
                                 Row(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(Icons.Default.Folder, contentDescription = null, tint = AppleRed, modifier = Modifier.size(16.dp))
+                                    Icon(
+                                        imageVector = if (isUsb) Icons.Default.Usb else Icons.Default.Folder,
+                                        contentDescription = null,
+                                        tint = AppleRed,
+                                        modifier = Modifier.size(16.dp)
+                                    )
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text(text = preset, fontSize = dimensions.badgeSize, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text(
+                                        text = if (isUsb) "U盘: $preset" else preset,
+                                        fontSize = dimensions.badgeSize,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
                                 }
                             }
                         }
@@ -2121,6 +2163,23 @@ fun SettingsScreen(
                     )
 
                     Spacer(modifier = Modifier.height(14.dp))
+                    Button(
+                        onClick = {
+                            showAddLocalPathDialog = false
+                            onOpenLocalFolderPicker()
+                        },
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .tvButtonFocusable(shape = RoundedCornerShape(10.dp))
+                    ) {
+                        Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("浏览本机与外接U盘目录 (内置选择器)", fontSize = dimensions.captionSize)
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
                     OutlinedButton(
                         onClick = {
                             showAddLocalPathDialog = false
@@ -2132,7 +2191,7 @@ fun SettingsScreen(
                             .tvButtonFocusable(shape = RoundedCornerShape(10.dp)),
                         border = BorderStroke(1.dp, borderColor)
                     ) {
-                        Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.FolderShared, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(6.dp))
                         Text("打开系统文件夹选择器 (SAF)", fontSize = dimensions.captionSize)
                     }

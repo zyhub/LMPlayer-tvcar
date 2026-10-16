@@ -54,6 +54,11 @@
     <!-- Android 13+ 前台播放服务的媒体通知需要该权限才会显示，缺它会静默不出通知 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Android 11+ 全盘及外接 U 盘/SD 卡文件直接访问权限 (支持车机与电视外置存储卷文件遍历) -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
     <application
         android:name=".LMApplication"
         android:allowBackup="false"
@@ -66,6 +71,7 @@
         android:theme="@style/Theme.LMPlayer"
         android:usesCleartextTraffic="true"
         android:enableOnBackInvokedCallback="true"
+        android:requestLegacyExternalStorage="true"
         tools:targetApi="34">
 
         <activity

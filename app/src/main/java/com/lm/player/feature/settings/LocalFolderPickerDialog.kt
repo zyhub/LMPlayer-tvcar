@@ -2,11 +2,14 @@ package com.lm.player.feature.settings
 
 import android.os.Environment
 import android.widget.Toast
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -24,9 +27,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.lm.player.core.designsystem.component.LocalPlatformMode
 import com.lm.player.core.designsystem.component.tvButtonFocusable
 import com.lm.player.core.designsystem.component.tvFocusable
 import com.lm.player.core.designsystem.theme.AppleRed
+import com.lm.player.core.model.PlatformMode
+import com.lm.player.core.util.StorageVolumeHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -35,6 +41,7 @@ import java.util.Locale
 /**
  * 仿资料库本地文件夹风格的离线存储目录选择器
  * - 支持全盘层级下钻与返回上级目录
+ * - 支持内部存储与外接 U 盘 / SD 卡设备平滑切换
  * - 支持创建新文件夹
  * - 支持一键选定当前目录或恢复默认目录
  */
@@ -45,6 +52,13 @@ fun LocalFolderPickerDialog(
     onConfirm: (String) -> Unit
 ) {
     val context = LocalContext.current
+    val isCarMode = LocalPlatformMode.current == PlatformMode.CAR
+
+    // 探测所有已挂载存储设备 (内置主存储 + 外接 U 盘 / SD 卡)
+    val storageVolumes = remember {
+        StorageVolumeHelper.getMountedVolumes(context)
+    }
+
     val defaultStorageDir = remember {
         val external = Environment.getExternalStorageDirectory()
         if (external != null && external.exists()) external else File("/storage/emulated/0")
@@ -142,7 +156,63 @@ fun LocalFolderPickerDialog(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // 1.5 存储设备切换栏 (内部存储 / 外接 U 盘 / SD 卡)
+                if (storageVolumes.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        storageVolumes.forEach { vol ->
+                            val isSelected = currentDir.absolutePath == vol.path || currentDir.absolutePath.startsWith("${vol.path}/")
+                            val chipModifier = if (isCarMode) {
+                                Modifier
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable { currentDir = vol.file }
+                            } else {
+                                Modifier
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .tvFocusable(
+                                        shape = RoundedCornerShape(10.dp),
+                                        focusedScale = 1.05f,
+                                        onClick = { currentDir = vol.file }
+                                    )
+                            }
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (isSelected) AppleRed.copy(alpha = 0.15f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                                border = BorderStroke(1.dp, if (isSelected) AppleRed else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)),
+                                modifier = chipModifier
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = if (vol.isRemovable) Icons.Default.Usb else Icons.Default.PhoneAndroid,
+                                        contentDescription = null,
+                                        tint = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = vol.name,
+                                        style = TextStyle(
+                                            fontSize = 12.sp,
+                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                            color = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurface
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
+                }
 
                 // 2. 当前路径指示条与上级目录按钮
                 Surface(
@@ -156,8 +226,12 @@ fun LocalFolderPickerDialog(
                             .padding(horizontal = 10.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        val currentVolume = storageVolumes.firstOrNull {
+                            currentDir.absolutePath == it.path || currentDir.absolutePath.startsWith("${it.path}/")
+                        }
+                        val isAtVolumeRoot = currentVolume != null && (currentDir.absolutePath == currentVolume.path || currentDir.absolutePath == "${currentVolume.path}/")
                         val parent = currentDir.parentFile
-                        val canGoUp = parent != null && parent.canRead() && currentDir.absolutePath != "/"
+                        val canGoUp = !isAtVolumeRoot && parent != null && (parent.canRead() || parent.listFiles() != null) && currentDir.absolutePath != "/" && currentDir.absolutePath != "/storage"
                         IconButton(
                             onClick = {
                                 if (canGoUp && parent != null) {
@@ -243,8 +317,16 @@ fun LocalFolderPickerDialog(
                                         else -> "空文件夹"
                                     }
 
-                                    Row(
-                                        modifier = Modifier
+                                    val itemModifier = if (isCarMode) {
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .clickable {
+                                                currentDir = item
+                                            }
+                                            .padding(horizontal = 10.dp, vertical = 10.dp)
+                                    } else {
+                                        Modifier
                                             .fillMaxWidth()
                                             .clip(RoundedCornerShape(12.dp))
                                             .tvFocusable(
@@ -253,7 +335,11 @@ fun LocalFolderPickerDialog(
                                                     currentDir = item
                                                 }
                                             )
-                                            .padding(horizontal = 10.dp, vertical = 10.dp),
+                                            .padding(horizontal = 10.dp, vertical = 10.dp)
+                                    }
+
+                                    Row(
+                                        modifier = itemModifier,
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
                                         Icon(

@@ -111,14 +111,34 @@ fun Modifier.tvFocusable(
 ): Modifier = composed {
     val backgroundFocusEnabled = LocalTvBackgroundFocusEnabled.current
     val effectiveEnabled = enabled && backgroundFocusEnabled
-    // 车机模式：只关「焦点」，不关「触控」。焦点相关行为一律改用 focusEnabled；
-    // 末尾 pointerInput(effectiveEnabled) 的 onTap / onLongPress 继续沿用 effectiveEnabled，保持触控可用。
-    val focusEnabled = effectiveEnabled && LocalPlatformMode.current != PlatformMode.CAR
-
-    var isFocused by remember { mutableStateOf(false) }
     val currentOnClick by rememberUpdatedState(onClick)
     val currentOnLongClick by rememberUpdatedState(onLongClick)
     val currentOnMenuKey by rememberUpdatedState(onMenuKey)
+
+    val isCarMode = LocalPlatformMode.current == PlatformMode.CAR
+    if (isCarMode) {
+        val longClickHandler = currentOnLongClick
+        return@composed if (longClickHandler != null) {
+            this
+                .clip(shape)
+                .combinedClickable(
+                    enabled = effectiveEnabled,
+                    onLongClick = longClickHandler,
+                    onClick = currentOnClick
+                )
+        } else {
+            this
+                .clip(shape)
+                .clickable(
+                    enabled = effectiveEnabled,
+                    onClick = currentOnClick
+                )
+        }
+    }
+
+    val focusEnabled = effectiveEnabled
+
+    var isFocused by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     var centerDownReceived by remember { mutableStateOf(false) }
     var longPressTriggered by remember { mutableStateOf(false) }

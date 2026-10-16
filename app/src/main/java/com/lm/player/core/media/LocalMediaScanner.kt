@@ -555,6 +555,7 @@ object LocalMediaScanner {
                                         bitRate = 320,
                                         format = ext.ifBlank { "mp3" },
                                         isFavorite = false,
+                                        relativeFolderPath = dir.name ?: "U盘",
                                         addedTimestamp = file.lastModified().takeIf { it > 0L } ?: System.currentTimeMillis()
                                     )
                                 )
@@ -1082,7 +1083,9 @@ object LocalMediaScanner {
         val state = Environment.getExternalStorageState()
         val mounted = state == Environment.MEDIA_MOUNTED ||
             state == Environment.MEDIA_MOUNTED_READ_ONLY
-        val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager()) {
+            true
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_AUDIO) ==
                 PackageManager.PERMISSION_GRANTED
         } else {
@@ -1136,7 +1139,8 @@ object LocalMediaScanner {
             for (song in allSongs) {
                 val isLocalOnly = song.serverId in listOf("local_storage", "local_folder", "local_saf") || song.id.startsWith("local_")
                 val path = song.localFilePath
-                val fileExists = !path.isNullOrBlank() && try { File(path).exists() } catch (_: Exception) { false }
+                val isContentUri = !path.isNullOrBlank() && path.startsWith("content://")
+                val fileExists = isContentUri || (!path.isNullOrBlank() && try { File(path).exists() } catch (_: Exception) { false })
 
                 if (isLocalOnly && !fileExists) {
                     // 纯本地歌曲且文件已物理删除 -> 移除遗留孤立条目

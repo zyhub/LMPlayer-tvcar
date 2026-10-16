@@ -66,10 +66,12 @@ class PlaybackRouter(
             val recordPath = downloadRecord?.localFilePath
             val hasValidRecordFile = downloadRecord?.status == DownloadStatus.DOWNLOADED &&
                     !recordPath.isNullOrEmpty() &&
-                    File(recordPath).let { it.exists() && it.length() > 0 }
+                    if (recordPath.startsWith("content://")) true
+                    else File(recordPath).let { it.exists() && it.length() > 0 }
 
             val hasValidSongLocalFile = !song.localFilePath.isNullOrEmpty() &&
-                    File(song.localFilePath).let { it.exists() && it.length() > 0 }
+                    if (song.localFilePath.startsWith("content://")) true
+                    else File(song.localFilePath).let { it.exists() && it.length() > 0 }
 
             val isStreamUrlLocalFile = song.streamUrl.startsWith("/") &&
                     File(song.streamUrl).let { it.exists() && it.length() > 0 }
@@ -273,8 +275,13 @@ class PlaybackRouter(
         }
 
         val uri: Uri = if (resolvedLocalPath != null) {
-            Log.d(TAG, "Routing to local file: $resolvedLocalPath")
-            Uri.fromFile(File(resolvedLocalPath))
+            if (resolvedLocalPath.startsWith("content://")) {
+                Log.d(TAG, "Routing to local content uri: $resolvedLocalPath")
+                Uri.parse(resolvedLocalPath)
+            } else {
+                Log.d(TAG, "Routing to local file: $resolvedLocalPath")
+                Uri.fromFile(File(resolvedLocalPath))
+            }
         } else if (finalStreamUrl.startsWith("content://")) {
             Log.d(TAG, "Routing to SAF content uri: $finalStreamUrl")
             Uri.parse(finalStreamUrl)
