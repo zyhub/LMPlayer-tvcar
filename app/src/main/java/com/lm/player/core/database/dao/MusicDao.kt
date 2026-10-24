@@ -5,6 +5,9 @@ import com.lm.player.core.database.entity.DownloadEntity
 import com.lm.player.core.database.entity.PlaylistEntity
 import com.lm.player.core.database.entity.PlaylistSongEntity
 import com.lm.player.core.database.entity.ServerEntity
+import com.lm.player.core.database.entity.ResolvedStreamCacheEntity
+import com.lm.player.core.database.entity.ServerSourceEntity
+import com.lm.player.core.database.entity.ServerSourceMetaEntity
 import com.lm.player.core.database.entity.SongEntity
 import com.lm.player.core.model.DownloadStatus
 import kotlinx.coroutines.flow.Flow
@@ -269,4 +272,40 @@ interface PlaylistDao {
 
     @Query("DELETE FROM playlists")
     suspend fun clearAllPlaylists()
+}
+
+@Dao
+interface ServerSourceDao {
+    @Query("SELECT * FROM server_sources WHERE serverId = :serverId ORDER BY isActive DESC, name ASC")
+    fun observeSources(serverId: String): Flow<List<ServerSourceEntity>>
+
+    @Query("SELECT * FROM server_sources WHERE serverId = :serverId ORDER BY isActive DESC, name ASC")
+    suspend fun getSources(serverId: String): List<ServerSourceEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertSources(items: List<ServerSourceEntity>)
+
+    @Query("DELETE FROM server_sources WHERE serverId = :serverId")
+    suspend fun deleteSources(serverId: String)
+
+    @Query("SELECT * FROM server_source_meta WHERE serverId = :serverId LIMIT 1")
+    fun observeMeta(serverId: String): Flow<ServerSourceMetaEntity?>
+
+    @Query("SELECT * FROM server_source_meta WHERE serverId = :serverId LIMIT 1")
+    suspend fun getMeta(serverId: String): ServerSourceMetaEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertMeta(meta: ServerSourceMetaEntity)
+
+    @Query("SELECT * FROM resolved_stream_cache WHERE cacheKey = :cacheKey LIMIT 1")
+    suspend fun getCachedStream(cacheKey: String): ResolvedStreamCacheEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertCachedStream(entity: ResolvedStreamCacheEntity)
+
+    @Query("DELETE FROM resolved_stream_cache WHERE expiresAt < :now")
+    suspend fun purgeExpiredStreams(now: Long = System.currentTimeMillis())
+
+    @Query("DELETE FROM resolved_stream_cache WHERE serverHost = :serverHost")
+    suspend fun clearCachedStreamsForHost(serverHost: String)
 }

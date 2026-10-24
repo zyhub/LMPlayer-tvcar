@@ -2,6 +2,7 @@ package com.lm.player.core.util
 
 import android.content.Context
 import android.os.Build
+import com.lm.player.core.security.LogRedactor
 import java.io.File
 import java.io.PrintWriter
 import java.io.StringWriter
@@ -10,21 +11,14 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * 全局崩溃日志自诊断 (TV / 车机无 adb 场景下的兜底排查手段)
- *
- * 电视与车机设备通常无法直接抓取 logcat，界面一旦闪退只能靠用户口述现象，定位成本极高。
- * 这里在主进程安装全局未捕获异常处理器：进程结束前把完整堆栈写入
- * filesDir/crash_last.txt (应用私有目录，不需要任何存储权限)，下次启动时由
- * CrashReportDialog 原样展示，用户截图即可回传完整堆栈。
- *
- * 注意：处理器只负责「记录」，记录完成后仍然交回系统默认处理器，
- * 因此「应用已停止运行」等原生行为与崩溃上报完全不受影响。
+ * 全局崩溃日志自诊断 (TV / 车机端无 adb 场景下的兜底排查手段，对齐手机端异常捕获与脱敏机制)
  */
 object CrashLogger {
 
     private const val FILE_NAME = "crash_last.txt"
     private const val PREFS_NAME = "lemon_settings_prefs"
     private const val KEY_SHOWN_STAMP = "crash_log_shown_stamp"
+    private const val MAX_LOG_LENGTH = 180_000
 
     /** 崩溃日志文件 (应用私有目录，随卸载一并清除) */
     fun file(context: Context): File = File(context.filesDir, FILE_NAME)
@@ -49,7 +43,7 @@ object CrashLogger {
         val shownStamp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getLong(KEY_SHOWN_STAMP, 0L)
         if (f.lastModified() <= shownStamp) return null
-        return runCatching { f.readText() }.getOrNull()?.takeIf { it.isNotBlank() }
+        return runCatching { f.readText() }.getOrNull()?.let { LogRedactor.text(it) }?.takeIf { it.isNotBlank() }
     }
 
     /** 标记当前崩溃日志已展示，避免每次启动反复弹出同一份报告 */
@@ -63,17 +57,20 @@ object CrashLogger {
     private fun writeCrash(context: Context, thread: Thread, throwable: Throwable) {
         val writer = StringWriter()
         PrintWriter(writer).use { pw ->
-            pw.println("时间: " + SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date()))
+            pw.println("LMPlayer TV车机版 崩溃日志")
+            pw.println("时间: " + SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date()))
             pw.println("版本: " + versionName(context))
             pw.println(
                 "设备: " + Build.MANUFACTURER + " " + Build.MODEL +
                     " / Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")"
             )
-            pw.println("线程: " + thread.name)
+            pw.println("线程: " + thread.name + " (id=" + thread.id + ")")
             pw.println("----------------------------------------")
             throwable.printStackTrace(pw)
         }
-        runCatching { file(context).writeText(writer.toString()) }
+        val rawLog = writer.toString()
+        val sanitized = LogRedactor.text(rawLog).take(MAX_LOG_LENGTH)
+        runCatching { file(context).writeText(sanitized) }
     }
 
     private fun versionName(context: Context): String = runCatching {

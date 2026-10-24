@@ -131,6 +131,16 @@ object NetworkClientFactory {
                 )
             }
             val encodedPath = request.url.encodedPath
+            // 自动为第三方音乐平台 CDN 音频直链补齐防盗链 Referer / Origin 头
+            val cdnPlatform = MusicCdnHeaders.guessSourceFromUrl(request.url.toString())
+            if (cdnPlatform.isNotBlank() && request.header("Referer").isNullOrBlank()) {
+                val cdnHeaders = MusicCdnHeaders.buildHeaders(cdnPlatform)
+                cdnHeaders.forEach { (k, v) ->
+                    if (request.header(k).isNullOrBlank()) {
+                        reqBuilder.header(k, v)
+                    }
+                }
+            }
             // 音频流式接口绕过 OkHttp 磁盘缓存（交由 Media3 SimpleCache 统一管理），避免 206 Range 截断冲突
             if (encodedPath.contains("/api/play/")) {
                 reqBuilder.cacheControl(okhttp3.CacheControl.FORCE_NETWORK)
@@ -145,7 +155,47 @@ object NetworkClientFactory {
                     reqBuilder.header("Authorization", "Bearer $activeAuthToken")
                 }
             }
-            chain.proceed(reqBuilder.build())
+            val sampleLatency = encodedPath.startsWith("/api/") &&
+                !encodedPath.contains("/api/play/local") &&
+                !encodedPath.contains("/api/play/proxy") &&
+                !encodedPath.contains("/api/play/local-ape") &&
+                !encodedPath.contains("/api/download/") &&
+                !encodedPath.contains("/api/library/") &&
+                !encodedPath.contains("/api/source/health/") &&
+                !encodedPath.contains("/api/tag/")
+            val startedAt = System.currentTimeMillis()
+            try {
+                val response = chain.proceed(reqBuilder.build())
+                val elapsed = System.currentTimeMillis() - startedAt
+                if (sampleLatency) {
+                    ServerLatencyMonitor.record(
+                        host = request.url.host,
+                        elapsedMs = elapsed,
+                        success = response.isSuccessful
+                    )
+                    com.lm.player.core.source.SourceAccelerationController.onServerSample(
+                        host = request.url.host,
+                        elapsedMs = elapsed,
+                        success = true
+                    )
+                }
+                response
+            } catch (e: java.io.IOException) {
+                val elapsed = System.currentTimeMillis() - startedAt
+                if (sampleLatency) {
+                    ServerLatencyMonitor.record(
+                        host = request.url.host,
+                        elapsedMs = elapsed,
+                        success = false
+                    )
+                    com.lm.player.core.source.SourceAccelerationController.onServerSample(
+                        host = request.url.host,
+                        elapsedMs = elapsed,
+                        success = false
+                    )
+                }
+                throw e
+            }
         }
 
         // API 23~28 专属 SSLContext 配置

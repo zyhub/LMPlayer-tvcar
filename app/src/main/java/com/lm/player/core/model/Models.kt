@@ -145,7 +145,8 @@ data class DownloadSettings(
     val bitrate: String = "原始无损 (FLAC/高码率)",
     val wifiOnly: Boolean = false,
     val autoTagging: Boolean = true,
-    val customDownloadPath: String = ""
+    val customDownloadPath: String = "",
+    val customDownloadTreeUri: String = ""
 )
 
 @Immutable
@@ -227,6 +228,82 @@ enum class SearchContentType(val key: String, val displayName: String) {
  * 柠檬音乐服务端导入的落雪/澜音音源脚本数据模型
  */
 @Immutable
+data class SourceHealthPlatform(
+    val id: String,
+    val label: String,
+    val level: String = "unknown",
+    val sampleCount: Int = 0,
+    val previewCount: Int = 0,
+    val ratio: Double = 0.0
+)
+
+@Immutable
+data class SourceHealthInfo(
+    val level: String = "unknown",
+    val badge: String = "",
+    val tip: String = "",
+    val unhealthy: Boolean = false,
+    val sampleCount: Int = 0,
+    val previewCount: Int = 0,
+    val ratio: Double = 0.0,
+    val platforms: List<SourceHealthPlatform> = emptyList(),
+    val autoClosedPlatforms: List<String> = emptyList(),
+    val updatedAt: String = ""
+)
+
+@Immutable
+data class SourcePlatformCapability(
+    val id: String,
+    val name: String = "",
+    val qualitys: List<String> = emptyList(),
+    val actions: List<String> = emptyList(),
+    val enabled: Boolean = true
+)
+
+@Immutable
+data class ServerSourceStatus(
+    val id: String,
+    val name: String,
+    val description: String = "",
+    val author: String = "",
+    val version: String = "",
+    val homepage: String = "",
+    val isActive: Boolean = false,
+    val health: SourceHealthInfo = SourceHealthInfo(),
+    val platforms: List<SourcePlatformCapability> = emptyList(),
+    val disabledPlatforms: List<String> = emptyList(),
+    val rawScriptCached: Boolean = false
+)
+
+@Immutable
+data class ServerSourceSnapshot(
+    val serverId: String,
+    val serverName: String,
+    val sources: List<ServerSourceStatus> = emptyList(),
+    val fallbackMode: String = "auto",
+    val latencyMs: Long = 0L,
+    val online: Boolean = true,
+    val error: String? = null
+)
+
+@Immutable
+data class SourceScriptEntry(
+    val id: String,
+    val name: String = "",
+    val version: String = "",
+    val script: String = "",
+    val homepage: String = "",
+    val sourcesJson: String = "{}",
+    val hash: String = ""
+)
+
+@Immutable
+data class SourceScriptBundle(
+    val version: Int = 1,
+    val generatedAt: String = "",
+    val sources: List<SourceScriptEntry> = emptyList()
+)
+
 data class LemonSourceScriptInfo(
     val id: String,
     val name: String,

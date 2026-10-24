@@ -47,6 +47,7 @@ class DownloadEngine(
         DownloadSettings(
             maxConcurrent = prefs.getInt("max_concurrent", 3),
             customDownloadPath = resolveFilesystemPath(prefs.getString("custom_download_path", "") ?: ""),
+            customDownloadTreeUri = prefs.getString("custom_download_tree_uri", "") ?: "",
             wifiOnly = prefs.getBoolean("wifi_only", false),
             autoTagging = prefs.getBoolean("auto_tagging", true)
         )
@@ -136,12 +137,16 @@ class DownloadEngine(
 
     fun updateSettings(newSettings: DownloadSettings) {
         val normalizedPath = resolveCustomPathIfNeeded(newSettings.customDownloadPath)
-        val normalizedSettings = newSettings.copy(customDownloadPath = normalizedPath)
+        val normalizedSettings = newSettings.copy(
+            customDownloadPath = normalizedPath,
+            customDownloadTreeUri = newSettings.customDownloadTreeUri
+        )
         val oldMax = downloadSettings.value.maxConcurrent
         downloadSettings.value = normalizedSettings
         prefs.edit()
             .putInt("max_concurrent", normalizedSettings.maxConcurrent)
             .putString("custom_download_path", normalizedSettings.customDownloadPath)
+            .putString("custom_download_tree_uri", normalizedSettings.customDownloadTreeUri)
             .putBoolean("wifi_only", normalizedSettings.wifiOnly)
             .putBoolean("auto_tagging", normalizedSettings.autoTagging)
             .apply()
@@ -254,9 +259,10 @@ class DownloadEngine(
         val customPath = downloadSettings.value.customDownloadPath
         if (customPath.isNotBlank()) {
             val customDir = File(customPath)
-            if (customDir.exists() || customDir.mkdirs()) {
+            if ((customDir.exists() || customDir.mkdirs()) && isWritableDirectory(customDir)) {
                 return customDir
             }
+            Log.w(TAG, "Custom download directory is not writable: $customPath; fallback to app storage")
         }
         val dir = File(context.getExternalFilesDir(null), "music")
         if (!dir.exists()) {
@@ -265,84 +271,141 @@ class DownloadEngine(
         return dir
     }
 
+    private fun isWritableDirectory(dir: File): Boolean {
+        return try {
+            if (!dir.isDirectory) return false
+            val probe = File.createTempFile(".lm_write_test", null, dir)
+            probe.delete()
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 即时阻断性探测：检测指定绝对路径或 SAF TreeUri 是否真实可写，彻底阻断假成功
+     */
+    fun testDirectoryWritable(path: String, treeUriStr: String? = null): Boolean {
+        // 1. 优先探测标准 POSIX File 权限
+        if (path.isNotBlank() && !path.startsWith("content://")) {
+            val f = File(path)
+            if ((f.exists() || f.mkdirs()) && isWritableDirectory(f)) {
+                return true
+            }
+        }
+        // 2. 探测 SAF DocumentFile 权限
+        if (!treeUriStr.isNullOrBlank()) {
+            return try {
+                val treeUri = android.net.Uri.parse(treeUriStr)
+                val docDir = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri)
+                if (docDir != null && docDir.canWrite()) {
+                    val probe = docDir.createFile("text/plain", ".lm_probe_${System.currentTimeMillis()}.tmp")
+                    if (probe != null && probe.exists()) {
+                        probe.delete()
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "SAF directory probe failed: ${e.message}")
+                false
+            }
+        }
+        return false
+    }
+
+    /**
+     * 通过 SAF DocumentFile 管道流将下载好的音频文件安全写入用户选定的外部公共目录 (如 /Download 或外置 TF 卡/U盘)
+     */
+    fun copyFileToSaf(srcFile: File, treeUriStr: String, targetFileName: String, mimeType: String = "audio/*"): Boolean {
+        if (treeUriStr.isBlank()) return false
+        return try {
+            if (!srcFile.exists() || srcFile.length() <= 0L) return false
+
+            val treeUri = android.net.Uri.parse(treeUriStr)
+            val docDir = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri) ?: return false
+            if (!docDir.canWrite()) return false
+
+            val customPath = downloadSettings.value.customDownloadPath
+            val isSameFolder = if (customPath.isNotBlank()) {
+                runCatching {
+                    val destFolder = File(customPath).canonicalFile
+                    val srcFolder = srcFile.parentFile?.canonicalFile
+                    destFolder != null && srcFolder != null && destFolder == srcFolder
+                }.getOrDefault(false)
+            } else false
+
+            if (isSameFolder && srcFile.name == targetFileName) {
+                Log.i(TAG, "Source file already in target SAF directory with target name, skipping copy: ${srcFile.absolutePath}")
+                android.media.MediaScannerConnection.scanFile(
+                    context,
+                    arrayOf(srcFile.absolutePath),
+                    arrayOf(mimeType)
+                ) { _, _ -> }
+                return true
+            }
+
+            val existing = docDir.findFile(targetFileName)
+            if (existing != null) {
+                if (!isSameFolder || srcFile.name != targetFileName) {
+                    existing.delete()
+                } else {
+                    return true
+                }
+            }
+
+            val effectiveMime = when {
+                targetFileName.endsWith(".flac", ignoreCase = true) -> "audio/flac"
+                targetFileName.endsWith(".mp3", ignoreCase = true) -> "audio/mpeg"
+                targetFileName.endsWith(".m4a", ignoreCase = true) -> "audio/mp4"
+                targetFileName.endsWith(".wav", ignoreCase = true) -> "audio/wav"
+                targetFileName.endsWith(".ogg", ignoreCase = true) -> "audio/ogg"
+                else -> mimeType
+            }
+            val newDoc = docDir.createFile(effectiveMime, targetFileName) ?: return false
+            context.contentResolver.openOutputStream(newDoc.uri)?.use { out ->
+                srcFile.inputStream().use { input ->
+                    input.copyTo(out)
+                }
+                out.flush()
+            }
+            Log.i(TAG, "Successfully wrote downloaded file to SAF DocumentFile: ${newDoc.uri}")
+
+            val publicTarget = if (customPath.isNotBlank()) File(customPath, targetFileName) else null
+            val pathToScan = if (publicTarget != null && publicTarget.exists()) publicTarget.absolutePath else srcFile.absolutePath
+            android.media.MediaScannerConnection.scanFile(
+                context,
+                arrayOf(pathToScan),
+                arrayOf(effectiveMime)
+            ) { _, _ -> }
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed writing to SAF target: ${e.message}", e)
+            false
+        }
+    }
+
     fun sanitizeSegment(name: String): String {
         val cleaned = name.trim()
             .replace(Regex("""[\\/:*?"<>|\r\n\t]"""), "_")
             .replace(Regex("""\s+"""), " ")
             .trim('.', ' ')
-        // 目录穿越防护：整段恰为 ".."（或 "."）时上面的 trim 会把它清空，但形如
-        // "Album/.." 这类组合里内层 ".." 会被保留，而 File(baseDir, "Album/../../x")
-        // 会解析到应用私有目录之外的任意路径。relativeFolderPath 来自服务端返回的
-        // 文件夹层级或数据库历史值 —— 即服务端可控，必须在此阻断。
         if (cleaned == "." || cleaned == "..") return ""
         val truncated = if (cleaned.length > 60) cleaned.substring(0, 60).trimEnd() else cleaned
         return truncated.ifBlank { "未知" }
     }
 
     /**
-     * 校验最终落盘路径必须位于允许的下载根目录之内（防目录穿越的兜底闸门）。
-     * 返回 null 表示路径非法，调用方应回退到默认目录。
+     * 下载文件直接保存在下载根目录，不再按歌手、专辑或服务端路径建子目录。
+     * 文件名使用“歌手 - 歌名”，重名时自动追加序号 (2)。
      */
-    private fun safeChildFile(baseDir: File, relative: String): File? {
-        return try {
-            val base = baseDir.canonicalFile
-            val target = File(base, relative).canonicalFile
-            val basePath = base.path + File.separator
-            if (target.path == base.path || target.path.startsWith(basePath)) target else null
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    /**
-     * 根据在线文件夹层级结构或歌手/专辑规范结构获取下载存储的目标文件
-     * 优先使用传入的 online folder hierarchy 或 relativeFolderPath，自动过滤 JSON 字符串
-     */
-    fun getTargetDownloadFile(song: UnifiedSong, folderHierarchy: String? = null): File {
+    @Suppress("UNUSED_PARAMETER")
+    suspend fun getTargetDownloadFile(song: UnifiedSong, folderHierarchy: String? = null): File {
         val baseDir = getDownloadDir()
-
-        val candidate = (folderHierarchy ?: song.relativeFolderPath)?.trim()
-        val isCandidateValidHierarchy = !candidate.isNullOrBlank() &&
-                !candidate.startsWith("{") &&
-                !candidate.startsWith("[") &&
-                !candidate.contains("\"") &&
-                !candidate.contains(":") &&
-                !candidate.contains("_id__") &&
-                !candidate.contains("_name__") &&
-                candidate.length <= 100
-
-        val subFolder = when {
-            isCandidateValidHierarchy -> {
-                candidate!!.split('/', '\\')
-                    .map { sanitizeSegment(it) }
-                    .filter { it.isNotBlank() }
-                    .joinToString("/")
-            }
-            song.artist.isNotBlank() && song.album.isNotBlank() &&
-                    !song.artist.contains("未知") && !song.album.contains("未知") -> {
-                "${sanitizeSegment(song.artist)}/${sanitizeSegment(song.album)}"
-            }
-            song.artist.isNotBlank() && !song.artist.contains("未知") -> {
-                sanitizeSegment(song.artist)
-            }
-            else -> "Music"
-        }
-
-        // 兜底闸门：即使 subFolder 通过了逐段净化，也再校验一次最终规范化路径落在 baseDir 之内
-        val parentDir = safeChildFile(baseDir, subFolder) ?: baseDir
-        if (!parentDir.exists()) {
-            parentDir.mkdirs()
-        }
-
-        val enrichedTitle = if (
-            SongMatchingResolver.extractEditionMarkers(song.title, "").isEmpty() &&
-            SongMatchingResolver.extractEditionMarkers("", song.album).isNotEmpty()
-        ) {
-            SongMatchingResolver.enrichTitleWithEdition(song.title.ifBlank { song.id }, song.album)
-        } else {
-            song.title.ifBlank { song.id }
-        }
-        val safeTitle = sanitizeSegment(enrichedTitle)
+        val safeTitle = sanitizeSegment(song.title.ifBlank { song.id })
         val ext = when {
             song.format.contains("flac", ignoreCase = true) -> "flac"
             song.format.contains("wav", ignoreCase = true) -> "wav"
@@ -351,7 +414,27 @@ class DownloadEngine(
             song.format.contains("aac", ignoreCase = true) -> "aac"
             else -> "mp3"
         }
-        return File(parentDir, "$safeTitle.$ext")
+        val artist = song.artist.trim()
+        val isArtistUnknown = artist.isBlank() || artist.contains("未知")
+        val baseName = if (isArtistUnknown) {
+            "${safeTitle}_${song.id.takeLast(6)}"
+        } else {
+            "${sanitizeSegment(artist)} - $safeTitle"
+        }
+
+        suspend fun ownerOf(file: File): String? =
+            runCatching { songDao.getSongByLocalPath(file.absolutePath)?.id }.getOrNull()
+
+        val preferred = File(baseDir, "$baseName.$ext")
+        if (!preferred.exists()) return preferred
+        if (ownerOf(preferred) == song.id) return preferred
+
+        for (index in 2..99) {
+            val candidate = File(baseDir, "$baseName ($index).$ext")
+            if (!candidate.exists()) return candidate
+            if (ownerOf(candidate) == song.id) return candidate
+        }
+        return File(baseDir, "$baseName (${System.currentTimeMillis()}).$ext")
     }
 
     private suspend fun saveOrUpdateSongEntity(song: UnifiedSong, localFilePath: String) {
@@ -669,14 +752,54 @@ class DownloadEngine(
                         }
                     }
 
-                    // 原子化重命名临时文件为正式音频文件
-                    if (actualDestFile.exists()) {
-                        actualDestFile.delete()
+                    // 原子化重命名临时文件为正式音频文件并支持 SAF 管道兜底
+                    var writeSuccess = false
+                    try {
+                        if (actualDestFile.exists()) {
+                            actualDestFile.delete()
+                        }
+                        if (tempDestFile.renameTo(actualDestFile)) {
+                            writeSuccess = true
+                        } else {
+                            tempDestFile.copyTo(actualDestFile, overwrite = true)
+                            tempDestFile.delete()
+                            writeSuccess = actualDestFile.exists() && actualDestFile.length() > 0
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Direct File write failed (${e.message}), attempting SAF pipeline...")
                     }
-                    if (!tempDestFile.renameTo(actualDestFile)) {
-                        tempDestFile.copyTo(actualDestFile, overwrite = true)
-                        tempDestFile.delete()
+
+                    val customPath = downloadSettings.value.customDownloadPath
+                    val isAlreadyInCustomDir = customPath.isNotBlank() &&
+                        runCatching { actualDestFile.parentFile?.canonicalFile == File(customPath).canonicalFile }.getOrDefault(false)
+
+                    val treeUriStr = downloadSettings.value.customDownloadTreeUri
+                    if (treeUriStr.isNotBlank() && (!writeSuccess || !isAlreadyInCustomDir)) {
+                        val srcToCopy = if (actualDestFile.exists() && actualDestFile.length() > 0) actualDestFile else tempDestFile
+                        if (srcToCopy.exists() && srcToCopy.length() > 0) {
+                            val safOk = copyFileToSaf(srcToCopy, treeUriStr, actualDestFile.name)
+                            if (safOk) {
+                                writeSuccess = true
+                                val targetPublicFile = File(customPath, actualDestFile.name)
+                                if (targetPublicFile.exists() && targetPublicFile.length() > 0) {
+                                    actualDestFile = targetPublicFile
+                                }
+                            }
+                        }
                     }
+
+                    if (!writeSuccess || !actualDestFile.exists() || actualDestFile.length() <= 0L) {
+                        throw Exception("音频文件落盘失败：目标下载目录无法写入，请在设置中重新指定目录或授予权限")
+                    }
+
+                    // 刷新系统媒体库，让电视/车机文件管理器立刻识别
+                    try {
+                        android.media.MediaScannerConnection.scanFile(
+                            context,
+                            arrayOf(actualDestFile.absolutePath),
+                            null
+                        ) { _, _ -> }
+                    } catch (_: Exception) {}
 
                     val finalExt = actualDestFile.extension.lowercase().ifBlank { song.format.lowercase() }
                     val finalSong = song.copy(

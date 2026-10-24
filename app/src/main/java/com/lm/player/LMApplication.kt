@@ -59,6 +59,10 @@ class LMApplication : Application(), ImageLoaderFactory {
         //    放在 onCreate 主线程会拖慢电视冷启动首帧，因此挪进上面的 IO 协程统一处理。
         CoroutineScope(Dispatchers.IO).launch {
             ZdsDatabase.getInstance(this@LMApplication)
+            com.lm.player.core.source.ServerSourceRepository.init(this@LMApplication)
+            com.lm.player.core.source.SourceAccelerationSession.init(this@LMApplication)
+            com.lm.player.core.source.SourceAccelerationController.init(this@LMApplication)
+            com.lm.player.core.source.SourceAccelerationController.restoreFromCache(this@LMApplication)
         }
     }
 

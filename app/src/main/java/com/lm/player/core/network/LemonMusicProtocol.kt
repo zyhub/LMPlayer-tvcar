@@ -33,6 +33,15 @@ import java.util.concurrent.ConcurrentHashMap
  * 7. 本地与云端同步滚动 LRC 歌词解析 (/api/play/lyric)
  * 8. 全网多平台在线搜索与试听串流 (/api/search, /api/play/url)
  */
+/** 服务器曲库中与在线歌曲匹配到的一条本地文件记录（用于下载时优先走服务器原文件） */
+data class ServerLibraryTrack(
+    val filePath: String,
+    val trackId: String,
+    val title: String,
+    val artist: String,
+    val format: String
+)
+
 class LemonMusicProtocol(
     private val client: OkHttpClient,
     private val serverUrl: String,
@@ -42,6 +51,9 @@ class LemonMusicProtocol(
 
     private val cleanBase = serverUrl.trim().trimEnd('/')
     private val authCacheKey = "${cleanBase}_${username.trim()}"
+    private val serverHost: String = cleanBase
+        .substringAfter("://", cleanBase)
+        .substringBefore('/')
     @Volatile
     private var authToken: String = sharedAuthTokens[authCacheKey].orEmpty()
 
@@ -72,6 +84,8 @@ class LemonMusicProtocol(
     companion object {
         private const val TAG = "LemonMusicProtocol"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        private const val LOCAL_ACCEL_BUDGET_MS = 2_500L
+        private val serverLibraryLookupCache = ConcurrentHashMap<String, ServerLibraryTrack>()
 
         /** 内嵌歌词探测允许读入内存的最大响应体（512KB，约等于探测 Range 的 1.3 倍余量） */
         private const val MAX_EMBEDDED_LYRIC_PROBE_BYTES = 512L * 1024L
@@ -161,6 +175,7 @@ class LemonMusicProtocol(
         }
 
         fun clearStaticCaches() {
+            serverLibraryLookupCache.clear()
             songIdToPathMap.clear()
             songIdToTrackIdMap.clear()
             songIdToSongMap.clear()
@@ -496,6 +511,76 @@ class LemonMusicProtocol(
     /**
      * 同步全量音乐库曲目 (/api/library/tracks?all=1)
      */
+    /**
+     * 根据歌名/歌手反查该在线歌曲是否已存在于飞牛/NAS 服务器曲库中。
+     * 用途：在线搜索结果 (id=lemon_online_*) 与服务器曲库记录 (id=lemon_<md5(path)>)
+     * ID 不同，搜索结果又常常没有 streamUrl，导致下载时找不到服务器原文件，只能去
+     * 第三方音源取链。服务端代理大文件会严重限速，用户看到的就是下载卡 0%/失败。
+     * /api/library/tracks?q= 是单曲查询，实测 0.5s 返回，不会像 ?all=1 那样慢。
+     */
+    suspend fun findServerLibraryTrack(
+        title: String,
+        artist: String,
+        durationMs: Long = 0L,
+        album: String = ""
+    ): ServerLibraryTrack? = withContext(Dispatchers.IO) {
+        if (title.isBlank()) return@withContext null
+        val cacheKey = "${SongMatchingResolver.normalizeTrackTitle(title)}|||${SongMatchingResolver.normalizeArtist(artist)}|||${SongMatchingResolver.normalizeTrackTitle(album)}"
+        serverLibraryLookupCache[cacheKey]?.let { return@withContext it }
+
+        var found: ServerLibraryTrack? = null
+        try {
+            ensureAuthenticatedOrThrow()
+            val enc = URLEncoder.encode(title, "UTF-8")
+            val req = newAuthRequest("$cleanBase/api/library/tracks?q=$enc&limit=30").get().build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use
+                val body = resp.body?.string() ?: ""
+                if (body.isBlank()) return@use
+                val json = JSONObject(body)
+                val arr = json.optJSONArray("data")
+                    ?: json.optJSONObject("data")?.optJSONArray("list")
+                    ?: json.optJSONArray("list")
+                    ?: JSONArray()
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val filePath = obj.optString("filePath").trim()
+                    if (filePath.isBlank()) continue
+                    val itemTitle = obj.optString("title")
+                        .ifBlank { obj.optString("parsedTitle") }
+                        .ifBlank { filePath.substringAfterLast('/').substringBeforeLast('.') }
+                    val itemArtist = obj.optString("artist").ifBlank { obj.optString("parsedArtist") }
+                    if (!SongMatchingResolver.isSongMatch(
+                            title1 = title,
+                            artist1 = artist,
+                            durationMs1 = durationMs,
+                            title2 = itemTitle,
+                            artist2 = itemArtist,
+                            durationMs2 = 0L,
+                            album1 = album,
+                            album2 = obj.optString("album")
+                        )
+                    ) continue
+                    found = ServerLibraryTrack(
+                        filePath = filePath,
+                        trackId = obj.optString("trackId").ifBlank { obj.optString("id") },
+                        title = itemTitle,
+                        artist = itemArtist,
+                        format = obj.optString("format").lowercase()
+                    )
+                    break
+                }
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "findServerLibraryTrack failed for $title: ${e.message}")
+            return@withContext null
+        }
+
+        found?.let { serverLibraryLookupCache[cacheKey] = it }
+        found
+    }
+
     override suspend fun getSongList(offset: Int, limit: Int): Result<List<UnifiedSong>> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticatedOrThrow()
@@ -2487,15 +2572,23 @@ class LemonMusicProtocol(
         keyword: String,
         source: String = "kw",
         page: Int = 1,
-        limit: Int = 30
+        limit: Int = 30,
+        callTimeoutMs: Long = 0L
     ): Result<List<UnifiedSong>> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticatedOrThrow()
             val encKw = URLEncoder.encode(keyword, "UTF-8")
             val url = "$cleanBase/api/search?keyword=$encKw&source=$source&page=$page&limit=$limit"
             val req = newAuthRequest(url).get().build()
+            val searchClient = if (callTimeoutMs > 0L) {
+                client.newBuilder()
+                    .callTimeout(callTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    .build()
+            } else {
+                client
+            }
 
-            client.newCall(req).execute().use { resp ->
+            searchClient.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
                 if (!resp.isSuccessful) return@withContext Result.failure(Exception("在线搜索失败 (HTTP ${resp.code})"))
                 val json = JSONObject(body)
@@ -2711,14 +2804,56 @@ class LemonMusicProtocol(
         allowSearchFallback: Boolean = true,
         // 「跨平台同档补源」调用时置 true：调用方刚刚在本平台试过同一档，直接跳到搜索补源阶段，
         // 避免对同一个 songId 连发两次必然失败的取链请求。
-        skipDirectAttempt: Boolean = false
+        skipDirectAttempt: Boolean = false,
+        skipLocalAcceleration: Boolean = false
     ): Result<String> = withContext(Dispatchers.IO) {
         try {
+            val normalizedQuality = AudioQuality.fromKey(quality).key
+            val localSource = songId.removePrefix("lemon_online_").let {
+                if (it.contains("_")) it.substringBefore("_") else source
+            }
+
+            // 音源加速：外网或内网高延迟时，先让本地 QuickJS 解析；失败再走服务器。
+            if (!refresh && !skipLocalAcceleration &&
+                com.lm.player.core.source.SourceAccelerationController.shouldAccelerate(serverHost)
+            ) {
+                val localInfo = buildLocalMusicInfo(songId, source, metaJson, fallbackTitle, fallbackArtist)
+                val local = com.lm.player.core.source.SourceAccelerationSession.resolveMusicUrlWithBudget(
+                    source = localSource,
+                    quality = normalizedQuality,
+                    musicInfoJson = localInfo,
+                    budgetMs = LOCAL_ACCEL_BUDGET_MS
+                )
+                local.getOrNull()?.takeIf { it.startsWith("http://") || it.startsWith("https://") }?.let { localUrl ->
+                    Log.i(TAG, "Local source acceleration resolved: ${songId}/${normalizedQuality}")
+                    com.lm.player.core.source.ServerSourceRepository.cacheStream(
+                        host = serverHost,
+                        songId = songId,
+                        quality = normalizedQuality,
+                        url = localUrl,
+                        sourceId = "local_accel"
+                    )
+                    return@withContext Result.success(localUrl)
+                }
+                local.exceptionOrNull()?.let { Log.w(TAG, "Local source acceleration failed, fallback server: ${it.message}") }
+            }
+
+            if (!refresh && com.lm.player.core.source.ServerSourceRepository.isLocalFallbackActive(serverHost)) {
+                val cached = com.lm.player.core.source.ServerSourceRepository.getCachedStream(
+                    host = serverHost,
+                    songId = songId,
+                    quality = normalizedQuality
+                )
+                if (cached != null) {
+                    Log.i(TAG, "Using locally cached stream fallback: $songId / $normalizedQuality")
+                    return@withContext Result.success(cached.url)
+                }
+            }
+
             ensureAuthenticatedOrThrow()
             val cleanId = songId.removePrefix("lemon_online_")
             val actualSource = if (cleanId.contains("_")) cleanId.substringBefore("_") else source
             val rawId = if (cleanId.contains("_")) cleanId.substringAfter("_") else cleanId
-            val normalizedQuality = AudioQuality.fromKey(quality).key
 
             fun parsePlayUrlFromBody(body: String): String? {
                 if (body.isBlank()) return null
@@ -2942,10 +3077,15 @@ class LemonMusicProtocol(
         metaJson: String? = null,
         fallbackTitle: String? = null,
         fallbackArtist: String? = null,
-        refresh: Boolean = false
+        refresh: Boolean = false,
+        maxDurationMs: Long = 0L,
+        skipLocalAcceleration: Boolean = false
     ): Result<ResolvedOnlineStream> = withContext(Dispatchers.IO) {
         val candidateQualities = getFallbackQualities(preferredQuality)
         var lastError: Throwable? = null
+        val startedAt = System.currentTimeMillis()
+        fun budgetExceeded(): Boolean =
+            maxDurationMs > 0L && System.currentTimeMillis() - startedAt >= maxDurationMs
 
         fun buildResolvedStream(url: String, qKey: String): ResolvedOnlineStream {
             val decodedUpstream = runCatching {
@@ -2992,7 +3132,8 @@ class LemonMusicProtocol(
                 fallbackTitle = fallbackTitle,
                 fallbackArtist = fallbackArtist,
                 refresh = refresh || index > 0,
-                allowSearchFallback = false
+                allowSearchFallback = false,
+                skipLocalAcceleration = skipLocalAcceleration
             )
             directRes.getOrNull()?.takeIf { it.isNotBlank() }?.let {
                 return@withContext Result.success(buildResolvedStream(it, qKey))
@@ -3009,7 +3150,8 @@ class LemonMusicProtocol(
                 fallbackArtist = fallbackArtist,
                 refresh = true,
                 allowSearchFallback = true,
-                skipDirectAttempt = true
+                skipDirectAttempt = true,
+                skipLocalAcceleration = skipLocalAcceleration
             )
             crossRes.getOrNull()?.takeIf { it.isNotBlank() }?.let {
                 return@withContext Result.success(buildResolvedStream(it, qKey))
@@ -3338,6 +3480,326 @@ class LemonMusicProtocol(
     /**
      * 从远程 URL 导入音源脚本 (/api/source/import-url)
      */
+
+    /**
+     * 拉取服务端音源状态快照（/api/source/list + /api/settings 的 source.*）。
+     */
+    suspend fun fetchSourceSnapshot(): Result<ServerSourceSnapshot> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val startedAt = System.currentTimeMillis()
+            val req = newAuthRequest("$cleanBase/api/source/list").get().build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: ""
+                if (!resp.isSuccessful) {
+                    return@withContext Result.failure(Exception("获取音源状态失败 (HTTP ${resp.code})"))
+                }
+                val trimmed = body.trim()
+                val arr = when {
+                    trimmed.startsWith("[") -> JSONArray(trimmed)
+                    trimmed.startsWith("{") -> {
+                        val json = JSONObject(trimmed)
+                        json.optJSONArray("data") ?: json.optJSONArray("list") ?: json.optJSONArray("rows") ?: JSONArray()
+                    }
+                    else -> JSONArray()
+                }
+
+                val settingsObj = runCatching { getServerSettings().getOrNull() }.getOrNull()
+                val fallbackMode = settingsObj?.optString("source.fallbackMode")
+                    ?.takeIf { it.isNotBlank() } ?: "auto"
+                val srvPlatformsRaw = settingsObj?.optString("source.enabledPlatforms")
+                val srvPlatformsJson = srvPlatformsRaw?.takeIf { it.isNotBlank() }
+                    ?.let { runCatching { JSONObject(it) }.getOrNull() }
+
+                val result = ArrayList<ServerSourceStatus>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val item = arr.optJSONObject(i) ?: continue
+                    val id = item.optString("id").ifBlank { (i + 1).toString() }
+                    val sourcesObj = item.optJSONObject("sources")
+                    val caps = mutableListOf<SourcePlatformCapability>()
+                    val disabled = mutableListOf<String>()
+                    if (sourcesObj != null) {
+                        val keys = sourcesObj.keys()
+                        while (keys.hasNext()) {
+                            val platform = keys.next()
+                            val v = sourcesObj.opt(platform)
+                            val enabled = when (v) {
+                                is Boolean -> v
+                                is JSONObject -> v.optBoolean("enabled", true)
+                                else -> true
+                            }
+                            val obj = v as? JSONObject
+                            val qualitys = mutableListOf<String>()
+                            val actions = mutableListOf<String>()
+                            obj?.optJSONArray("qualitys")?.let { qa ->
+                                for (qi in 0 until qa.length()) qa.optString(qi).takeIf { it.isNotBlank() }?.let { qualitys.add(it) }
+                            }
+                            obj?.optJSONArray("actions")?.let { aa ->
+                                for (ai in 0 until aa.length()) aa.optString(ai).takeIf { it.isNotBlank() }?.let { actions.add(it) }
+                            }
+                            caps.add(
+                                SourcePlatformCapability(
+                                    id = platform.lowercase(),
+                                    name = obj?.optString("name").orEmpty(),
+                                    qualitys = qualitys,
+                                    actions = actions,
+                                    enabled = enabled
+                                )
+                            )
+                            if (!enabled) disabled.add(platform.lowercase())
+                        }
+                    } else {
+                        item.optJSONArray("sources")?.let { sa ->
+                            for (si in 0 until sa.length()) {
+                                val p = sa.optString(si)
+                                if (p.isNotBlank()) caps.add(SourcePlatformCapability(id = p.lowercase(), enabled = true))
+                            }
+                        }
+                    }
+                    val disabledArr = item.optJSONArray("disabledSources")
+                        ?: item.optJSONArray("disabledPlatforms")
+                        ?: item.optJSONArray("disabled_platforms")
+                    if (disabledArr != null) {
+                        for (di in 0 until disabledArr.length()) {
+                            val p = disabledArr.optString(di).lowercase()
+                            if (p.isNotBlank() && p !in disabled) disabled.add(p)
+                        }
+                    }
+                    if (srvPlatformsJson != null && srvPlatformsJson.has(id)) {
+                        val enabledSet = mutableSetOf<String>()
+                        srvPlatformsJson.optJSONArray(id)?.let { ea ->
+                            for (ei in 0 until ea.length()) enabledSet.add(ea.optString(ei).lowercase())
+                        }
+                        for (p in caps.map { it.id }) {
+                            if (p !in enabledSet && p !in disabled) disabled.add(p)
+                        }
+                    }
+
+                    val healthObj = item.optJSONObject("health")
+                    val healthPlatforms = mutableListOf<SourceHealthPlatform>()
+                    healthObj?.optJSONArray("platforms")?.let { hp ->
+                        for (hi in 0 until hp.length()) {
+                            val p = hp.optJSONObject(hi) ?: continue
+                            val pid = p.optString("id")
+                            if (pid.isBlank()) continue
+                            healthPlatforms.add(
+                                SourceHealthPlatform(
+                                    id = pid.lowercase(),
+                                    label = p.optString("label", pid),
+                                    level = p.optString("level", "unknown"),
+                                    sampleCount = p.optInt("sampleCount", 0),
+                                    previewCount = p.optInt("previewCount", 0),
+                                    ratio = p.optDouble("ratio", 0.0)
+                                )
+                            )
+                        }
+                    }
+                    val autoClosed = mutableListOf<String>()
+                    healthObj?.optJSONArray("autoClosedPlatforms")?.let { ac ->
+                        for (ai in 0 until ac.length()) ac.optString(ai).takeIf { it.isNotBlank() }?.let { autoClosed.add(it) }
+                    }
+                    val health = SourceHealthInfo(
+                        level = healthObj?.optString("level", "unknown") ?: "unknown",
+                        badge = healthObj?.optString("badge").orEmpty(),
+                        tip = healthObj?.optString("tip").orEmpty(),
+                        unhealthy = healthObj?.optBoolean("unhealthy", false) ?: false,
+                        sampleCount = healthObj?.optInt("sampleCount", 0) ?: 0,
+                        previewCount = healthObj?.optInt("previewCount", 0) ?: 0,
+                        ratio = healthObj?.optDouble("ratio", 0.0) ?: 0.0,
+                        platforms = healthPlatforms,
+                        autoClosedPlatforms = autoClosed,
+                        updatedAt = healthObj?.optString("updatedAt").orEmpty()
+                    )
+
+                    result.add(
+                        ServerSourceStatus(
+                            id = id,
+                            name = item.optString("name", "自定义音源"),
+                            description = item.optString("description").orEmpty(),
+                            author = item.optString("author").orEmpty(),
+                            version = item.optString("version").orEmpty(),
+                            homepage = item.optString("homepage").orEmpty(),
+                            isActive = item.optBoolean("active", false),
+                            health = health,
+                            platforms = caps,
+                            disabledPlatforms = disabled.distinct()
+                        )
+                    )
+                }
+
+                Result.success(
+                    ServerSourceSnapshot(
+                        serverId = "",
+                        serverName = "",
+                        sources = result,
+                        fallbackMode = fallbackMode,
+                        latencyMs = System.currentTimeMillis() - startedAt,
+                        online = true
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.e(TAG, "Failed to fetch source snapshot", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 拉取 active 音源脚本 bundle。
+     */
+    suspend fun fetchActiveScriptBundle(): Result<SourceScriptBundle> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val direct = runCatching { fetchBundleEndpoint() }.getOrNull()
+            if (direct != null && direct.sources.isNotEmpty()) {
+                return@withContext Result.success(direct)
+            }
+
+            val snapshot = fetchSourceSnapshot().getOrElse {
+                return@withContext Result.failure(it)
+            }
+            val active = snapshot.sources.filter { it.isActive }
+            if (active.isEmpty()) {
+                return@withContext Result.failure(Exception("没有已激活的音源"))
+            }
+            val entries = ArrayList<SourceScriptEntry>()
+            for (source in active) {
+                var script = fetchRawScript(source.id).orEmpty()
+                if (!looksLikeSourceScript(script) && source.homepage.startsWith("http")) {
+                    script = fetchExternalScript(source.homepage).orEmpty()
+                }
+                if (!looksLikeSourceScript(script)) {
+                    Log.w(TAG, "No usable script for ${source.name} (${source.id})")
+                    continue
+                }
+                entries.add(
+                    SourceScriptEntry(
+                        id = source.id,
+                        name = source.name,
+                        version = source.version,
+                        script = script,
+                        homepage = source.homepage,
+                        sourcesJson = "{}"
+                    )
+                )
+            }
+            if (entries.isEmpty()) {
+                Result.failure(Exception("服务端脚本接口不可用，且 homepage 未返回有效脚本"))
+            } else {
+                Result.success(SourceScriptBundle(sources = entries))
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.e(TAG, "fetchActiveScriptBundle failed", e)
+            Result.failure(e)
+        }
+    }
+
+    private suspend fun fetchBundleEndpoint(): SourceScriptBundle? {
+        val req = newAuthRequest("$cleanBase/api/source/active-bundle").get().build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return null
+            val body = resp.body?.string().orEmpty()
+            val obj = runCatching { JSONObject(body) }.getOrNull() ?: return null
+            val arr = obj.optJSONArray("sources") ?: return null
+            val list = ArrayList<SourceScriptEntry>(arr.length())
+            for (i in 0 until arr.length()) {
+                val item = arr.optJSONObject(i) ?: continue
+                val script = item.optString("script")
+                if (!looksLikeSourceScript(script)) continue
+                list.add(
+                    SourceScriptEntry(
+                        id = item.optString("id"),
+                        name = item.optString("name"),
+                        version = item.optString("version"),
+                        script = script,
+                        homepage = item.optString("homepage"),
+                        sourcesJson = item.optJSONObject("sources")?.toString() ?: "{}",
+                        hash = item.optString("hash")
+                    )
+                )
+            }
+            return SourceScriptBundle(
+                version = obj.optInt("version", 1),
+                generatedAt = obj.optString("generatedAt"),
+                sources = list
+            )
+        }
+    }
+
+    private suspend fun fetchRawScript(sourceId: String): String? {
+        if (sourceId.isBlank()) return null
+        val encoded = java.net.URLEncoder.encode(sourceId, "UTF-8")
+        val req = newAuthRequest("$cleanBase/api/source/$encoded/raw").get().build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return null
+            val body = resp.body?.string().orEmpty()
+            return body.takeIf { looksLikeSourceScript(it) }
+        }
+    }
+
+    private suspend fun fetchExternalScript(url: String): String? {
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", "LMPlayerTV/1.10.29")
+            .get()
+            .build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return null
+            val body = resp.body?.string().orEmpty()
+            return body.takeIf { looksLikeSourceScript(it) }
+        }
+    }
+
+    private fun looksLikeSourceScript(text: String): Boolean {
+        if (text.length < 50 || text.length > 5 * 1024 * 1024) return false
+        if (text.trimStart().startsWith("<")) return false
+        return text.contains("globalThis.lx") || text.contains("lx.EVENT_NAMES") ||
+            text.contains("EVENT_NAMES") && text.contains("musicUrl")
+    }
+
+    /** 构造 LX 音源要求的最小 musicInfo */
+    private fun buildLocalMusicInfo(
+        songId: String,
+        source: String,
+        metaJson: String?,
+        fallbackTitle: String?,
+        fallbackArtist: String?
+    ): String {
+        val obj = runCatching { JSONObject(metaJson ?: "{}") }.getOrDefault(JSONObject())
+        val clean = songId.removePrefix("lemon_online_")
+        val rawId = if (clean.contains("_")) clean.substringAfter("_") else clean
+        if (rawId.isNotBlank()) {
+            if (obj.optString("id").isBlank()) obj.put("id", rawId)
+            if (obj.optString("songId").isBlank()) obj.put("songId", rawId)
+        }
+        if (obj.optString("name").isBlank() && !fallbackTitle.isNullOrBlank()) obj.put("name", fallbackTitle)
+        if (obj.optString("singer").isBlank() && !fallbackArtist.isNullOrBlank()) obj.put("singer", fallbackArtist)
+        if (obj.optString("source").isBlank()) obj.put("source", source)
+        listOf("hash", "songmid").forEach { key ->
+            if (obj.has(key) && obj.optString(key).isBlank()) obj.remove(key)
+        }
+        return obj.toString()
+    }
+
+    /** 轻量健康检查：10 秒总超时，只判断服务器是否可达，不解析业务。 */
+    suspend fun healthCheck(timeoutMs: Long = 10_000L): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticated()
+            val probeClient = client.newBuilder()
+                .callTimeout(timeoutMs.coerceIn(1_000L, 10_000L), java.util.concurrent.TimeUnit.MILLISECONDS)
+                .build()
+            val req = newAuthRequest("$cleanBase/api/settings").get().build()
+            probeClient.newCall(req).execute().use { resp ->
+                Result.success(resp.isSuccessful)
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Result.failure(e)
+        }
+    }
+
     suspend fun importSourceUrl(scriptUrl: String): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticatedOrThrow()

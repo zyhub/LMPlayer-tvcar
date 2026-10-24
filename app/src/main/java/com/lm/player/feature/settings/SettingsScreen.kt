@@ -48,6 +48,14 @@ import com.lm.player.core.model.*
 import com.lm.player.core.network.LemonMusicProtocol
 import com.lm.player.core.network.NetworkClientFactory
 import com.lm.player.core.update.AppUpdateManager
+import com.lm.player.core.database.entity.ServerSourceEntity
+import com.lm.player.core.database.entity.ServerSourceMetaEntity
+import com.lm.player.core.network.ServerLatencyMonitor
+import com.lm.player.core.source.ServerSourceRepository
+import kotlinx.coroutines.flow.flowOf
+import android.os.SystemClock
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import com.lm.player.core.update.UpdateInfo
 import com.lm.player.core.util.StorageVolumeHelper
 import java.io.File
@@ -166,6 +174,7 @@ fun SettingsScreen(
     }
 
     // 弹窗状态
+    var showServerManager by remember { mutableStateOf(false) }
     var showAddServerDialog by remember { mutableStateOf(false) }
     var editingServer by remember { mutableStateOf<ServerConfig?>(null) }
     var isTestingConnection by remember { mutableStateOf(false) }
@@ -229,19 +238,63 @@ fun SettingsScreen(
     var newLocalPathInput by remember { mutableStateOf("") }
 
     val activeServer = servers.firstOrNull { it.id == activeServerId } ?: servers.firstOrNull { it.isCurrentActive }
+    val isLocalMode = activeServer == null
+    val sourceStatusServer = activeServer?.takeIf { it.type == ServerType.LEMON_MUSIC }
+        ?: servers.firstOrNull { it.type == ServerType.LEMON_MUSIC }
+    val sourceServerHost = remember(sourceStatusServer?.serverUrl) {
+        val raw = sourceStatusServer?.serverUrl.orEmpty().trim()
+        raw.substringAfter("://", raw).substringBefore('/').substringBefore('?')
+    }
+    val cachedSources by remember(sourceStatusServer?.id) {
+        sourceStatusServer?.let { database.serverSourceDao().observeSources(it.id) }
+            ?: flowOf(emptyList<ServerSourceEntity>())
+    }.collectAsState(initial = emptyList())
+    val cachedSourceMeta by remember(sourceStatusServer?.id) {
+        sourceStatusServer?.let { database.serverSourceDao().observeMeta(it.id) }
+            ?: flowOf<ServerSourceMetaEntity?>(null)
+    }.collectAsState(initial = null)
+    var isRefreshingSources by remember { mutableStateOf(false) }
+    var sourceStatusError by remember { mutableStateOf<String?>(null) }
+    var liveServerOnline by remember(sourceStatusServer?.id) { mutableStateOf<Boolean?>(null) }
+    var liveServerLatency by remember(sourceStatusServer?.id) { mutableStateOf<Long?>(null) }
+
+    LaunchedEffect(sourceStatusServer?.id) {
+        val server = sourceStatusServer ?: run {
+            liveServerOnline = null
+            liveServerLatency = null
+            return@LaunchedEffect
+        }
+        while (isActive) {
+            val started = SystemClock.elapsedRealtime()
+            val ok = withContext(Dispatchers.IO) {
+                runCatching {
+                    val client = NetworkClientFactory.createOkHttpClient(context)
+                    val proto = LemonMusicProtocol(client, server.serverUrl, server.username, server.tokenOrApiKey)
+                    proto.healthCheck(4_000L).getOrDefault(false)
+                }.getOrDefault(false)
+            }
+            val elapsed = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
+            liveServerOnline = ok
+            liveServerLatency = if (ok) elapsed else null
+            ServerLatencyMonitor.record(sourceServerHost, elapsed, ok)
+            com.lm.player.core.source.SourceAccelerationController.onServerSample(sourceServerHost, elapsed, ok)
+            delay(if (ok) 15_000L else 6_000L)
+        }
+    }
 
     // 当切换到音源脚本或存储路径 Tab 时，若连接了柠檬音乐则自动拉取
     LaunchedEffect(selectedTab, activeServer?.id, isScanningLocalAndServer, isPurgingLegacyData) {
-        if (selectedTab == SettingsTab.SOURCES && activeServer?.type == ServerType.LEMON_MUSIC) {
-            isLoadingScripts = true
+        if (selectedTab == SettingsTab.SOURCES && liveServerOnline == true && sourceStatusServer != null) {
+            isRefreshingSources = true
+            sourceStatusError = null
             try {
                 val client = NetworkClientFactory.createOkHttpClient(context)
-                val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
-                val result = proto.fetchSourceList()
-                sourceScripts = result.getOrDefault(emptyList())
+                val proto = LemonMusicProtocol(client, sourceStatusServer.serverUrl, sourceStatusServer.username, sourceStatusServer.tokenOrApiKey)
+                ServerSourceRepository.syncFromServer(sourceStatusServer, proto)
+                com.lm.player.core.source.SourceAccelerationController.start(context, sourceStatusServer, proto)
             } catch (_: Exception) {
             } finally {
-                isLoadingScripts = false
+                isRefreshingSources = false
             }
         }
         if (selectedTab == SettingsTab.DOWNLOAD && activeServer?.type == ServerType.LEMON_MUSIC) {
@@ -412,37 +465,143 @@ fun SettingsScreen(
             when (selectedTab) {
                 // ==================== 1. 账号与服务 ====================
                 SettingsTab.ACCOUNT -> {
+                    val accountServer = sourceStatusServer
+                    val accountOnline = liveServerOnline == true
                     item {
-                        SettingsCard(title = "当前连接服务", icon = Icons.Default.Dns) {
-                            if (activeServer != null) {
-                                SettingInfoRow(label = "服务名称", value = activeServer.name)
-                                SettingInfoRow(label = "服务类型", value = activeServer.type.displayName)
-                                SettingInfoRow(label = "服务器地址", value = activeServer.serverUrl)
-                                SettingInfoRow(label = "登录账号", value = activeServer.username.ifBlank { "匿名/Token" })
-                                SettingInfoRow(label = "鉴权状态", value = if (activeServer.tokenOrApiKey.isNotBlank()) "已授权 (Bearer/ApiKey)" else "未配置")
+                        SettingsCard(title = "柠檬音乐账号", icon = Icons.Default.AccountCircle) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(54.dp)
+                                        .clip(CircleShape)
+                                        .background(AppleRed),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text("L", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                                }
+                                Spacer(modifier = Modifier.width(14.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = accountServer?.username?.ifBlank { "Token 登录" } ?: "未登录",
+                                        fontSize = 18.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Text(
+                                        text = when {
+                                            isLocalMode && accountServer != null -> "离线模式"
+                                            accountOnline -> "柠檬音乐账号 · 已登录"
+                                            accountServer != null -> "服务器离线"
+                                            else -> "未登录"
+                                        },
+                                        fontSize = 12.sp,
+                                        color = if (isLocalMode) MaterialTheme.colorScheme.onSurfaceVariant else if (accountOnline) MaterialTheme.colorScheme.onSurfaceVariant else AppleRed
+                                    )
+                                }
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = when {
+                                        isLocalMode -> MaterialTheme.colorScheme.surfaceVariant
+                                        accountOnline -> Color(0xFF34C759).copy(alpha = 0.15f)
+                                        accountServer != null -> AppleRed.copy(alpha = 0.12f)
+                                        else -> MaterialTheme.colorScheme.surfaceVariant
+                                    }
+                                ) {
+                                    Text(
+                                        text = when {
+                                            isLocalMode -> "离线模式"
+                                            accountOnline -> if (accountServer?.tokenOrApiKey?.isNotBlank() == true) "已授权" else "未授权"
+                                            accountServer != null -> "未连接"
+                                            else -> "未登录"
+                                        },
+                                        fontSize = 11.sp,
+                                        color = when {
+                                            isLocalMode -> MaterialTheme.colorScheme.onSurfaceVariant
+                                            accountOnline -> Color(0xFF228B45)
+                                            accountServer != null -> AppleRed
+                                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                    )
+                                }
+                            }
 
-                                Spacer(modifier = Modifier.height(10.dp))
+                            if (accountServer != null) {
+                                Spacer(modifier = Modifier.height(14.dp))
+                                HorizontalDivider(color = borderColor.copy(alpha = 0.6f))
+                                Spacer(modifier = Modifier.height(14.dp))
+
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(42.dp)
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(AppleRed.copy(alpha = 0.12f)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(Icons.Default.Dns, contentDescription = null, tint = AppleRed, modifier = Modifier.size(22.dp))
+                                    }
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(accountServer.name, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                                        Text(accountServer.serverUrl, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                    Text(
+                                        text = when {
+                                            isLocalMode -> "离线模式"
+                                            accountOnline -> "已连接"
+                                            else -> "未连接"
+                                        },
+                                        fontSize = 11.sp,
+                                        color = when {
+                                            isLocalMode -> MaterialTheme.colorScheme.onSurfaceVariant
+                                            accountOnline -> Color(0xFF228B45)
+                                            else -> AppleRed
+                                        },
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.height(16.dp))
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Column {
+                                        Text(if (accountOnline) "${cachedSourceMeta?.activeSourceCount ?: 0}/${cachedSourceMeta?.totalSourceCount ?: 0}" else "0/0", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = if (accountOnline) MaterialTheme.colorScheme.onSurface else AppleRed)
+                                        Text("激活音源", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                    Column {
+                                        Text(if (accountOnline) "${liveServerLatency ?: cachedSourceMeta?.latencyMs ?: "—"}ms" else "—", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = if (accountOnline) MaterialTheme.colorScheme.onSurface else AppleRed)
+                                        Text("延迟", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                    Column {
+                                        Text(if (!accountOnline) "离线" else if (cachedSourceMeta?.lastSyncAt != null) "已同步" else "未同步", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = if (accountOnline) MaterialTheme.colorScheme.onSurface else AppleRed)
+                                        Text("曲库状态", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.height(16.dp))
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                                 ) {
                                     Button(
                                         onClick = {
-                                            isTestingConnection = true
-                                            coroutineScope.launch {
-                                                try {
-                                                    val client = NetworkClientFactory.createOkHttpClient(context)
-                                                    val proto = LemonMusicProtocol(client, activeServer.serverUrl, activeServer.username, activeServer.tokenOrApiKey)
-                                                    val res = proto.testConnection()
-                                                    if (res.isSuccess) {
-                                                        Toast.makeText(context, "连接成功！服务端响应正常", Toast.LENGTH_SHORT).show()
-                                                    } else {
-                                                        Toast.makeText(context, "连接失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                                            if (!isTestingConnection) {
+                                                isTestingConnection = true
+                                                coroutineScope.launch {
+                                                    try {
+                                                        val client = NetworkClientFactory.createOkHttpClient(context)
+                                                        val proto = LemonMusicProtocol(client, accountServer.serverUrl, accountServer.username, accountServer.tokenOrApiKey)
+                                                        val res = proto.testConnection()
+                                                        Toast.makeText(
+                                                            context,
+                                                            if (res.isSuccess) "连接成功！服务端响应正常" else "连接失败: ${res.exceptionOrNull()?.message}",
+                                                            if (res.isSuccess) Toast.LENGTH_SHORT else Toast.LENGTH_LONG
+                                                        ).show()
+                                                    } catch (e: Exception) {
+                                                        Toast.makeText(context, "连接测试异常: ${e.message}", Toast.LENGTH_LONG).show()
+                                                    } finally {
+                                                        isTestingConnection = false
                                                     }
-                                                } catch (e: Exception) {
-                                                    Toast.makeText(context, "连接异常: ${e.message}", Toast.LENGTH_LONG).show()
-                                                } finally {
-                                                    isTestingConnection = false
                                                 }
                                             }
                                         },
@@ -459,114 +618,49 @@ fun SettingsScreen(
                                         Text(if (isTestingConnection) "测试中..." else "测试连通性", fontSize = dimensions.bodySize)
                                     }
 
-                                    OutlinedButton(
-                                        onClick = {
-                                            editingServer = activeServer
-                                            showAddServerDialog = true
-                                        },
+                                    Button(
+                                        onClick = { showServerManager = true },
                                         shape = RoundedCornerShape(12.dp),
+                                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                                         modifier = Modifier
                                             .weight(1f)
-                                            .tvButtonFocusable(shape = RoundedCornerShape(12.dp)),
+                                            .tvButtonFocusable(
+                                                shape = RoundedCornerShape(12.dp),
+                                                focusedBorderColor = Color(0xFFFFD60A)
+                                            ),
                                         border = BorderStroke(1.dp, borderColor)
                                     ) {
-                                        Text("编辑配置", fontSize = dimensions.bodySize)
+                                        Icon(
+                                            Icons.Default.Dns,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(16.dp),
+                                            tint = AppleRed
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            "管理服务器",
+                                            fontSize = dimensions.bodySize,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            fontWeight = FontWeight.Medium
+                                        )
                                     }
                                 }
                             } else {
+                                Spacer(modifier = Modifier.height(14.dp))
                                 Text(
                                     text = "当前处于纯本地离线模式，未连接任何远程音乐服务器。",
                                     fontSize = dimensions.bodySize,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
-                            }
-                        }
-                    }
-
-                    item {
-                        SettingsCard(title = "已配置的服务列表", icon = Icons.Default.Storage) {
-                            if (servers.isEmpty()) {
-                                Text("暂无配置的服务器", fontSize = dimensions.bodySize, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            } else {
-                                servers.forEach { s ->
-                                    val isCurrent = s.id == activeServerId || s.isCurrentActive
-                                    Surface(
-                                        shape = RoundedCornerShape(12.dp),
-                                        color = if (isCurrent) AppleRed.copy(alpha = 0.10f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
-                                        border = BorderStroke(1.dp, if (isCurrent) AppleRed else borderColor.copy(alpha = 0.4f)),
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(vertical = 4.dp)
-                                            .tvFocusable(
-                                                shape = RoundedCornerShape(12.dp),
-                                                focusedScale = 1.015f,
-                                                focusedBorderColor = if (isCurrent) Color(0xFFFFD60A) else AppleRed,
-                                                onClick = { onSelectServer(s) }
-                                            )
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.padding(12.dp),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Column(modifier = Modifier.weight(1f)) {
-                                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                                    Text(s.name, fontSize = dimensions.itemTitleSize, fontWeight = FontWeight.Bold)
-                                                    if (isCurrent) {
-                                                        Spacer(modifier = Modifier.width(6.dp))
-                                                        Surface(shape = RoundedCornerShape(4.dp), color = AppleRed) {
-                                                            Text("当前使用", color = Color.White, fontSize = dimensions.badgeSize, modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp))
-                                                        }
-                                                    }
-                                                }
-                                                Text(s.serverUrl, fontSize = dimensions.badgeSize, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                            }
-
-                                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                                IconButton(
-                                                    onClick = { editingServer = s; showAddServerDialog = true },
-                                                    modifier = Modifier
-                                                        .size(32.dp)
-                                                        .tvButtonFocusable(shape = CircleShape, focusedScale = 1.12f)
-                                                ) {
-                                                    Icon(Icons.Default.Edit, contentDescription = "编辑", modifier = Modifier.size(16.dp))
-                                                }
-                                                IconButton(
-                                                    onClick = { onDeleteServer(s.id) },
-                                                    modifier = Modifier
-                                                        .size(32.dp)
-                                                        .tvButtonFocusable(shape = CircleShape, focusedScale = 1.12f)
-                                                ) {
-                                                    Icon(Icons.Default.Delete, contentDescription = "删除", tint = AppleRed, modifier = Modifier.size(16.dp))
-                                                }
-                                            }
-                                        }
-                                    }
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Button(
+                                    onClick = { editingServer = null; showAddServerDialog = true },
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                                    modifier = Modifier.tvButtonFocusable(shape = RoundedCornerShape(12.dp))
+                                ) {
+                                    Text("添加柠檬音乐服务器", fontSize = dimensions.bodySize)
                                 }
-                            }
-
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Button(
-                                onClick = { editingServer = null; showAddServerDialog = true },
-                                shape = RoundedCornerShape(12.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                                border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.55f)),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .tvButtonFocusable(
-                                        shape = RoundedCornerShape(12.dp),
-                                        focusedScale = 1.025f,
-                                        focusedBorderColor = Color(0xFFFFD60A)
-                                    )
-                            ) {
-                                Icon(Icons.Default.Add, contentDescription = null, tint = AppleRed, modifier = Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    "添加柠檬音乐服务器",
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                    fontSize = dimensions.bodySize,
-                                    fontWeight = FontWeight.Bold
-                                )
                             }
                         }
                     }
@@ -691,284 +785,45 @@ fun SettingsScreen(
                     }
 
                     item {
-                        SettingsCard(title = "落雪音源脚本管理 (LX Music)", icon = Icons.Default.Extension) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "服务端音源扩展 (${sourceScripts.size})",
-                                    fontSize = dimensions.itemTitleSize,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    IconButton(
-                                        onClick = {
-                                            if (activeServer?.type == ServerType.LEMON_MUSIC) {
-                                                isLoadingScripts = true
-                                                coroutineScope.launch {
-                                                    try {
-                                                        val proto = LemonMusicProtocol(
-                                                            NetworkClientFactory.createOkHttpClient(context),
-                                                            activeServer.serverUrl,
-                                                            activeServer.username,
-                                                            activeServer.tokenOrApiKey
-                                                        )
-                                                        sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
-                                                    } catch (e: Exception) {
-                                                        Toast.makeText(context, "刷新音源失败: ${e.message}", Toast.LENGTH_SHORT).show()
-                                                    } finally {
-                                                        isLoadingScripts = false
-                                                    }
-                                                }
-                                            } else {
-                                                Toast.makeText(context, "请先连接柠檬音乐服务端", Toast.LENGTH_SHORT).show()
+                        ServerSourceStatusCard(
+                            serverName = sourceStatusServer?.name.orEmpty(),
+                            isConnected = !isLocalMode && liveServerOnline == true,
+                            serverHost = sourceServerHost,
+                            onlineLatencyMs = liveServerLatency,
+                            sources = cachedSources,
+                            meta = cachedSourceMeta,
+                            isRefreshing = isRefreshingSources,
+                            error = sourceStatusError,
+                            onRefresh = {
+                                if (sourceStatusServer == null) {
+                                    sourceStatusError = "请先配置柠檬音乐服务端"
+                                } else {
+                                    isRefreshingSources = true
+                                    sourceStatusError = null
+                                    coroutineScope.launch {
+                                        try {
+                                            val proto = LemonMusicProtocol(
+                                                NetworkClientFactory.createOkHttpClient(context),
+                                                sourceStatusServer.serverUrl,
+                                                sourceStatusServer.username,
+                                                sourceStatusServer.tokenOrApiKey
+                                            )
+                                            val res = ServerSourceRepository.syncFromServer(sourceStatusServer, proto, force = true)
+                                            if (res.isFailure) {
+                                                sourceStatusError = res.exceptionOrNull()?.message ?: "音源状态同步失败"
                                             }
-                                        },
-                                        modifier = Modifier
-                                            .size(32.dp)
-                                            .tvButtonFocusable(shape = CircleShape, focusedScale = 1.12f)
-                                    ) {
-                                        Icon(Icons.Default.Refresh, contentDescription = "刷新", modifier = Modifier.size(16.dp))
-                                    }
-                                    IconButton(
-                                        onClick = {
-                                            if (activeServer?.type == ServerType.LEMON_MUSIC) {
-                                                showImportScriptDialog = true
-                                            } else {
-                                                Toast.makeText(context, "请先连接柠檬音乐服务端", Toast.LENGTH_SHORT).show()
-                                            }
-                                        },
-                                        modifier = Modifier
-                                            .size(32.dp)
-                                            .tvButtonFocusable(shape = CircleShape, focusedScale = 1.12f)
-                                    ) {
-                                        Icon(Icons.Default.Add, contentDescription = "导入脚本", tint = AppleRed, modifier = Modifier.size(18.dp))
-                                    }
-                                }
-                            }
-
-                            Spacer(modifier = Modifier.height(8.dp))
-
-                            if (isLoadingScripts) {
-                                Box(modifier = Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
-                                    CircularProgressIndicator(modifier = Modifier.size(24.dp), color = AppleRed)
-                                }
-                            } else if (sourceScripts.isEmpty()) {
-                                Text(
-                                    text = if (activeServer?.type == ServerType.LEMON_MUSIC) "服务端暂未部署音源脚本，请点击右上角「+」导入落雪音源脚本" else "连接柠檬音乐服务端后可集中管理落雪音源脚本",
-                                    fontSize = dimensions.captionSize,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            } else {
-                                sourceScripts.forEach { script ->
-                                    val isExpanded = expandedScriptIds.contains(script.id)
-                                    val toggleScript: () -> Unit = {
-                                        if (activeServer != null) {
-                                            val enable = !script.isActive
-                                            coroutineScope.launch {
-                                                val proto = LemonMusicProtocol(
-                                                    NetworkClientFactory.createOkHttpClient(context),
-                                                    activeServer.serverUrl,
-                                                    activeServer.username,
-                                                    activeServer.tokenOrApiKey
-                                                )
-                                                val res = if (enable) proto.activateSource(script.id) else proto.deactivateSource(script.id)
-                                                if (res.isSuccess) {
-                                                    sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
-                                                    Toast.makeText(context, if (enable) "音源已激活" else "音源已停用", Toast.LENGTH_SHORT).show()
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Surface(
-                                        shape = RoundedCornerShape(12.dp),
-                                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
-                                        border = BorderStroke(1.dp, borderColor.copy(alpha = 0.4f)),
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(vertical = 4.dp)
-                                    ) {
-                                        Column(modifier = Modifier.fillMaxWidth().padding(12.dp)) {
-                                            Row(
-                                                modifier = Modifier.fillMaxWidth(),
-                                                horizontalArrangement = Arrangement.SpaceBetween,
-                                                verticalAlignment = Alignment.CenterVertically
-                                            ) {
-                                                Row(
-                                                    modifier = Modifier
-                                                        .weight(1f)
-                                                        .tvFocusable(
-                                                            shape = RoundedCornerShape(8.dp),
-                                                            focusedScale = 1.01f,
-                                                            onClick = {
-                                                                expandedScriptIds = if (isExpanded) expandedScriptIds - script.id else expandedScriptIds + script.id
-                                                            }
-                                                        ),
-                                                    verticalAlignment = Alignment.CenterVertically
-                                                ) {
-                                                    Icon(
-                                                        imageVector = if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                                                        contentDescription = if (isExpanded) "折叠平台设置" else "展开平台设置",
-                                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                        modifier = Modifier.size(22.dp)
-                                                    )
-                                                    Spacer(modifier = Modifier.width(6.dp))
-                                                    Column {
-                                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                                            Text(script.name, fontSize = dimensions.itemTitleSize, fontWeight = FontWeight.Bold)
-                                                            if (script.version.isNotBlank()) {
-                                                                Spacer(modifier = Modifier.width(6.dp))
-                                                                Text("v${script.version}", fontSize = dimensions.badgeSize, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                            }
-                                                        }
-                                                        if (script.author.isNotBlank()) {
-                                                            Text("作者: ${script.author}", fontSize = dimensions.badgeSize, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                        }
-                                                    }
-                                                }
-
-                                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                                    Box(
-                                                        modifier = Modifier
-                                                            .tvButtonFocusable(shape = RoundedCornerShape(16.dp), focusedScale = 1.05f)
-                                                            .clickable(onClick = toggleScript)
-                                                            .padding(horizontal = 4.dp, vertical = 2.dp)
-                                                    ) {
-                                                        Switch(
-                                                            checked = script.isActive,
-                                                            onCheckedChange = null,
-                                                            colors = SwitchDefaults.colors(
-                                                                checkedThumbColor = Color.White,
-                                                                checkedTrackColor = AppleRed
-                                                            )
-                                                        )
-                                                    }
-                                                    IconButton(
-                                                        onClick = { scriptToDelete = script },
-                                                        modifier = Modifier
-                                                            .size(32.dp)
-                                                            .tvButtonFocusable(shape = CircleShape, focusedScale = 1.12f)
-                                                    ) {
-                                                        Icon(Icons.Default.Delete, contentDescription = "删除", tint = AppleRed.copy(alpha = 0.8f), modifier = Modifier.size(16.dp))
-                                                    }
-                                                }
-                                            }
-
-                                            // 折叠菜单：各平台独立解析设置
-                                            AnimatedVisibility(visible = isExpanded) {
-                                                Column(
-                                                    modifier = Modifier
-                                                        .fillMaxWidth()
-                                                        .padding(top = 8.dp)
-                                                ) {
-                                                    HorizontalDivider(
-                                                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
-                                                        thickness = 0.5.dp,
-                                                        modifier = Modifier.padding(vertical = 6.dp)
-                                                    )
-                                                    Text(
-                                                        text = "平台解析设置 (对接柠檬服务器)",
-                                                        fontSize = dimensions.captionSize,
-                                                        fontWeight = FontWeight.Medium,
-                                                        color = MaterialTheme.colorScheme.primary
-                                                    )
-                                                    Spacer(modifier = Modifier.height(6.dp))
-
-                                                    val platforms = script.supportedPlatforms.ifEmpty { listOf("kw", "kg", "tx", "wy", "mg") }
-                                                    platforms.forEach { platform ->
-                                                        val platformTitle = when (platform.lowercase()) {
-                                                            "kw" -> "酷我音乐"
-                                                            "kg" -> "酷狗音乐"
-                                                            "tx" -> "QQ音乐"
-                                                            "wy" -> "网易云音乐"
-                                                            "mg" -> "咪咕音乐"
-                                                            "bd" -> "百度音乐"
-                                                            else -> platform.uppercase()
-                                                        }
-                                                        val isPlatformEnabled = platform !in script.disabledPlatforms
-
-                                                        val togglePlatform: () -> Unit = {
-                                                            if (activeServer != null) {
-                                                                val nextEnabled = !isPlatformEnabled
-                                                                val oldScripts = sourceScripts
-                                                                val updatedDisabled = if (nextEnabled) {
-                                                                    script.disabledPlatforms - platform
-                                                                } else {
-                                                                    script.disabledPlatforms + platform
-                                                                }
-                                                                sourceScripts = sourceScripts.map {
-                                                                    if (it.id == script.id) it.copy(disabledPlatforms = updatedDisabled) else it
-                                                                }
-                                                                coroutineScope.launch {
-                                                                    val proto = LemonMusicProtocol(
-                                                                        NetworkClientFactory.createOkHttpClient(context),
-                                                                        activeServer.serverUrl,
-                                                                        activeServer.username,
-                                                                        activeServer.tokenOrApiKey
-                                                                    )
-                                                                    val res = proto.updateSourcePlatformStatus(script.id, platform, nextEnabled)
-                                                                    if (res.isSuccess) {
-                                                                        Toast.makeText(context, "$platformTitle 解析已${if (nextEnabled) "开启" else "取消"}", Toast.LENGTH_SHORT).show()
-                                                                    } else {
-                                                                        sourceScripts = oldScripts
-                                                                        Toast.makeText(context, "更新失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-
-                                                        Row(
-                                                            modifier = Modifier
-                                                                .fillMaxWidth()
-                                                                .padding(vertical = 3.dp, horizontal = 4.dp)
-                                                                .tvFocusable(
-                                                                    shape = RoundedCornerShape(6.dp),
-                                                                    focusedScale = 1.01f,
-                                                                    onClick = togglePlatform
-                                                                ),
-                                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                                            verticalAlignment = Alignment.CenterVertically
-                                                        ) {
-                                                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                                                Surface(
-                                                                    shape = RoundedCornerShape(4.dp),
-                                                                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
-                                                                ) {
-                                                                    Text(
-                                                                        text = platform.uppercase(),
-                                                                        fontSize = 10.sp,
-                                                                        fontWeight = FontWeight.Bold,
-                                                                        color = MaterialTheme.colorScheme.primary,
-                                                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
-                                                                    )
-                                                                }
-                                                                Spacer(modifier = Modifier.width(8.dp))
-                                                                Text(
-                                                                    text = platformTitle,
-                                                                    fontSize = dimensions.bodySize,
-                                                                    color = MaterialTheme.colorScheme.onSurface
-                                                                )
-                                                            }
-                                                            Switch(
-                                                                checked = isPlatformEnabled,
-                                                                onCheckedChange = { togglePlatform() },
-                                                                colors = SwitchDefaults.colors(
-                                                                    checkedThumbColor = Color.White,
-                                                                    checkedTrackColor = AppleRed
-                                                                ),
-                                                                modifier = Modifier.scale(0.85f)
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                            com.lm.player.core.source.SourceAccelerationController.start(context, sourceStatusServer, proto)
+                                        } catch (e: kotlinx.coroutines.CancellationException) {
+                                            throw e
+                                        } catch (e: Exception) {
+                                            sourceStatusError = e.message ?: "音源状态同步失败"
+                                        } finally {
+                                            isRefreshingSources = false
                                         }
                                     }
                                 }
                             }
-                        }
+                        )
                     }
                 }
 
@@ -2380,6 +2235,172 @@ fun SettingsScreen(
                 ) { Text("取消") }
             }
         )
+    }
+
+    if (showServerManager) {
+        Dialog(onDismissRequest = { showServerManager = false }) {
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = cardBg,
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                border = BorderStroke(1.dp, borderColor),
+                modifier = Modifier
+                    .fillMaxWidth(0.92f)
+                    .padding(12.dp)
+            ) {
+                Column(modifier = Modifier.padding(18.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text("服务器管理", fontSize = dimensions.sectionTitleSize, fontWeight = FontWeight.Bold)
+                            Text(
+                                "仅柠檬音乐 · 已配置 ${servers.size} 台",
+                                fontSize = dimensions.badgeSize,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        IconButton(
+                            onClick = { showServerManager = false },
+                            modifier = Modifier.tvButtonFocusable(shape = CircleShape)
+                        ) {
+                            Icon(Icons.Default.Close, contentDescription = "关闭", modifier = Modifier.size(18.dp))
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    if (servers.isEmpty()) {
+                        Text(
+                            "暂无配置的柠檬音乐服务器",
+                            fontSize = dimensions.bodySize,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(vertical = 16.dp)
+                        )
+                    } else {
+                        Column(
+                            modifier = Modifier
+                                .heightIn(max = 380.dp)
+                                .verticalScroll(rememberScrollState())
+                        ) {
+                            servers.forEach { s ->
+                                val isCurrent = s.id == activeServerId || s.isCurrentActive
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = if (isCurrent) AppleRed.copy(alpha = 0.08f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+                                    border = BorderStroke(1.dp, if (isCurrent) AppleRed.copy(alpha = 0.6f) else borderColor),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 4.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(12.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Text(s.name, fontSize = dimensions.itemTitleSize, fontWeight = FontWeight.Bold)
+                                                if (isCurrent) {
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Surface(shape = RoundedCornerShape(4.dp), color = AppleRed) {
+                                                        Text(
+                                                            "当前",
+                                                            color = Color.White,
+                                                            fontSize = dimensions.badgeSize,
+                                                            fontWeight = FontWeight.Bold,
+                                                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                            Text(
+                                                s.serverUrl,
+                                                fontSize = dimensions.badgeSize,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1
+                                            )
+                                        }
+
+                                        Row(
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            IconButton(
+                                                onClick = {
+                                                    editingServer = s
+                                                    showServerManager = false
+                                                    showAddServerDialog = true
+                                                },
+                                                modifier = Modifier
+                                                    .size(34.dp)
+                                                    .tvButtonFocusable(shape = CircleShape)
+                                            ) {
+                                                Icon(Icons.Default.Edit, contentDescription = "编辑", modifier = Modifier.size(16.dp))
+                                            }
+                                            IconButton(
+                                                onClick = { onDeleteServer(s.id) },
+                                                modifier = Modifier
+                                                    .size(34.dp)
+                                                    .tvButtonFocusable(shape = CircleShape)
+                                            ) {
+                                                Icon(Icons.Default.Delete, contentDescription = "删除", tint = AppleRed, modifier = Modifier.size(16.dp))
+                                            }
+                                            Button(
+                                                onClick = {
+                                                    onSelectServer(s)
+                                                    showServerManager = false
+                                                },
+                                                colors = ButtonDefaults.buttonColors(
+                                                    containerColor = if (isCurrent) MaterialTheme.colorScheme.surfaceVariant else AppleRed
+                                                ),
+                                                shape = RoundedCornerShape(8.dp),
+                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                                modifier = Modifier.tvButtonFocusable(shape = RoundedCornerShape(8.dp))
+                                            ) {
+                                                Text(
+                                                    if (isCurrent) "使用中" else "切换",
+                                                    fontSize = dimensions.badgeSize,
+                                                    color = if (isCurrent) MaterialTheme.colorScheme.onSurfaceVariant else Color.White
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Button(
+                        onClick = {
+                            editingServer = null
+                            showServerManager = false
+                            showAddServerDialog = true
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .tvButtonFocusable(
+                                shape = RoundedCornerShape(12.dp),
+                                focusedBorderColor = Color(0xFFFFD60A)
+                            )
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp), tint = Color.White)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            "添加柠檬音乐服务器",
+                            fontSize = dimensions.bodySize,
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+        }
     }
 
     // 添加/编辑服务器配置弹窗

@@ -24,6 +24,25 @@ class PlaybackRouter(
     private val context: Context
 ) {
     private val TAG = "PlaybackRouter"
+    private val PLAYBACK_ACCEL_BUDGET_MS = 2_000L
+
+    private fun buildAccelerationInfo(song: UnifiedSong): String {
+        val obj = runCatching { org.json.JSONObject(song.rawMetaJson ?: "{}") }.getOrDefault(org.json.JSONObject())
+        val clean = song.id.removePrefix("lemon_online_")
+        val rawId = if (clean.contains("_")) clean.substringAfter("_") else clean
+        if (rawId.isNotBlank()) {
+            if (obj.optString("id").isBlank()) obj.put("id", rawId)
+            if (obj.optString("songId").isBlank()) obj.put("songId", rawId)
+        }
+        if (obj.optString("name").isBlank()) obj.put("name", song.title)
+        if (obj.optString("singer").isBlank()) obj.put("singer", song.artist)
+        if (obj.optString("albumName").isBlank()) obj.put("albumName", song.album)
+        listOf("hash", "songmid").forEach { key ->
+            if (obj.has(key) && obj.optString(key).isBlank()) obj.remove(key)
+        }
+        return obj.toString()
+    }
+
 
     /**
      * 核心路由决策机制：
@@ -137,7 +156,67 @@ class PlaybackRouter(
                     if (active != null && active.type == ServerType.LEMON_MUSIC) {
                         val client = NetworkClientFactory.createOkHttpClient(context)
                         val protocol = LemonMusicProtocol(client, active.serverUrl, active.username, active.tokenOrApiKey)
-                        protocol.ensureAuthenticated()
+
+                        val isOnlineId = song.id.startsWith("lemon_online_") || song.serverId == "lemon_online"
+                        val isServerSong = !isOnlineId && song.serverId.isNotBlank() && song.serverId != "local_storage"
+
+                        var accelerated = false
+                        var accelerationAttempted = false
+                        var localQuality: com.lm.player.core.model.AudioQuality? = null
+
+                        if (!forceRefresh && isOnlineId && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate()) {
+                            accelerationAttempted = true
+                            val clean = song.id.removePrefix("lemon_online_")
+                            val accelSource = if (clean.contains("_")) clean.substringBefore("_") else "kw"
+                            val accelQuality = overrideQuality ?: LemonMusicProtocol.getPreferredStreamQuality(context)
+                            val local = com.lm.player.core.source.SourceAccelerationSession.resolveMusicUrlWithQualityFallback(
+                                source = accelSource,
+                                preferredQuality = accelQuality,
+                                musicInfoJson = buildAccelerationInfo(song),
+                                budgetMs = PLAYBACK_ACCEL_BUDGET_MS
+                            )
+                            val localResolution = local.getOrNull()
+                            val localUrl = localResolution?.url?.takeIf {
+                                it.startsWith("http://") || it.startsWith("https://")
+                            }
+                            if (localUrl != null && localResolution != null &&
+                                com.lm.player.core.network.CdnProbe.probe(localUrl)
+                            ) {
+                                finalStreamUrl = localUrl
+                                accelerated = true
+                                localQuality = com.lm.player.core.model.AudioQuality.fromKey(localResolution.qualityKey)
+                                Log.i(TAG, "Home/playback local acceleration resolved: ${song.title}")
+                            } else if (localUrl != null) {
+                                Log.w(TAG, "Home/playback local acceleration probe failed: ${song.title}")
+                            }
+                        } else if (isServerSong && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate()) {
+                            accelerationAttempted = true
+                            val resolved = com.lm.player.core.source.ServerLibraryAccelerationResolver.resolve(
+                                protocol = protocol,
+                                serverId = active.id,
+                                song = song,
+                                overrideQuality = overrideQuality,
+                                refresh = forceRefresh
+                            ).getOrNull()
+                            resolved?.let {
+                                if (com.lm.player.core.network.CdnProbe.probe(it.url)) {
+                                    finalStreamUrl = it.url
+                                    accelerated = true
+                                    localQuality = it.quality
+                                    Log.i(TAG, "Server library local acceleration resolved: ${song.title} via ${it.source}")
+                                } else {
+                                    Log.w(TAG, "Server library local acceleration probe failed: ${song.title}")
+                                    com.lm.player.core.source.ServerLibraryAccelerationResolver.invalidate(
+                                        serverId = active.id,
+                                        song = song,
+                                        qualityKey = it.requestedQuality.key
+                                    )
+                                }
+                            }
+                        }
+
+                        if (!accelerated) {
+                            protocol.ensureAuthenticated()
 
                         var serverPath = LemonMusicProtocol.getServerFilePath(song.id, song.streamUrl, song.coverUrl)
                         var trackId = LemonMusicProtocol.getServerTrackId(song.id)
@@ -244,6 +323,14 @@ class PlaybackRouter(
                         // 兜底流地址
                         if (finalStreamUrl.isBlank() && song.streamUrl.isNotBlank() && !song.streamUrl.startsWith("lemon_online://")) {
                             finalStreamUrl = song.streamUrl
+                        }
+                        }
+
+                        var resolvedFormat = song.format
+                        var resolvedBitRate = song.bitRate
+                        localQuality?.let { q ->
+                            resolvedFormat = q.format.lowercase()
+                            resolvedBitRate = q.bitrate
                         }
 
                         if (finalStreamUrl.isNotBlank() && (finalStreamUrl != song.streamUrl || resolvedFormat != song.format || resolvedBitRate != song.bitRate)) {

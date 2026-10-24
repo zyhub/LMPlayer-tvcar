@@ -1,5 +1,9 @@
 package com.lm.player.core.designsystem.component
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -16,7 +20,10 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -27,6 +34,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -34,27 +43,26 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
-import com.lm.player.core.designsystem.theme.scale
+import com.lm.player.core.security.LogRedactor
 
 /**
- * 崩溃自诊断报告弹窗
- *
- * TV / 车机端无法取 logcat，闪退后把上一次的完整堆栈原样呈现给用户，
- * 用户截图回传即可定位问题。展示完由调用方标记已读，不会每次启动重复打扰。
+ * 崩溃自诊断报告弹窗（对齐手机端程序崩溃日志风格，带一键复制与大屏焦点适配）
  */
 @Composable
 fun CrashReportDialog(
     report: String,
     onDismiss: () -> Unit
 ) {
+    val context = LocalContext.current
     val dimensions = LocalAppDimensions.current
-    val closeFocusRequester = remember { FocusRequester() }
+    val copyFocusRequester = remember { FocusRequester() }
+    val sanitizedReport = remember(report) { LogRedactor.text(report) }
 
     LaunchedEffect(Unit) {
-        // 遥控器必须有确定性焦点，否则用户无法用 OK 键关闭
+        // TV 遥控器确定性焦点，优先聚焦在「一键复制」上，按 OK 即可复制
         try {
             kotlinx.coroutines.delay(80L)
-            closeFocusRequester.requestFocus()
+            copyFocusRequester.requestFocus()
         } catch (_: Exception) {
         }
     }
@@ -63,20 +71,21 @@ fun CrashReportDialog(
         Surface(
             shape = RoundedCornerShape(20.dp),
             color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 6.dp,
             modifier = Modifier
-                .fillMaxWidth(0.80f)
-                .fillMaxHeight(0.84f)
+                .fillMaxWidth(0.85f)
+                .fillMaxHeight(0.86f)
         ) {
             Column(modifier = Modifier.fillMaxSize().padding(18.dp)) {
                 Text(
-                    text = "上次运行发生闪退",
+                    text = "程序崩溃日志",
                     fontSize = dimensions.sectionTitleSize,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onSurface
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "以下堆栈已自动保存在本机，请截图发给开发者用于定位；关闭后不再自动弹出。",
+                    text = "上次运行异常退出，完整日志如下。可一键复制后反馈。",
                     fontSize = dimensions.captionSize,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -91,10 +100,10 @@ fun CrashReportDialog(
                 ) {
                     Box(modifier = Modifier.verticalScroll(rememberScrollState()).padding(12.dp)) {
                         Text(
-                            text = report,
-                            fontSize = 12.sp,
+                            text = sanitizedReport,
+                            fontSize = 11.5.sp,
                             fontFamily = FontFamily.Monospace,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = MaterialTheme.colorScheme.onSurface
                         )
                     }
                 }
@@ -102,32 +111,41 @@ fun CrashReportDialog(
                 Spacer(modifier = Modifier.height(14.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Surface(
-                        shape = RoundedCornerShape(18.dp),
-                        color = AppleRed.copy(alpha = 0.16f),
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        shape = RoundedCornerShape(14.dp),
                         modifier = Modifier
-                            .focusRequester(closeFocusRequester)
-                            .tvFocusable(
-                                shape = RoundedCornerShape(18.dp),
-                                focusedScale = 1.08f,
-                                onClick = onDismiss
+                            .weight(1f)
+                            .tvButtonFocusable(shape = RoundedCornerShape(14.dp))
+                    ) {
+                        Text("关闭", fontSize = dimensions.bodySize)
+                    }
+
+                    Button(
+                        onClick = {
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(ClipData.newPlainText("LMPlayer Crash Log", sanitizedReport))
+                            Toast.makeText(context, "崩溃日志已复制", Toast.LENGTH_SHORT).show()
+                        },
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                        modifier = Modifier
+                            .weight(1.3f)
+                            .focusRequester(copyFocusRequester)
+                            .tvButtonFocusable(
+                                shape = RoundedCornerShape(14.dp),
+                                focusedBorderColor = Color(0xFFFFD60A)
                             )
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = dimensions.scale(22.dp), vertical = dimensions.scale(9.dp)),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "我知道了",
-                                fontSize = dimensions.itemTitleSize,
-                                fontWeight = FontWeight.Bold,
-                                color = AppleRed
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                        }
+                        Text(
+                            text = "一键复制全部日志",
+                            fontSize = dimensions.bodySize,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
                     }
                 }
             }

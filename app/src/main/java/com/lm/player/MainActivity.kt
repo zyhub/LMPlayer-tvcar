@@ -50,6 +50,7 @@ import com.lm.player.core.database.entity.ServerEntity
 import com.lm.player.core.database.entity.SongEntity
 import androidx.room.invalidationTrackerFlow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.debounce
 import com.lm.player.core.designsystem.theme.AppThemeMode
 import com.lm.player.core.designsystem.component.CrashReportDialog
 import androidx.compose.runtime.MutableState
@@ -102,6 +103,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -989,6 +991,7 @@ class MainActivity : ComponentActivity() {
                 // 大曲库下 CursorWindow 2MB 放不下会抛 IllegalStateException 闪退），
                 // 改为 Room 官方 invalidationTrackerFlow 监听 songs 表变化 + 分页读取聚合
                 database.invalidationTrackerFlow("songs")
+                    .debounce(400L)
                     .map { database.songDao().getAllSongsList() }
                     .collect { songEntities ->
                     val (mappedSongs, recAdded) = withContext(Dispatchers.IO) {
@@ -3181,9 +3184,17 @@ class MainActivity : ComponentActivity() {
                                 onConfirm = { selectedPath ->
                                     showCustomFolderPickerForDownload = false
                                     if (selectedPath.isNotBlank()) {
-                                        val updated = downloadEngine.downloadSettings.value.copy(customDownloadPath = selectedPath)
+                                        if (downloadEngine.testDirectoryWritable(selectedPath, null)) {
+                                            val updated = downloadEngine.downloadSettings.value.copy(customDownloadPath = selectedPath)
+                                            downloadEngine.updateSettings(updated)
+                                            Toast.makeText(this@MainActivity, "已成功设定并保存下载存储目录：$selectedPath", Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            Toast.makeText(this@MainActivity, "该目录无写入权限，请重新选择或授予所有文件访问权限", Toast.LENGTH_LONG).show()
+                                        }
+                                    } else {
+                                        val updated = downloadEngine.downloadSettings.value.copy(customDownloadPath = "")
                                         downloadEngine.updateSettings(updated)
-                                        Toast.makeText(this@MainActivity, "已成功设定并保存下载存储目录：$selectedPath", Toast.LENGTH_SHORT).show()
+                                        Toast.makeText(this@MainActivity, "已恢复为默认应用私有下载目录", Toast.LENGTH_SHORT).show()
                                     }
                                 }
                             )
@@ -3686,7 +3697,7 @@ class MainActivity : ComponentActivity() {
         // 车机模式下不认「频道 / 翻页 / 导航」这类电视遥控器的借位映射（见 isTvStyleMediaKey）：
         // 车机上这些键位常被旋钮、预置键占用，继续当切歌键判读会表现为"莫名跳歌"。
         // 放行而不消费 —— 归属交给系统与其它应用；电视模式不受影响。
-        if (isCarPlatformActive && isTvStyleMediaKey(event.keyCode)) return super.dispatchKeyEvent(event)
+        if (isCarPlatformActive && isTvStyleMediaKey(event.keyCode)) return safeSuperDispatchKeyEvent(event)
 
         if (isMediaOrVolumeKey(event.keyCode)) {
             when (event.action) {
@@ -3710,7 +3721,33 @@ class MainActivity : ComponentActivity() {
                 else -> return true
             }
         }
-        return super.dispatchKeyEvent(event)
+        return safeSuperDispatchKeyEvent(event)
+    }
+
+    private fun safeSuperDispatchKeyEvent(event: KeyEvent): Boolean {
+        return try {
+            super.dispatchKeyEvent(event)
+        } catch (e: IllegalStateException) {
+            // Compose 焦点系统缺陷兜底：在歌曲列表等 LazyColumn 快速移动或到达顶部边界时，
+            // Compose 内部 2D 焦点查找算法访问了正在 detached 的 LayoutCoordinates 节点，
+            // 会抛出 "LayoutCoordinate operations are only valid when isAttached is true"。
+            // 吞掉此异常并安全消费该次按键，避免整机进程崩溃。
+            if (e.message?.contains("isAttached", ignoreCase = true) == true ||
+                e.message?.contains("LayoutCoordinate", ignoreCase = true) == true
+            ) {
+                android.util.Log.w("MainActivity", "Safely swallowed Compose focus detached crash during rapid D-Pad move: ${e.message}")
+                true
+            } else {
+                throw e
+            }
+        } catch (e: IllegalArgumentException) {
+            if (e.message?.contains("Focus", ignoreCase = true) == true) {
+                android.util.Log.w("MainActivity", "Safely swallowed Compose focus traversal crash: ${e.message}")
+                true
+            } else {
+                throw e
+            }
+        }
     }
 
     private fun startPlaybackService() {
