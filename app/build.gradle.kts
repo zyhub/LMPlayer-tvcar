@@ -32,8 +32,8 @@ android {
         applicationId = "com.lm.player.tv"
         minSdk = 23
         targetSdk = 34
-        versionCode = 76
-        versionName = "1.10.29"
+        versionCode = 77
+        versionName = "1.10.30"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

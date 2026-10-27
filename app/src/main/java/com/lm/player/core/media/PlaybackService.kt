@@ -21,7 +21,10 @@ import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.CommandButton
+import androidx.media3.session.MediaNotification
 import androidx.media3.session.MediaSession
+import com.google.common.collect.ImmutableList
 import androidx.media3.session.MediaSessionService
 import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionResult
@@ -421,6 +424,31 @@ class PlaybackService : MediaSessionService() {
                 .build()
             mediaSession = session
 
+            // 注册官方防崩监听器，吸收任何由于后台启动前台服务受限引发的系统异常
+            setListener(object : MediaSessionService.Listener {
+                override fun onForegroundServiceStartNotAllowedException() {
+                    Log.w(TAG, "MediaSessionService: 成功捕获并拦截系统后台启动前台服务受限异常 (ForegroundServiceStartNotAllowedException)")
+                }
+            })
+
+            // 挂载静态同步 Provider，杜绝 Media3 默认 DefaultMediaNotificationProvider 异步拉取 Bitmap
+            setMediaNotificationProvider(object : MediaNotification.Provider {
+                override fun createNotification(
+                    mediaSession: MediaSession,
+                    customLayout: ImmutableList<CommandButton>,
+                    actionFactory: MediaNotification.ActionFactory,
+                    onNotificationChangedCallback: MediaNotification.Provider.Callback
+                ): MediaNotification {
+                    return MediaNotification(NOTIFICATION_ID, buildNotification(exoPlayer?.isPlaying == true))
+                }
+
+                override fun handleCustomCommand(
+                    session: MediaSession,
+                    action: String,
+                    extras: Bundle
+                ): Boolean = false
+            })
+
             addSession(session)
 
             // 4. 前台状态已在本 try 块「步骤 0」建立（必须早于任何可能抛异常的步骤），
@@ -717,6 +745,17 @@ class PlaybackService : MediaSessionService() {
         } catch (e: Throwable) {
             Log.e(TAG, "stopForeground failed", e)
         }
+    }
+
+    /**
+     * 关键重写：拦截 Media3 内部自带的 MediaNotificationManager
+     * 绝不调用 super.onUpdateNotification(session, startInForegroundRequired)！
+     * 避免 Media3 内部异步加载 Bitmap 完成后在主线程调用 ContextCompat.startForegroundService() 抛出 ForegroundServiceStartNotAllowedException。
+     * 本服务自身在 onCreate / onStartCommand 中通过 startImmediateForeground() 建立前台状态，
+     * 并通过 updateForegroundNotification() 由系统 NotificationManager.notify() 安全刷新大屏通知。
+     */
+    override fun onUpdateNotification(session: MediaSession, startInForegroundRequired: Boolean) {
+        // 静默拦截，完全由本服务自主管理
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? {
