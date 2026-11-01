@@ -11,7 +11,10 @@ import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -22,6 +25,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
+import kotlin.math.abs
 
 import androidx.compose.ui.platform.LocalContext
 import coil.request.ImageRequest
@@ -38,10 +42,78 @@ val AppleGradients = listOf(
 )
 
 fun getGradientForId(id: String): List<Color> {
-    // 注意：abs(Int.MIN_VALUE) 仍是负数 (溢出)，取模后会得到负下标并抛
-    // ArrayIndexOutOfBoundsException 直接闪退，这里用 mod 保证下标恒为非负
-    val index = id.hashCode().mod(AppleGradients.size)
+    val index = abs(id.hashCode()) % AppleGradients.size
     return AppleGradients[index]
+}
+
+private fun normalizeMusicCoverUrl(raw: String?): String? {
+    if (raw.isNullOrBlank()) return null
+    var url = raw.trim()
+    if (url.isEmpty() || url.equals("null", ignoreCase = true) || url.equals("undefined", ignoreCase = true)) return null
+    if (com.lm.player.core.network.LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(url)) return null
+    if (url.startsWith("//")) {
+        url = "https:$url"
+    }
+
+    // 酷我 kwcdn 替换为稳定的主 CDN (避免 HTTPS 下 514 限制)
+    if (url.contains("kwcdn.kuwo.cn", ignoreCase = true)) {
+        url = url.replace(Regex("""(?i)(?:[a-zA-Z0-9_\-]+\.)*kwcdn\.kuwo\.cn"""), "img1.kuwo.cn")
+        url = url.replace("img1.img1.kuwo.cn", "img1.kuwo.cn")
+    }
+
+    // 酷我相对路径自动补全
+    if (!url.startsWith("http://") && !url.startsWith("https://") && !url.startsWith("data:") && !url.startsWith("file:") && !url.startsWith("content:")) {
+        if (url.matches(Regex("^(120|150|240|300|500)/.*")) || url.contains("s3s") || url.contains("s4s") || url.contains("star/albumcover")) {
+            val upgraded = url.replaceFirst(Regex("^(120|150|240|300)/"), "500/")
+            url = "https://img1.kuwo.cn/star/albumcover/$upgraded"
+        }
+    }
+
+    // 酷狗与各大音源大尺寸占位符替换
+    if (url.contains("{size}")) {
+        url = url.replace("{size}", "300")
+    }
+
+    // 网易云 music.126.net 自动追加轻量级缩略图参数
+    if (url.contains("music.126.net") && !url.contains("param=")) {
+        url += if (url.contains("?")) "&param=300y300" else "?param=300y300"
+    }
+
+    // 酷我小图自动升阶
+    if (url.contains("kuwo.cn/star/albumcover/120/")) {
+        url = url.replace("kuwo.cn/star/albumcover/120/", "kuwo.cn/star/albumcover/500/")
+    }
+
+    if (url.startsWith("http://img1.kuwo.cn/")) {
+        url = "https://" + url.substring("http://".length)
+    } else if (url.startsWith("http://") && (url.contains("music.126.net") || url.contains("migu.cn") || url.contains("gtimg.cn") || url.contains("qq.com"))) {
+        url = "https://" + url.substring("http://".length)
+    }
+    return url
+}
+
+private fun buildMusicImageRequest(
+    context: android.content.Context,
+    rawUrl: String?,
+    width: Int,
+    height: Int = width
+): ImageRequest? {
+    val cleanUrl = normalizeMusicCoverUrl(rawUrl) ?: return null
+    val builder = ImageRequest.Builder(context)
+        .data(cleanUrl)
+        .size(width, height)
+        .crossfade(false)
+        .memoryCachePolicy(coil.request.CachePolicy.ENABLED)
+        .diskCachePolicy(coil.request.CachePolicy.ENABLED)
+        .networkCachePolicy(coil.request.CachePolicy.ENABLED)
+
+    if (cleanUrl.startsWith("http://") || cleanUrl.startsWith("https://")) {
+        val headers = com.lm.player.core.network.MusicCdnHeaders.buildHeadersForUrl(cleanUrl)
+        for ((k, v) in headers) {
+            builder.addHeader(k, v)
+        }
+    }
+    return builder.build()
 }
 
 /**
@@ -57,34 +129,24 @@ fun AlbumArtworkImage(
     seedId: String = "",
     targetSize: Int = 160 // 默认按列表高保真 160px 解码，大幅减少 75% 显存
 ) {
-    val cleanModel = remember(model) {
-        if (model.isNullOrBlank()) null
-        else {
-            val trimmed = model.trim()
-            if (trimmed.startsWith("//")) "https:$trimmed" else trimmed
-        }
-    }
+    val cleanModel = remember(model) { normalizeMusicCoverUrl(model) }
+    var loadFailed by remember(cleanModel) { mutableStateOf(false) }
     val gradientColors = remember(seedId, cleanModel) {
         getGradientForId(if (seedId.isNotBlank()) seedId else (cleanModel ?: "seed"))
     }
-    // Brush 连同其 shader 也需 remember：列表每行每次重组都新建会产生大量可回收垃圾
-    val gradientBrush = remember(gradientColors) { Brush.linearGradient(gradientColors) }
     val context = LocalContext.current
 
     Box(
         modifier = modifier
+            .then(if (shadowElevation > 0.dp) Modifier.shadow(shadowElevation, RoundedCornerShape(cornerRadius)) else Modifier)
             .clip(RoundedCornerShape(cornerRadius))
-            .background(gradientBrush),
+            .background(Brush.linearGradient(gradientColors)),
         contentAlignment = Alignment.Center
     ) {
         if (!cleanModel.isNullOrBlank()) {
             AsyncImage(
                 model = remember(cleanModel, targetSize) {
-                    ImageRequest.Builder(context)
-                        .data(cleanModel)
-                        .size(targetSize, targetSize)
-                        .crossfade(false)
-                        .build()
+                    buildMusicImageRequest(context, cleanModel, targetSize, targetSize)
                 },
                 contentDescription = null,
                 contentScale = contentScale,
@@ -108,26 +170,23 @@ fun PlaylistArtworkImage(
     seedId: String = "",
     targetSize: Int = 160
 ) {
-    val gradientColors = remember(title, seedId, model) {
-        getGradientForId(if (title.isNotBlank()) title else if (seedId.isNotBlank()) seedId else (model ?: "playlist"))
+    val cleanModel = remember(model) { normalizeMusicCoverUrl(model) }
+    var loadFailed by remember(cleanModel) { mutableStateOf(false) }
+    val gradientColors = remember(title, seedId, cleanModel) {
+        getGradientForId(if (title.isNotBlank()) title else if (seedId.isNotBlank()) seedId else (cleanModel ?: "playlist"))
     }
-    val gradientBrush = remember(gradientColors) { Brush.linearGradient(gradientColors) }
     val context = LocalContext.current
 
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(cornerRadius))
-            .background(gradientBrush),
+            .background(Brush.linearGradient(gradientColors)),
         contentAlignment = Alignment.Center
     ) {
-        if (!model.isNullOrBlank()) {
+        if (!cleanModel.isNullOrBlank()) {
             AsyncImage(
-                model = remember(model, targetSize) {
-                    ImageRequest.Builder(context)
-                        .data(model)
-                        .size(targetSize, targetSize)
-                        .crossfade(false)
-                        .build()
+                model = remember(cleanModel, targetSize) {
+                    buildMusicImageRequest(context, cleanModel, targetSize, targetSize)
                 },
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
@@ -154,26 +213,23 @@ fun ArtistAvatarImage(
     seedId: String = "",
     targetSize: Int = 160
 ) {
-    val gradientColors = remember(seedId, model) {
-        getGradientForId(if (seedId.isNotBlank()) seedId else (model ?: "artist"))
+    val cleanModel = remember(model) { normalizeMusicCoverUrl(model) }
+    var loadFailed by remember(cleanModel) { mutableStateOf(false) }
+    val gradientColors = remember(seedId, cleanModel) {
+        getGradientForId(if (seedId.isNotBlank()) seedId else (cleanModel ?: "artist"))
     }
-    val gradientBrush = remember(gradientColors) { Brush.linearGradient(gradientColors) }
     val context = LocalContext.current
 
     Box(
         modifier = modifier
             .clip(CircleShape)
-            .background(gradientBrush),
+            .background(Brush.linearGradient(gradientColors)),
         contentAlignment = Alignment.Center
     ) {
-        if (!model.isNullOrBlank()) {
+        if (!cleanModel.isNullOrBlank()) {
             AsyncImage(
-                model = remember(model, targetSize) {
-                    ImageRequest.Builder(context)
-                        .data(model)
-                        .size(targetSize, targetSize)
-                        .crossfade(false)
-                        .build()
+                model = remember(cleanModel, targetSize) {
+                    buildMusicImageRequest(context, cleanModel, targetSize, targetSize)
                 },
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
@@ -200,15 +256,20 @@ fun MosaicArtworkCollage(
     cornerRadius: Dp = 12.dp,
     seedId: String = ""
 ) {
-    val validCovers = remember(coverUrls) { coverUrls.filter { it.isNotBlank() }.take(4) }
+    var failedUrls by remember(coverUrls) { mutableStateOf(emptySet<String>()) }
+    val validCovers = remember(coverUrls, failedUrls) {
+        coverUrls.mapNotNull { normalizeMusicCoverUrl(it) }
+            .filter { it !in failedUrls }
+            .distinct()
+            .take(4)
+    }
     val gradientColors = remember(seedId) { getGradientForId(seedId) }
-    val gradientBrush = remember(gradientColors) { Brush.linearGradient(gradientColors) }
     val context = LocalContext.current
 
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(cornerRadius))
-            .background(gradientBrush),
+            .background(Brush.linearGradient(gradientColors)),
         contentAlignment = Alignment.Center
     ) {
         when (validCovers.size) {
@@ -221,80 +282,67 @@ fun MosaicArtworkCollage(
                 )
             }
             1 -> {
+                val c0 = validCovers[0]
                 AsyncImage(
-                    model = remember(validCovers[0]) {
-                        ImageRequest.Builder(context)
-                            .data(validCovers[0])
-                            .size(200, 200)
-                            .crossfade(false)
-                            .build()
+                    model = remember(c0) {
+                        buildMusicImageRequest(context, c0, 200, 200)
                     },
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
+                    onError = { failedUrls = failedUrls + c0 },
                     modifier = Modifier.fillMaxSize()
                 )
             }
             else -> {
+                val c0 = validCovers[0]
+                val c1 = validCovers.getOrElse(1) { c0 }
+                val c2 = validCovers.getOrElse(2) { c0 }
+                val c3 = validCovers.getOrElse(3) { c1 }
                 Column(modifier = Modifier.fillMaxSize()) {
                     Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
                         Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
                             AsyncImage(
-                                model = remember(validCovers[0]) {
-                                    ImageRequest.Builder(context)
-                                        .data(validCovers[0])
-                                        .size(100, 100)
-                                        .crossfade(false)
-                                        .build()
+                                model = remember(c0) {
+                                    buildMusicImageRequest(context, c0, 120, 120)
                                 },
                                 contentDescription = null,
                                 contentScale = ContentScale.Crop,
+                                onError = { failedUrls = failedUrls + c0 },
                                 modifier = Modifier.fillMaxSize()
                             )
                         }
                         Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                            val c1 = validCovers.getOrElse(1) { validCovers[0] }
                             AsyncImage(
                                 model = remember(c1) {
-                                    ImageRequest.Builder(context)
-                                        .data(c1)
-                                        .size(100, 100)
-                                        .crossfade(false)
-                                        .build()
+                                    buildMusicImageRequest(context, c1, 120, 120)
                                 },
                                 contentDescription = null,
                                 contentScale = ContentScale.Crop,
+                                onError = { failedUrls = failedUrls + c1 },
                                 modifier = Modifier.fillMaxSize()
                             )
                         }
                     }
                     Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
                         Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                            val c2 = validCovers.getOrElse(2) { validCovers[0] }
                             AsyncImage(
                                 model = remember(c2) {
-                                    ImageRequest.Builder(context)
-                                        .data(c2)
-                                        .size(100, 100)
-                                        .crossfade(false)
-                                        .build()
+                                    buildMusicImageRequest(context, c2, 120, 120)
                                 },
                                 contentDescription = null,
                                 contentScale = ContentScale.Crop,
+                                onError = { failedUrls = failedUrls + c2 },
                                 modifier = Modifier.fillMaxSize()
                             )
                         }
                         Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                            val c3 = validCovers.getOrElse(3) { validCovers.getOrElse(1) { validCovers[0] } }
                             AsyncImage(
                                 model = remember(c3) {
-                                    ImageRequest.Builder(context)
-                                        .data(c3)
-                                        .size(100, 100)
-                                        .crossfade(false)
-                                        .build()
+                                    buildMusicImageRequest(context, c3, 120, 120)
                                 },
                                 contentDescription = null,
                                 contentScale = ContentScale.Crop,
+                                onError = { failedUrls = failedUrls + c3 },
                                 modifier = Modifier.fillMaxSize()
                             )
                         }
@@ -310,11 +358,10 @@ fun DefaultMusicPlaceholder(
     colors: List<Color>,
     modifier: Modifier = Modifier
 ) {
-    val brush = remember(colors) { Brush.linearGradient(colors) }
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(brush),
+            .background(Brush.linearGradient(colors)),
         contentAlignment = Alignment.Center
     ) {
         Icon(

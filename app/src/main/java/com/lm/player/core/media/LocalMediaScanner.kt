@@ -22,6 +22,56 @@ import java.io.File
 
 object LocalMediaScanner {
 
+    fun generateDeterministicLocalSongId(filePath: String): String {
+        val clean = try {
+            File(filePath).canonicalPath.replace('\\', '/').trim().lowercase()
+        } catch (_: Exception) {
+            File(filePath).absolutePath.replace('\\', '/').trim().lowercase()
+        }
+        return "local_file_${LemonMusicProtocol.md5(clean)}"
+    }
+
+    suspend fun cleanupDuplicateLocalSongs(database: ZdsDatabase): Int = withContext(Dispatchers.IO) {
+        try {
+            val allSongs = database.songDao().getAllSongsList()
+            val toDelete = mutableListOf<String>()
+            val byPath = HashMap<String, MutableList<SongEntity>>()
+            for (song in allSongs) {
+                val p = song.localFilePath?.trim()?.replace('\\', '/')?.lowercase()
+                if (!p.isNullOrBlank()) {
+                    byPath.getOrPut(p) { mutableListOf() }.add(song)
+                }
+            }
+            for ((_, list) in byPath) {
+                if (list.size > 1) {
+                    val serverSong = list.firstOrNull { it.serverId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online") }
+                    if (serverSong != null) {
+                        for (other in list) {
+                            if (other.id != serverSong.id) toDelete.add(other.id)
+                        }
+                    } else {
+                        val sorted = list.sortedByDescending { it.addedTimestamp }
+                        for (i in 1 until sorted.size) {
+                            toDelete.add(sorted[i].id)
+                        }
+                    }
+                }
+            }
+            if (toDelete.isNotEmpty()) {
+                val distinctIds = toDelete.distinct()
+                distinctIds.chunked(500).forEach { chunk ->
+                    database.songDao().deleteSongsByIds(chunk)
+                }
+                Log.i(TAG, "cleanupDuplicateLocalSongs: Deleted ${distinctIds.size} duplicate local song entries.")
+                return@withContext distinctIds.size
+            }
+            0
+        } catch (e: Exception) {
+            Log.w(TAG, "cleanupDuplicateLocalSongs failed: ${e.message}")
+            0
+        }
+    }
+
     /**
      * 解析需要扫描的 MediaStore 音频卷 URI 列表。
      *
@@ -41,11 +91,41 @@ object LocalMediaScanner {
     }
 
     private const val TAG = "LocalMediaScanner"
-    private val AUDIO_EXTENSIONS = setOf("mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "ape", "dsd")
+    private val AUDIO_EXTENSIONS = setOf("mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "ape", "dsd", "dsf", "dff", "alac", "wma")
 
     /**
      * 1. 一键全盘扫描系统 MediaStore 音频数据库
      */
+    
+    /**
+     * 自动探测车机与电视上所有已挂载的存储卷 (机身存储 + 外接 U 盘 / SD 卡) 的音乐扫描候选路径
+     */
+    fun detectMountedScanDirs(context: Context): List<String> {
+        val result = LinkedHashSet<String>()
+        result.add("/storage/emulated/0/Music")
+        result.add("/storage/emulated/0/Download")
+        try {
+            val volumes = com.lm.player.core.util.StorageVolumeHelper.getMountedVolumes(context)
+            for (vol in volumes) {
+                if (vol.isRemovable && vol.path.isNotBlank()) {
+                    val root = File(vol.path)
+                    if (root.exists() && root.isDirectory) {
+                        result.add(root.absolutePath)
+                        listOf("Music", "Audio", "Songs", "Download", "无损音乐", "本地音乐").forEach { sub ->
+                            val subDir = File(root, sub)
+                            if (subDir.exists() && subDir.isDirectory) {
+                                result.add(subDir.absolutePath)
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "detectMountedScanDirs exception: ${e.message}")
+        }
+        return result.toList()
+    }
+
     suspend fun scanSystemMediaStore(context: Context, database: ZdsDatabase): Int = withContext(Dispatchers.IO) {
         var count = 0
         try {
@@ -60,7 +140,7 @@ object LocalMediaScanner {
                 MediaStore.Audio.Media.SIZE
             )
 
-            val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0 AND ${MediaStore.Audio.Media.DURATION} >= 10000"
+            val selection = "${MediaStore.Audio.Media.DURATION} >= 1000"
             val sortOrder = "${MediaStore.Audio.Media.TITLE} ASC"
 
             // 遍历**全部外部卷**（内置存储 + SD 卡 + U 盘/移动硬盘）：此前只查
@@ -112,7 +192,7 @@ object LocalMediaScanner {
                                 file.nameWithoutExtension
                             )
                             val ext = file.extension.lowercase().ifBlank { "mp3" }
-                            val songId = "local_media_${id}"
+                            val songId = generateDeterministicLocalSongId(path)
 
                             // 提取并持久化内嵌高清专辑封面 (优先从音频文件 ID3/FLAC tag 中提取，次选 MediaStore)
                             var coverUrl = extractAndCacheArtwork(context, path, songId, metadataRetriever)
@@ -178,7 +258,7 @@ object LocalMediaScanner {
                         collectAudioFiles(file)
                     } else if (file.isFile) {
                         val ext = file.extension.lowercase()
-                        if (ext in AUDIO_EXTENSIONS && file.length() > 50 * 1024) { // 过滤小于50KB短音效
+                        if (ext in AUDIO_EXTENSIONS && file.length() > 1024) { // 过滤小于50KB短音效
                             audioFiles.add(file)
                         }
                     }
@@ -201,7 +281,7 @@ object LocalMediaScanner {
                     val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                     val durationMs = durationStr?.toLongOrNull() ?: 0L
                     val ext = file.extension.lowercase().ifBlank { "flac" }
-                    val songId = "local_dir_${LemonMusicProtocol.md5(file.absolutePath)}"
+                    val songId = generateDeterministicLocalSongId(file.absolutePath)
 
                     // 提取并保存内嵌专辑封面
                     val coverUrl = extractAndCacheArtwork(context, file.absolutePath, songId, retriever)
@@ -279,7 +359,7 @@ object LocalMediaScanner {
                             val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                             val durationMs = durationStr?.toLongOrNull() ?: 0L
                             val ext = file.extension.lowercase().ifBlank { "mp3" }
-                            val songId = "local_dir_${LemonMusicProtocol.md5(file.absolutePath)}"
+                            val songId = generateDeterministicLocalSongId(file.absolutePath)
                             val parentDir = file.parentFile?.absolutePath ?: customFolderPath
 
                             val coverUrl = extractAndCacheArtwork(context, file.absolutePath, songId, retriever)
@@ -350,7 +430,7 @@ object LocalMediaScanner {
                             val file = File(path)
                             val title = SongMatchingResolver.enrichTitleWithEdition(rawTitle, file.nameWithoutExtension)
                             val ext = file.extension.lowercase().ifBlank { "mp3" }
-                            val songId = "local_media_${id}"
+                            val songId = generateDeterministicLocalSongId(path)
                             val parentDir = file.parentFile?.absolutePath ?: "/storage/emulated/0/Music"
 
                             // 高性能封面：优先使用 MediaStore 系统内置 albumart 协议，避免阻塞式逐文件 I/O 写入
@@ -408,7 +488,7 @@ object LocalMediaScanner {
                                         val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                                         val durationMs = durationStr?.toLongOrNull() ?: 0L
                                         val ext = f.extension.lowercase().ifBlank { "mp3" }
-                                        val songId = "local_dir_${LemonMusicProtocol.md5(f.absolutePath)}"
+                                        val songId = generateDeterministicLocalSongId(f.absolutePath)
                                         val parentDir = f.parentFile?.absolutePath ?: cand.absolutePath
 
                                         val coverUrl = extractAndCacheArtwork(context, f.absolutePath, songId, retriever)
@@ -516,7 +596,7 @@ object LocalMediaScanner {
                 for (file in files) {
                     if (file.isDirectory && !file.name.orEmpty().startsWith(".")) {
                         pendingDirs.addLast(file)
-                    } else if (file.isFile && file.length() > 50 * 1024) {
+                    } else if (file.isFile && file.length() > 1024) {
                         val name = file.name.orEmpty()
                         val ext = name.substringAfterLast('.', "").lowercase()
                         if (ext in AUDIO_EXTENSIONS) {

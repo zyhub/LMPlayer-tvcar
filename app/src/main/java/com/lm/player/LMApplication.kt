@@ -70,13 +70,13 @@ class LMApplication : Application(), ImageLoaderFactory {
      * 针对电视大屏与机顶盒调优的高性能低显存 Coil 图像加载器
      */
     override fun newImageLoader(): ImageLoader {
-        val okHttpClient = NetworkClientFactory.createOkHttpClient(this)
+        val okHttpClient = NetworkClientFactory.createImageOkHttpClient(this)
         return ImageLoader.Builder(this)
             .okHttpClient(okHttpClient)
             .crossfade(false) // 关闭多余淡入淡出动画，换取极致流畅与零掉帧
             .memoryCache {
                 MemoryCache.Builder(this)
-                    .maxSizePercent(0.14)
+                    .maxSizePercent(0.20)
                     .strongReferencesEnabled(true)
                     .build()
             }

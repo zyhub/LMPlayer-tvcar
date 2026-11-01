@@ -377,14 +377,17 @@ fun SongListItemRow(
                     )
                 )
                 Spacer(modifier = Modifier.height(2.dp))
+                val isHiresLocal = song.isHiRes || (isLosslessLocal && realBitRate >= 1200) || (song.sampleRate ?: 0) >= 48000 || (song.bitDepth ?: 0) >= 24
+                val badgeColor = if (isHiresLocal) Color(0xFFFFB300) else Color(0xFF34C759)
+                val badgeText = if (isHiresLocal) "Hi-Res" else if (isLosslessLocal) "无损" else "已离线"
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Surface(
                         shape = RoundedCornerShape(4.dp),
-                        color = Color(0xFF34C759).copy(alpha = 0.14f)
+                        color = badgeColor.copy(alpha = 0.18f)
                     ) {
                         Text(
-                            text = if (isLosslessLocal && realBitRate >= 1200) "Hi-Res" else if (isLosslessLocal) "无损" else "已离线",
-                            color = Color(0xFF34C759),
+                            text = badgeText,
+                            color = badgeColor,
                             fontSize = dimensions.badgeSize,
                             fontWeight = FontWeight.Bold,
                             modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
@@ -395,22 +398,39 @@ fun SongListItemRow(
                         // 复用本行上面已经 remember 过的三元组，避免重复 stat 与二次开文件读魔数
                         text = formatDownloadedSongSpecs(realFormatStr, realBitRate, realSizeStr),
                         fontSize = dimensions.badgeSize,
-                        color = Color(0xFF34C759),
+                        color = badgeColor,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                 }
             } else {
-                Text(
-                    text = "${song.artist} • ${if (song.album.isNotBlank()) song.album else "单曲"} ($onlineStreamQualityTag)",
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    style = TextStyle(
-                        fontSize = dimensions.captionSize,
-                        fontWeight = FontWeight.Normal,
-                        color = if (isCurrentPlaying) AppleRed.copy(alpha = 0.85f) else MaterialTheme.colorScheme.onSurfaceVariant
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (song.isHiRes) {
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = Color(0xFFFFB300).copy(alpha = 0.18f)
+                        ) {
+                            Text(
+                                text = "Hi-Res",
+                                color = Color(0xFFFFB300),
+                                fontSize = dimensions.badgeSize,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(5.dp))
+                    }
+                    Text(
+                        text = "${song.artist} • ${if (song.album.isNotBlank()) song.album else "单曲"} ($onlineStreamQualityTag)",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        style = TextStyle(
+                            fontSize = dimensions.captionSize,
+                            fontWeight = FontWeight.Normal,
+                            color = if (isCurrentPlaying) AppleRed.copy(alpha = 0.85f) else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     )
-                )
+                }
             }
         }
 
@@ -556,13 +576,28 @@ fun LocalMusicHomeScreen(
     }
     val isOnlineConnected = activeLemonServer != null
 
-    // 本地已下载/缓存的歌曲列表
+    // 本地已下载/缓存的歌曲列表 (严格按路径去重)
     val localDownloadedSongs = remember(recentSongs) {
-        recentSongs.filter {
+        val raw = recentSongs.filter {
             val hasValidFile = !it.localFilePath.isNullOrBlank()
             (it.downloadStatus == DownloadStatus.DOWNLOADED && hasValidFile) ||
                 (it.serverId in listOf("local_storage", "local_saf", "local_folder") && hasValidFile)
         }
+        val byPath = LinkedHashMap<String, UnifiedSong>(raw.size)
+        for (s in raw) {
+            val p = s.localFilePath?.trim()?.replace('\\', '/')?.lowercase() ?: "id:${s.id}"
+            val existing = byPath[p]
+            if (existing == null) {
+                byPath[p] = s
+            } else {
+                val existingIsLocalOnly = existing.serverId in listOf("local_storage", "local_saf", "local_folder")
+                val incomingIsServer = s.serverId !in listOf("local_storage", "local_saf", "local_folder")
+                if (existingIsLocalOnly && incomingIsServer) {
+                    byPath[p] = s
+                }
+            }
+        }
+        byPath.values.distinctBy { it.id }
     }
 
     // 云端资料库歌曲数量

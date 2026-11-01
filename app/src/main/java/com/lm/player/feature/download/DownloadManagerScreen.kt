@@ -84,6 +84,7 @@ fun DownloadManagerScreen(
     var serverDownloads by remember { mutableStateOf<List<LemonServerDownloadTaskRecord>>(emptyList()) }
     var isServerLoading by remember { mutableStateOf(false) }
     var taskPendingDelete by remember { mutableStateOf<LemonServerDownloadTaskRecord?>(null) }
+    var taskPendingConfirm by remember { mutableStateOf<LemonServerDownloadTaskRecord?>(null) }
     val coroutineScope = rememberCoroutineScope()
 
     val refreshServerDownloads: () -> Unit = {
@@ -99,9 +100,16 @@ fun DownloadManagerScreen(
         refreshServerDownloads()
     }
 
-    LaunchedEffect(selectedTab) {
+    LaunchedEffect(selectedTab, serverDownloads) {
         if (selectedTab == 1) {
-            refreshServerDownloads()
+            val hasActiveTasks = serverDownloads.any {
+                val s = it.status.lowercase()
+                s == "downloading" || s == "pending" || s == "running"
+            }
+            if (hasActiveTasks) {
+                kotlinx.coroutines.delay(3000L)
+                refreshServerDownloads()
+            }
         }
     }
     var isMultiSelectMode by remember { mutableStateOf(false) }
@@ -517,6 +525,7 @@ fun DownloadManagerScreen(
                     isLoading = isServerLoading,
                     onRefresh = { refreshServerDownloads() },
                     onDeleteTask = { taskPendingDelete = it },
+                    onConfirmDowngrade = { taskPendingConfirm = it },
                     onClearCompleted = {
                         coroutineScope.launch {
                             LemonMusicProtocol.clearCompletedServerDownloads(context)
@@ -960,6 +969,83 @@ fun DownloadManagerScreen(
                     modifier = Modifier.tvButtonFocusable(shape = RoundedCornerShape(10.dp))
                 ) {
                     Text("取消")
+                }
+            }
+        )
+    }
+
+    // 6.0 假无损拦截/换源降级决策弹窗
+    if (taskPendingConfirm != null) {
+        val targetTask = taskPendingConfirm!!
+        AlertDialog(
+            onDismissRequest = { taskPendingConfirm = null },
+            title = {
+                Text("音质校验与换源决策", fontWeight = FontWeight.Bold)
+            },
+            text = {
+                Column {
+                    Text(
+                        text = "${targetTask.name} - ${targetTask.singer}",
+                        fontWeight = FontWeight.Bold,
+                        color = AppleRed
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "服务端检测到该曲目当前音源为假无损（或源文件失效），已智能暂停下载。请选择处理策略：",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val taskId = targetTask.id
+                        taskPendingConfirm = null
+                        coroutineScope.launch {
+                            LemonMusicProtocol.confirmDownloadDowngrade(taskId, "320k", context)
+                                .onSuccess {
+                                    Toast.makeText(context, "已确认降档为 320K 极高品质", Toast.LENGTH_SHORT).show()
+                                    refreshServerDownloads()
+                                }
+                                .onFailure {
+                                    Toast.makeText(context, "处理失败: ${it.message}", Toast.LENGTH_SHORT).show()
+                                }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                    modifier = Modifier.tvButtonFocusable(shape = RoundedCornerShape(10.dp))
+                ) {
+                    Text("✔ 确认降档 (320k)")
+                }
+            },
+            dismissButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedButton(
+                        onClick = {
+                            val taskId = targetTask.id
+                            taskPendingConfirm = null
+                            coroutineScope.launch {
+                                LemonMusicProtocol.confirmDownloadSource(taskId, "auto", context)
+                                    .onSuccess {
+                                        Toast.makeText(context, "已触发服务端自动换源重试", Toast.LENGTH_SHORT).show()
+                                        refreshServerDownloads()
+                                    }
+                                    .onFailure {
+                                        Toast.makeText(context, "换源重试失败: ${it.message}", Toast.LENGTH_SHORT).show()
+                                    }
+                            }
+                        },
+                        modifier = Modifier.tvButtonFocusable(shape = RoundedCornerShape(10.dp))
+                    ) {
+                        Text("换源重试")
+                    }
+                    TextButton(
+                        onClick = { taskPendingConfirm = null },
+                        modifier = Modifier.tvButtonFocusable(shape = RoundedCornerShape(10.dp))
+                    ) {
+                        Text("取消")
+                    }
                 }
             }
         )
@@ -1507,6 +1593,7 @@ private fun ServerDownloadTasksContent(
     isLoading: Boolean,
     onRefresh: () -> Unit,
     onDeleteTask: (LemonServerDownloadTaskRecord) -> Unit,
+    onConfirmDowngrade: (LemonServerDownloadTaskRecord) -> Unit = {},
     onClearCompleted: () -> Unit
 ) {
     if (isLoading && serverDownloads.isEmpty()) {
@@ -1610,7 +1697,8 @@ private fun ServerDownloadTasksContent(
                 ) { task ->
                     ServerDownloadTaskRow(
                         task = task,
-                        onDelete = { onDeleteTask(task) }
+                        onDelete = { onDeleteTask(task) },
+                        onConfirmDowngrade = { onConfirmDowngrade(task) }
                     )
                 }
             }
@@ -1621,7 +1709,8 @@ private fun ServerDownloadTasksContent(
 @Composable
 private fun ServerDownloadTaskRow(
     task: LemonServerDownloadTaskRecord,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    onConfirmDowngrade: () -> Unit = {}
 ) {
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val borderColor = if (isDark) Color.White.copy(alpha = 0.10f) else Color.Black.copy(alpha = 0.08f)
@@ -1651,7 +1740,15 @@ private fun ServerDownloadTaskRow(
         border = BorderStroke(1.dp, borderColor),
         modifier = Modifier
             .fillMaxWidth()
-            .tvFocusable(shape = RoundedCornerShape(14.dp), focusedScale = 1.015f, onClick = {})
+            .tvFocusable(
+                shape = RoundedCornerShape(14.dp),
+                focusedScale = 1.015f,
+                onClick = {
+                    if (task.status.lowercase() == "await_confirm") {
+                        onConfirmDowngrade()
+                    }
+                }
+            )
     ) {
         Column(modifier = Modifier.padding(14.dp)) {
             Row(

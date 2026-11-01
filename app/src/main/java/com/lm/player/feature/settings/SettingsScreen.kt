@@ -901,7 +901,16 @@ fun SettingsScreen(
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                             ) {
                                 Column(modifier = Modifier.padding(12.dp)) {
-                                    Text("当前本地离线保存路径", fontSize = dimensions.badgeSize, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("当前本地离线保存路径", fontSize = dimensions.badgeSize, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        if (downloadSettings.customDownloadTreeUri.isNotBlank() || downloadSettings.customDownloadPath.isNotBlank()) {
+                                            Text("写入状态正常", fontSize = dimensions.badgeSize, fontWeight = FontWeight.Bold, color = Color(0xFF34C759))
+                                        }
+                                    }
                                     Spacer(modifier = Modifier.height(2.dp))
                                     Text(
                                         text = downloadSettings.customDownloadPath.ifBlank { "默认应用私有目录 (/Music)" },
@@ -1007,8 +1016,12 @@ fun SettingsScreen(
                                                         Toast.makeText(context, "正在全盘及配置目录扫描音频并与服务器比对...", Toast.LENGTH_SHORT).show()
                                                     }
                                                     var totalScanned = 0
-                                                    // 1. 扫描配置目录
-                                                    for (path in localMusicPaths) {
+                                                    // 1. 自动聚合用户配置目录与所有探测到的外接 U 盘 / SD 卡目录
+                                                    val scanTargets = LinkedHashSet<String>()
+                                                    scanTargets.addAll(localMusicPaths)
+                                                    scanTargets.addAll(LocalMediaScanner.detectMountedScanDirs(context))
+
+                                                    for (path in scanTargets) {
                                                         if (java.io.File(path).exists()) {
                                                             totalScanned += LocalMediaScanner.scanCustomDirectory(context, path, database)
                                                         }
@@ -1940,25 +1953,12 @@ fun SettingsScreen(
                     )
                     Spacer(modifier = Modifier.height(14.dp))
 
-                    val mountedVolumes = remember { StorageVolumeHelper.getMountedVolumes(context) }
-                    val quickPresets = remember(mountedVolumes) {
+                    val quickPresets = remember {
                         val list = mutableListOf<String>()
-                        // 优先加入所有检测到的外接 U 盘 / SD 卡根目录及常见音乐子目录
-                        for (vol in mountedVolumes) {
-                            if (vol.isRemovable) {
-                                list.add(vol.path)
-                                val musicSub = File(vol.path, "Music")
-                                if (musicSub.exists()) {
-                                    list.add(musicSub.absolutePath)
-                                }
-                            }
-                        }
-                        // 默认内置存储路径
+                        list.addAll(LocalMediaScanner.detectMountedScanDirs(context))
                         list.add("/storage/emulated/0/Music")
                         list.add("/storage/emulated/0/Download")
                         list.add("/storage/emulated/0/Download/LMPlayer")
-                        list.add("/storage/emulated/0/Tencent/QQfile_recv")
-                        list.add("/storage/emulated/0/NetEase/CloudMusic")
                         list.distinct()
                     }
 
@@ -2074,7 +2074,17 @@ fun SettingsScreen(
                                     prefs.edit().putStringSet("local_music_scan_folders", HashSet(updated)).apply()
                                     showAddLocalPathDialog = false
                                     newLocalPathInput = ""
-                                    Toast.makeText(context, "已添加扫描目录: $path", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, "已添加扫描目录，正在即时扫描: $path", Toast.LENGTH_SHORT).show()
+                                    coroutineScope.launch {
+                                        val count = LocalMediaScanner.scanCustomDirectory(context, path, database)
+                                        val dlDir = java.io.File(downloadSettings.customDownloadPath.ifBlank { context.getExternalFilesDir(null)?.absolutePath ?: "" })
+                                        val matched = LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, dlDir)
+                                        LocalMediaScanner.matchAndMergeLocalWithServer(database)
+                                        withContext(Dispatchers.Main) {
+                                            Toast.makeText(context, "目录扫描完成：收录 $count 首，匹配 $matched 首已下载", Toast.LENGTH_LONG).show()
+                                            onLocalScanCompleted()
+                                        }
+                                    }
                                 }
                             },
                             shape = RoundedCornerShape(10.dp),

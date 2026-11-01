@@ -310,14 +310,19 @@ fun FullscreenPlayerSheet(
         song.id, song.format, song.bitRate, song.durationMs, song.serverId, song.streamUrl, isLocalOffline, realExt, realBitRate, realSizeStr, streamQuality
     ) {
         if (isLocalOffline) {
-            val isLossless = realExt in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF") || realBitRate >= 800
+            val isLossless = realExt in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF") || realBitRate >= 800 || song.isHiRes
+            val isHires = song.isHiRes || (isLossless && realBitRate >= 1200) || (song.sampleRate ?: 0) >= 48000 || (song.bitDepth ?: 0) >= 24
             val qLabel = when {
-                isLossless && realBitRate >= 1200 -> "Hi-Res $realExt"
+                isHires -> "Hi-Res $realExt"
                 isLossless -> "无损 $realExt"
                 realBitRate >= 256 -> "高品质 $realExt"
                 else -> "标准 $realExt"
             }
-            val bLabel = "${realBitRate.coerceAtLeast(128)} kbps"
+            val bLabel = if (song.bitDepth != null && song.sampleRate != null) {
+                "${song.bitDepth}bit/${song.sampleRate!! / 1000}kHz ${realBitRate.coerceAtLeast(128)} kbps"
+            } else {
+                "${realBitRate.coerceAtLeast(128)} kbps"
+            }
             val sLabel = realSizeStr.ifBlank {
                 AudioQuality.fromKey(if (isLossless) "flac" else "320k").estimateSizeText(song)
             }
@@ -328,21 +333,31 @@ fun FullscreenPlayerSheet(
                 song.streamUrl.startsWith("lemon_online://") ||
                 song.streamUrl.contains("/api/play/proxy")
             if (isOnlineTrial) {
-                val qLabel = "${streamQuality.badge} ${streamQuality.format.uppercase()}"
-                val bLabel = "${streamQuality.bitrate} kbps"
+                val isHires = song.isHiRes || streamQuality == AudioQuality.Q_HIRES
+                val qLabel = if (isHires) "Hi-Res ${streamQuality.format.uppercase()}" else "${streamQuality.badge} ${streamQuality.format.uppercase()}"
+                val bLabel = if (song.bitDepth != null && song.sampleRate != null) {
+                    "${song.bitDepth}bit/${song.sampleRate!! / 1000}kHz ${streamQuality.bitrate} kbps"
+                } else {
+                    "${streamQuality.bitrate} kbps"
+                }
                 val sLabel = streamQuality.estimateSizeText(song)
                 Triple(qLabel, bLabel, sLabel)
             } else {
                 val fmt = song.format.uppercase().ifBlank { "FLAC" }
-                val isLossless = fmt in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF") || song.bitRate >= 800
-                val br = if (song.bitRate > 0) song.bitRate else if (isLossless) 960 else 320
+                val isLossless = fmt in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF") || song.bitRate >= 800 || song.isHiRes
+                val isHires = song.isHiRes || (isLossless && song.bitRate >= 1200) || (song.sampleRate ?: 0) >= 48000 || (song.bitDepth ?: 0) >= 24
+                val br = if (song.bitRate > 0) song.bitRate else if (isHires) 1640 else if (isLossless) 960 else 320
                 val qLabel = when {
-                    isLossless && br >= 1200 -> "Hi-Res $fmt"
+                    isHires -> "Hi-Res $fmt"
                     isLossless -> "无损 $fmt"
                     br >= 256 -> "高品质 $fmt"
                     else -> "标准 $fmt"
                 }
-                val bLabel = "$br kbps"
+                val bLabel = if (song.bitDepth != null && song.sampleRate != null) {
+                    "${song.bitDepth}bit/${song.sampleRate!! / 1000}kHz $br kbps"
+                } else {
+                    "$br kbps"
+                }
                 val durSec = (song.durationMs / 1000L).coerceIn(30L, 3600L)
                 val mb = (durSec * br * 1000.0) / 8.0 / (1024.0 * 1024.0)
                 val sLabel = String.format(java.util.Locale.US, "%.1f MB", mb)
@@ -1768,17 +1783,19 @@ fun FullscreenPlayerSheet(
                                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    // 标签 1：音质 (如 无损 FLAC / Hi-Res FLAC) —— 统一淡黄
+                                    // 标签 1：音质 (如 无损 FLAC / Hi-Res FLAC) —— Hi-Res 专属金黄，普通淡黄
+                                    val isHiresBadge = displayQualityBadge.contains("Hi-Res") || song.isHiRes
+                                    val qBadgeColor = if (isHiresBadge) Color(0xFFFFD700) else SpecBadgeQualityColor
                                     Surface(
                                         shape = RoundedCornerShape(6.dp),
-                                        color = specBadgeContainer(SpecBadgeQualityColor),
-                                        border = BorderStroke(0.8.dp, specBadgeBorder(SpecBadgeQualityColor))
+                                        color = if (isHiresBadge) Color(0xFFFFD700).copy(alpha = 0.22f) else specBadgeContainer(SpecBadgeQualityColor),
+                                        border = BorderStroke(if (isHiresBadge) 1.dp else 0.8.dp, if (isHiresBadge) Color(0xFFFFD700).copy(alpha = 0.6f) else specBadgeBorder(SpecBadgeQualityColor))
                                     ) {
                                         Text(
                                             text = displayQualityBadge,
                                             fontSize = 10.5.sp,
                                             fontWeight = FontWeight.ExtraBold,
-                                            color = SpecBadgeQualityColor,
+                                            color = qBadgeColor,
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis,
                                             modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
@@ -3125,8 +3142,9 @@ fun AudioSpecsDropdownMenu(
             else -> com.lm.player.feature.home.resolveRealLocalFormatAndSize(song)
         }
     }
-    val isLossless = formatStr in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF") || effectiveBitRate >= 800
-    val qualityTag = if (isLossless) "Hi-Res 无损母带" else if (effectiveBitRate >= 320) "极高品质音频" else "标准音频"
+    val isLossless = formatStr in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF") || effectiveBitRate >= 800 || song.isHiRes
+    val isHires = song.isHiRes || (isLossless && effectiveBitRate >= 1200) || (song.sampleRate ?: 0) >= 48000 || (song.bitDepth ?: 0) >= 24
+    val qualityTag = if (isHires) "Hi-Res 无损母带" else if (isLossless) "无损高品质" else if (effectiveBitRate >= 320) "极高品质音频" else "标准音频"
 
     val locationText: String = if (isLocal && !song.localFilePath.isNullOrBlank()) {
         val f = java.io.File(song.localFilePath)
@@ -3231,7 +3249,12 @@ fun AudioSpecsDropdownMenu(
             if (isOnlineSong) {
                 SpecRowItem("解析来源", "$sourceName / ${platformName}解析", isBold = true, valueColor = AppleRed)
             }
-            SpecRowItem("音质等级", qualityTag, valueColor = if (isLossless) Color(0xFFD4AF37) else AppleRed)
+            SpecRowItem("音质等级", qualityTag, valueColor = if (isHires || isLossless) Color(0xFFD4AF37) else AppleRed)
+            if (song.bitDepth != null || song.sampleRate != null) {
+                val depth = song.bitDepth ?: 24
+                val rateKhz = (song.sampleRate ?: 96000) / 1000
+                SpecRowItem("声学精度", "${depth}bit / ${rateKhz}kHz", isBold = true, valueColor = Color(0xFFFFD700))
+            }
             SpecRowItem("编码格式", formatStr, isBold = true)
             SpecRowItem("音频码率", "$effectiveBitRate kbps")
             SpecRowItem("文件大小", sizeText, isBold = true, valueColor = AppleRed)

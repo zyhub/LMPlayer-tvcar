@@ -42,6 +42,23 @@ data class ServerLibraryTrack(
     val format: String
 )
 
+data class ServerPathConfig(
+    val downloadPath: String = "",
+    val availablePaths: List<String> = emptyList()
+)
+
+private fun JSONObject.optCleanString(vararg keys: String): String {
+    for (key in keys) {
+        val v = opt(key)
+        if (v == null || v == JSONObject.NULL) continue
+        val s = v.toString().trim()
+        if (s.isNotBlank() && !s.equals("null", ignoreCase = true) && !s.equals("undefined", ignoreCase = true)) {
+            return s
+        }
+    }
+    return ""
+}
+
 class LemonMusicProtocol(
     private val client: OkHttpClient,
     private val serverUrl: String,
@@ -151,6 +168,110 @@ class LemonMusicProtocol(
             }
             return Result.failure(Exception("服务器未连接"))
         }
+
+        suspend fun fetchDailyMix(context: Context? = null, forceRefresh: Boolean = false): Result<com.lm.player.core.model.DailyMixState> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.fetchDailyMix(forceRefresh = forceRefresh, context = context)
+            }
+            val todayStr = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.getDefault()).format(java.util.Date())
+            val prefs = context?.getSharedPreferences("lemon_daily_mix_quota", Context.MODE_PRIVATE)
+            val quotaKey = "quota_used_$todayStr"
+            var usedToday = prefs?.getInt(quotaKey, 0) ?: 0
+            if (forceRefresh) {
+                usedToday = (usedToday + 1).coerceAtMost(20)
+                prefs?.edit()?.putInt(quotaKey, usedToday)?.apply()
+            }
+            val remaining = (20 - usedToday).coerceIn(0, 20)
+            return Result.success(com.lm.player.core.model.DailyMixState(remainingRefreshes = remaining, maxRefreshes = 20, songs = emptyList()))
+        }
+
+        fun getLocalListeningStats(context: Context?): com.lm.player.core.model.UserListeningStats {
+            if (context == null) return com.lm.player.core.model.UserListeningStats()
+            val prefs = context.getSharedPreferences("lemon_listening_stats", Context.MODE_PRIVATE)
+            val todayKey = "today_listen_seconds_" + java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.getDefault()).format(java.util.Date())
+            val totalSec = prefs.getLong("total_listen_seconds", 0L)
+            val todaySec = prefs.getLong(todayKey, 0L)
+            val totalPlays = prefs.getInt("total_play_count", 0)
+            val todayMin = (todaySec / 60).toInt()
+            val formatted = when {
+                totalSec >= 3600 -> "累计 " + String.format(java.util.Locale.getDefault(), "%.1f", totalSec / 3600.0) + " 小时"
+                totalSec >= 60 -> "今日 ${todaySec / 60} 分钟"
+                totalPlays > 0 -> "已听 ${totalPlays} 首"
+                else -> "累计 0 小时"
+            }
+            val desc = if (totalPlays > 0) "已听 ${totalPlays} 首" else "享受美好音乐"
+            return com.lm.player.core.model.UserListeningStats(
+                totalSeconds = totalSec,
+                totalPlays = totalPlays,
+                todayMinutes = todayMin,
+                formattedDuration = formatted,
+                description = desc
+            )
+        }
+
+        suspend fun fetchListeningStats(context: Context? = null): com.lm.player.core.model.UserListeningStats {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            return proto?.fetchListeningStats(context) ?: getLocalListeningStats(context)
+        }
+
+        suspend fun saveDailyMixAsPlaylist(title: String, songIds: List<String>, context: Context? = null): Result<Boolean> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.saveDailyMixAsPlaylist(title, songIds)
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
+        suspend fun confirmDownloadDowngrade(taskId: String, acceptedQuality: String, context: Context? = null): Result<Boolean> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.confirmDownloadDowngrade(taskId, acceptedQuality)
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
+        suspend fun checkLibrarySyncState(context: Context? = null): Result<JSONObject> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.checkLibrarySyncState()
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
+        suspend fun confirmDownloadSource(taskId: String, source: String, context: Context? = null): Result<Boolean> {
+            val proto = activeInstance ?: context?.let { getActiveOrNew(it) }
+            if (proto != null) {
+                return proto.confirmDownloadSource(taskId, source)
+            }
+            return Result.failure(Exception("服务器未连接"))
+        }
+
+        private val songIdHasEmbeddedCoverMap = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+        private val songIdResolvedCoverMap = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+        fun registerResolvedCover(songId: String, coverUrl: String) {
+            val clean = coverUrl.trim()
+            if (songId.isBlank() || clean.isBlank() || clean.contains("/api/tag/cover")) return
+            songIdResolvedCoverMap[songId] = clean
+            songIdToSongMap[songId]?.let { existing ->
+                if (existing.coverUrl.isBlank() || existing.coverUrl.contains("/api/tag/cover")) {
+                    songIdToSongMap[songId] = existing.copy(coverUrl = clean)
+                }
+            }
+        }
+
+        fun getResolvedCover(songId: String): String? = songIdResolvedCoverMap[songId]?.takeIf { it.isNotBlank() }
+
+        fun isKnownMissingEmbeddedCoverUrl(url: String?): Boolean {
+            if (url.isNullOrBlank()) return true
+            if (!url.contains("/api/tag/cover")) return false
+            val path = getServerFilePath("", coverUrl = url)?.removePrefix("local:")?.trim().orEmpty()
+            if (path.isBlank()) return false
+            val songId = "lemon_${md5(path)}"
+            return songIdHasEmbeddedCoverMap[songId] == false
+        }
+
 
         // 跨实例共享的已认证 Bearer Token 缓存 (消除多组件并发实例化时的重复 /api/auth/login 请求)
         private val sharedAuthTokens = ConcurrentHashMap<String, String>()
@@ -2297,6 +2418,10 @@ class LemonMusicProtocol(
     /**
      * 获取指定路径的内嵌专辑封面图链接
      */
+    private fun resolveCoverArtUrlForLocalPath(path: String, fallback: String = ""): String {
+        return if (fallback.isNotBlank()) fallback else getCoverArtUrlForPath(path)
+    }
+
     fun getCoverArtUrlForPath(path: String): String {
         if (path.isBlank()) return ""
         val cleanPath = path.removePrefix("local:").trim()
@@ -4690,12 +4815,259 @@ class LemonMusicProtocol(
             Result.failure(e)
         }
     }
-}
 
-/**
- * 柠檬音乐服务端路径配置模型
- */
-data class ServerPathConfig(
-    val downloadPath: String = "",
-    val availablePaths: List<String> = emptyList()
-)
+    // ==================== 每日推荐 (Daily Mix 50% 本地 + 50% 在线探索) ====================
+
+    suspend fun fetchDailyMix(forceRefresh: Boolean = false, context: Context? = null): Result<com.lm.player.core.model.DailyMixState> = withContext(Dispatchers.IO) {
+        try {
+            val todayStr = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.getDefault()).format(java.util.Date())
+            val prefs = context?.getSharedPreferences("lemon_daily_mix_quota", Context.MODE_PRIVATE)
+            val quotaKey = "quota_used_$todayStr"
+            var usedToday = prefs?.getInt(quotaKey, 0) ?: 0
+            if (forceRefresh) {
+                usedToday = (usedToday + 1).coerceAtMost(20)
+                prefs?.edit()?.putInt(quotaKey, usedToday)?.apply()
+            }
+            val localRemaining = (20 - usedToday).coerceIn(0, 20)
+
+            ensureAuthenticatedOrThrow()
+            val urlV1 = "$cleanBase/api/v1/recommend/daily-mix?force=${if (forceRefresh) "1" else "0"}"
+            val req = newAuthRequest(urlV1).get().build()
+            val resp = runCatching { client.newCall(req).execute() }.getOrNull()
+            if (resp != null && resp.isSuccessful) {
+                val body = resp.body?.string() ?: "{}"
+                val json = JSONObject(body)
+                val dataObj = json.optJSONObject("data") ?: json
+                val serverRemaining = dataObj.optInt("remaining", localRemaining)
+                val maxRefreshes = dataObj.optInt("max", 20)
+                val effectiveRemaining = if (usedToday > 0) minOf(serverRemaining, localRemaining) else serverRemaining
+                val arr = dataObj.optJSONArray("list") ?: dataObj.optJSONArray("tracks") ?: JSONArray()
+                val songs = mutableListOf<UnifiedSong>()
+                for (i in 0 until arr.length()) {
+                    val item = arr.optJSONObject(i) ?: continue
+                    val path = item.optString("filePath")
+                    val sId = if (path.isNotBlank()) "lemon_${md5(path)}" else item.optString("id", "mix_$i")
+                    val s = UnifiedSong(
+                        id = sId,
+                        title = item.optString("title", "未知曲目"),
+                        artist = item.optString("artist", "未知歌手"),
+                        album = item.optString("album", "每日推荐"),
+                        durationMs = normalizeNumericDurationMs(item.optDouble("duration", 0.0)),
+                        coverUrl = if (path.isNotBlank()) {
+                            resolveCoverArtUrlForLocalPath(path)
+                        } else {
+                            val rawC = item.optCleanString("coverUrl", "cover", "img", "pic", "picUrl", "albumPic", "albumpic")
+                            normalizeImageUrl(rawC, cleanBase)
+                        },
+                        streamUrl = if (path.isNotBlank()) getStreamUrlForPathWithPreferredQuality(path) else item.optString("streamUrl"),
+                        serverId = "lemon_music",
+                        format = item.optString("format", "flac"),
+                        bitRate = item.optInt("bitRate", 960),
+                        trackId = item.optString("trackId").ifBlank { null }
+                    )
+                    songs.add(s)
+                }
+                resp.close()
+                return@withContext Result.success(com.lm.player.core.model.DailyMixState(remainingRefreshes = effectiveRemaining, maxRefreshes = maxRefreshes, songs = songs))
+            }
+            resp?.close()
+
+            // 兜底降级：从曲库 + 在线热门组装 50% 本地 + 50% 在线 Daily Mix
+            val localSongsResult = getSongList(0, 50)
+            val localPool = localSongsResult.getOrNull()?.shuffled()?.take(10) ?: emptyList()
+            val onlineResult = getDiscoverNewSongs("kw")
+            val onlinePool = onlineResult.getOrNull()?.shuffled()?.take(10) ?: emptyList()
+            val mixed = (localPool + onlinePool).shuffled()
+            Result.success(com.lm.player.core.model.DailyMixState(remainingRefreshes = localRemaining, maxRefreshes = 20, songs = mixed))
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "fetchDailyMix failed, using fallback mix", e)
+            val todayStr = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.getDefault()).format(java.util.Date())
+            val prefs = context?.getSharedPreferences("lemon_daily_mix_quota", Context.MODE_PRIVATE)
+            val quotaKey = "quota_used_$todayStr"
+            val usedToday = prefs?.getInt(quotaKey, 0) ?: 0
+            val localRemaining = (20 - usedToday).coerceIn(0, 20)
+            Result.success(com.lm.player.core.model.DailyMixState(remainingRefreshes = localRemaining, songs = emptyList()))
+        }
+    }
+
+    suspend fun fetchListeningStats(context: Context? = null): com.lm.player.core.model.UserListeningStats = withContext(Dispatchers.IO) {
+        try {
+            var srvTotalSec = 0L
+            var srvPlayCount = 0
+            var recentPlaysCount = 0
+
+            // 1. 优先尝试从 /api/auth/me 获取用户基础听歌统计
+            runCatching {
+                val req = newAuthRequest("$cleanBase/api/auth/me").get().build()
+                client.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val body = resp.body?.string().orEmpty()
+                        val json = JSONObject(body)
+                        val userObj = json.optJSONObject("user") ?: json
+                        srvTotalSec = userObj.optLong("playTime", userObj.optLong("listenDuration", userObj.optLong("totalPlayTime", 0L)))
+                        srvPlayCount = userObj.optInt("playCount", userObj.optInt("listenCount", 0))
+                    }
+                }
+            }
+
+            // 2. 尝试从 /api/library/user-data 获取 recentPlays 统计
+            runCatching {
+                val userData = getLibraryUserData().getOrNull()
+                if (userData != null) {
+                    if (srvTotalSec <= 0L) {
+                        srvTotalSec = userData.optLong("playTime", userData.optLong("listenDuration", 0L))
+                    }
+                    if (srvPlayCount <= 0) {
+                        srvPlayCount = userData.optInt("playCount", userData.optInt("listenCount", 0))
+                    }
+                    val recentArr = userData.optJSONArray("recentPlays") ?: userData.optJSONArray("recents")
+                    if (recentArr != null) {
+                        recentPlaysCount = recentArr.length()
+                        if (srvPlayCount <= 0) srvPlayCount = recentPlaysCount
+                    }
+                }
+            }
+
+            // 3. 读取本地持久化听歌统计并智能融合（取峰值，保证车机离线/在线均真实可用）
+            val localStats = getLocalListeningStats(context)
+            val finalSec = maxOf(srvTotalSec, localStats.totalSeconds)
+            val finalPlays = maxOf(srvPlayCount, localStats.totalPlays)
+            val todayMin = localStats.todayMinutes
+
+            val formatted = when {
+                finalSec >= 3600 -> "累计 " + String.format(java.util.Locale.getDefault(), "%.1f", finalSec / 3600.0) + " 小时"
+                finalSec >= 60 -> "今日 ${finalSec / 60} 分钟"
+                finalPlays > 0 -> "已听 ${finalPlays} 首"
+                recentPlaysCount > 0 -> "最近 ${recentPlaysCount} 首"
+                else -> "累计 0 小时"
+            }
+            val desc = if (finalPlays > 0) "已听 ${finalPlays} 首" else "享受美好音乐"
+
+            com.lm.player.core.model.UserListeningStats(
+                totalSeconds = finalSec,
+                totalPlays = finalPlays,
+                todayMinutes = todayMin,
+                formattedDuration = formatted,
+                description = desc
+            )
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            getLocalListeningStats(context)
+        }
+    }
+
+    suspend fun saveDailyMixAsPlaylist(title: String, songIds: List<String>): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val payload = JSONObject().apply {
+                put("name", title)
+                put("tracks", JSONArray(songIds))
+            }
+            val req = newAuthRequest("$cleanBase/api/v1/recommend/daily-mix/save")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    Result.success(true)
+                } else {
+                    val fallbackReq = newAuthRequest("$cleanBase/api/library/playlist/create")
+                        .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                        .build()
+                    client.newCall(fallbackReq).execute().use { fbResp ->
+                        Result.success(fbResp.isSuccessful)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "saveDailyMixAsPlaylist failed", e)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun confirmDownloadDowngrade(taskId: String, acceptedQuality: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val payload = JSONObject().apply {
+                put("id", taskId)
+                put("quality", acceptedQuality)
+            }
+            val req = newAuthRequest("$cleanBase/api/v1/download/confirm-downgrade")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    Result.success(true)
+                } else {
+                    val fbReq = newAuthRequest("$cleanBase/api/download/confirm-downgrade")
+                        .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                        .build()
+                    client.newCall(fbReq).execute().use { fbResp ->
+                        Result.success(fbResp.isSuccessful)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "confirmDownloadDowngrade failed", e)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun confirmDownloadSource(taskId: String, source: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val payload = JSONObject().apply {
+                put("id", taskId)
+                put("source", source)
+            }
+            val req = newAuthRequest("$cleanBase/api/v1/download/confirm-source")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    Result.success(true)
+                } else {
+                    val fbReq = newAuthRequest("$cleanBase/api/download/confirm-source")
+                        .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                        .build()
+                    client.newCall(fbReq).execute().use { fbResp ->
+                        Result.success(fbResp.isSuccessful)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "confirmDownloadSource failed", e)
+            Result.failure(e)
+        }
+    }
+
+    // ==================== 曲库轻量级同步校验 (/api/v1/library/sync-state) ====================
+
+    suspend fun checkLibrarySyncState(): Result<JSONObject> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val req = newAuthRequest("$cleanBase/api/v1/library/sync-state").get().build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: "{}"
+                if (resp.isSuccessful) {
+                    Result.success(JSONObject(body))
+                } else {
+                    // Fallback to /api/library/sync-state
+                    val fbReq = newAuthRequest("$cleanBase/api/library/sync-state").get().build()
+                    client.newCall(fbReq).execute().use { fbResp ->
+                        val fbBody = fbResp.body?.string() ?: "{}"
+                        if (fbResp.isSuccessful) Result.success(JSONObject(fbBody))
+                        else Result.failure(Exception("获取曲库同步状态失败 (${resp.code})"))
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Log.w(TAG, "checkLibrarySyncState failed", e)
+            Result.failure(e)
+        }
+    }
+}

@@ -694,6 +694,8 @@ object SongMatchingResolver {
             }
         }
 
+        val localIdsMatchedAndMerged = mutableListOf<String>()
+
         // 3. 构建保护性实体集合
         val preservedEntities = incomingServerSongs.map { incoming ->
             val existing = existingById[incoming.id]
@@ -729,6 +731,7 @@ object SongMatchingResolver {
                 }
                 if (matchedLocal?.localFilePath != null && checkFileExists(matchedLocal.localFilePath)) {
                     validLocalPath = matchedLocal.localFilePath
+                    localIdsMatchedAndMerged.add(matchedLocal.id)
                 }
             }
 
@@ -790,6 +793,14 @@ object SongMatchingResolver {
 
         // 4. 安全覆盖写入数据库
         database.songDao().insertSongs(preservedEntities)
+
+        if (localIdsMatchedAndMerged.isNotEmpty()) {
+            val toDeleteList = localIdsMatchedAndMerged.distinct()
+            toDeleteList.chunked(500).forEach { chunk ->
+                database.songDao().deleteSongsByIds(chunk)
+            }
+            Log.i("SongMatchingResolver", "Pruned ${toDeleteList.size} redundant local songs after merging with server tracks.")
+        }
 
         // 4.1 差量审查与孤儿清理 (Pruning) - 解决服务端删歌/改名后客户端僵尸曲目残留导致曲目总数对不上的核心问题
         if (!effectiveServerId.isNullOrBlank() && effectiveServerId !in listOf("local_storage", "local_folder", "local_saf", "lemon_online")) {

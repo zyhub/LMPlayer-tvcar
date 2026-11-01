@@ -355,6 +355,7 @@ fun LemonDiscoverHomeScreen(
                 item(key = "discover_bento_hero") {
                     val featuredSong = resolvedNewSongs.firstOrNull() ?: allCachedSongs.firstOrNull()
                     val secondSong = resolvedNewSongs.getOrNull(1) ?: allCachedSongs.getOrNull(1) ?: featuredSong
+                    val newReleaseSong = resolvedNewSongs.getOrNull(2) ?: resolvedNewSongs.firstOrNull() ?: allCachedSongs.getOrNull(2) ?: allCachedSongs.firstOrNull()
                     val topRank = toplists.firstOrNull()
                     val topAlbum = newAlbums.firstOrNull()
 
@@ -666,11 +667,12 @@ fun LemonDiscoverHomeScreen(
                                         focusedBorderColor = goldColor,
                                         focusKey = "disc_newsongs_hero",
                                         onClick = {
-                                            if (newSongs.isNotEmpty()) {
+                                            val songsToOpen = newSongs.ifEmpty { resolvedNewSongs.ifEmpty { allCachedSongs } }
+                                            if (songsToOpen.isNotEmpty()) {
                                                 collectionSessionId++
                                                 activeCollectionTitle = "${currentSource.displayName} · 新歌首发"
-                                                activeCollectionCover = newSongs.firstOrNull()?.coverUrl.orEmpty()
-                                                activeCollectionSongs = newSongs
+                                                activeCollectionCover = (newReleaseSong?.coverUrl ?: songsToOpen.firstOrNull()?.coverUrl).orEmpty()
+                                                activeCollectionSongs = songsToOpen
                                                 isLoadingCollection = false
                                             } else if (topAlbum != null) {
                                                 collectionSessionId++
@@ -693,11 +695,14 @@ fun LemonDiscoverHomeScreen(
                                 Row(
                                     modifier = Modifier
                                         .fillMaxSize()
-                                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                                        .padding(horizontal = 14.dp, vertical = 8.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.SpaceBetween
                                 ) {
-                                    Column(modifier = Modifier.weight(1f)) {
+                                    Column(
+                                        modifier = Modifier.weight(1f).padding(end = 8.dp),
+                                        verticalArrangement = Arrangement.Center
+                                    ) {
                                         Text(
                                             text = "新歌首发",
                                             fontSize = dimensions.cardHeaderSize,
@@ -706,16 +711,24 @@ fun LemonDiscoverHomeScreen(
                                         )
                                         Spacer(modifier = Modifier.height(2.dp))
                                         Text(
-                                            text = "共 ${resolvedNewSongs.size} 首潮流新歌 >",
+                                            text = if (newReleaseSong != null) "${newReleaseSong.title} · ${newReleaseSong.artist}" else "潮流新歌速递",
                                             fontSize = dimensions.badgeSize,
-                                            color = Color.White.copy(alpha = 0.7f),
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color.White.copy(alpha = 0.95f),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = if (resolvedNewSongs.isNotEmpty()) "共 ${resolvedNewSongs.size} 首潮流新歌 >" else "全网精选热歌首发 >",
+                                            fontSize = dimensions.captionSize,
+                                            color = goldColor.copy(alpha = 0.85f),
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis
                                         )
                                     }
                                     AlbumArtworkImage(
-                                        model = topAlbum?.coverUrl ?: featuredSong?.coverUrl,
-                                        seedId = topAlbum?.id ?: "album_hero",
+                                        model = newReleaseSong?.coverUrl ?: topAlbum?.coverUrl ?: featuredSong?.coverUrl,
+                                        seedId = newReleaseSong?.id ?: "newsong_hero",
                                         modifier = Modifier.size(dimensions.scale(54.dp)),
                                         cornerRadius = 12.dp
                                     )

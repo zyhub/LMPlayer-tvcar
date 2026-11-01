@@ -43,6 +43,9 @@ object NetworkClientFactory {
     private var sharedClient: OkHttpClient? = null
 
     @Volatile
+    private var sharedImageClient: OkHttpClient? = null
+
+    @Volatile
     private var activeAuthToken: String = ""
 
     private val authTokenHosts = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
@@ -214,6 +217,83 @@ object NetworkClientFactory {
 
         val client = builder.build()
         sharedClient = client
+        return client
+    }
+
+    /**
+     * 专为 Coil 图片加载打造的高并发连接池 OkHttpClient
+     * - 针对 4K/2K 大屏和车机横屏高密度卡片群优化
+     * - 自动替换 kwcdn.kuwo.cn 为 img1.kuwo.cn (绕过 HTTPS 514 频控)
+     * - 自动追加 CDN 轻量切图参数与对应平台的防盗链 Referer
+     */
+    @Synchronized
+    fun createImageOkHttpClient(context: Context): OkHttpClient {
+        sharedImageClient?.let { return it }
+
+        installSecurityProvider()
+
+        val pool = okhttp3.ConnectionPool(64, 5, java.util.concurrent.TimeUnit.MINUTES)
+        val dispatcher = okhttp3.Dispatcher().apply {
+            maxRequests = 128
+            maxRequestsPerHost = 32
+        }
+
+        val client = OkHttpClient.Builder()
+            .connectionPool(pool)
+            .dispatcher(dispatcher)
+            .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .writeTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .callTimeout(25, java.util.concurrent.TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .retryOnConnectionFailure(true)
+            .addInterceptor { chain ->
+                val origReq = chain.request()
+                var urlStr = origReq.url.toString()
+
+                // 1. 酷我 kwcdn 在 HTTPS 下会触发 514 频控重定向，替换为 img1 节点
+                if (urlStr.contains("kwcdn.kuwo.cn", ignoreCase = true)) {
+                    urlStr = urlStr.replace(Regex("""(?i)(?:[a-zA-Z0-9_\-]+\.)*kwcdn\.kuwo\.cn"""), "img1.kuwo.cn")
+                    urlStr = urlStr.replace("img1.img1.kuwo.cn", "img1.kuwo.cn")
+                }
+                if (urlStr.startsWith("http://img1.kuwo.cn/")) {
+                    urlStr = "https://" + urlStr.substring("http://".length)
+                }
+
+                // 2. 网易云图片自动追加轻量级 CDN 缩略图参数
+                if (urlStr.contains("music.126.net") && !urlStr.contains("param=")) {
+                    urlStr += if (urlStr.contains("?")) "&param=400y400" else "?param=400y400"
+                }
+
+                val reqBuilder = origReq.newBuilder().url(urlStr)
+
+                // 3. 自动注入对应平台的防盗链 Referer 请求头
+                val cdnPlatform = MusicCdnHeaders.guessSourceFromUrl(urlStr)
+                if (cdnPlatform.isNotBlank() && origReq.header("Referer").isNullOrBlank()) {
+                    val headers = MusicCdnHeaders.buildHeaders(cdnPlatform)
+                    headers.forEach { (k, v) ->
+                        if (origReq.header(k).isNullOrBlank()) {
+                            reqBuilder.header(k, v)
+                        }
+                    }
+                }
+
+                // 4. 若图片请求指向柠檬音乐服务器 (/api/tag/cover, /api/cover 等)，自动注入服务端鉴权 Bearer Token，杜绝 401 Unauthorized 导致歌曲封面加载失败
+                val tokenParam = origReq.url.queryParameter("token")
+                if (origReq.header("Authorization").isNullOrBlank()) {
+                    if (!tokenParam.isNullOrBlank() && isTokenHostAllowed(origReq.url.host)) {
+                        reqBuilder.header("Authorization", "Bearer $tokenParam")
+                    } else if (activeAuthToken.isNotBlank() && isTokenHostAllowed(origReq.url.host)) {
+                        reqBuilder.header("Authorization", "Bearer $activeAuthToken")
+                    }
+                }
+
+                chain.proceed(reqBuilder.build())
+            }
+            .build()
+
+        sharedImageClient = client
         return client
     }
 }
