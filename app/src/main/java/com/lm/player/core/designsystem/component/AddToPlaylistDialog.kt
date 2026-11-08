@@ -1,5 +1,7 @@
 package com.lm.player.core.designsystem.component
 
+import com.lm.player.core.designsystem.component.TvDialog as Dialog
+import com.lm.player.core.designsystem.component.TvDropdownMenu as DropdownMenu
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -22,7 +24,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.model.UnifiedPlaylist
@@ -178,7 +179,7 @@ fun AddToPlaylistDialog(
                             onValueChange = { newPlaylistName = it },
                             placeholder = { Text("输入歌单名称...", fontSize = 13.sp) },
                             singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier.tvTextFieldKeys().fillMaxWidth(),
                             colors = OutlinedTextFieldDefaults.colors(
                                 focusedBorderColor = AppleRed,
                                 unfocusedBorderColor = borderColor
@@ -420,7 +421,7 @@ fun AddToPlaylistDropdownMenu(
                     onValueChange = { newPlaylistName = it },
                     placeholder = { Text("输入新歌单名称...", fontSize = 12.sp) },
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.tvTextFieldKeys().fillMaxWidth(),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = AppleRed,
                         unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant

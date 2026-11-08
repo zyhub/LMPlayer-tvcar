@@ -1,4 +1,4 @@
-import java.util.Properties
+﻿import java.util.Properties
 
 plugins {
     id("com.android.application")
@@ -6,17 +6,27 @@ plugins {
     id("com.google.devtools.ksp")
 }
 
-// 签名密钥与密码**不入库**：优先读项目中已忽略的 local.properties，其次读同名环境变量。
-// 两者都取不到（例如从 GitHub 克隆后编译）时不创建 release 签名配置 —— 构建依然成功，
-// 只是产出未签名 APK，而源码树里不含任何口令。切勿把密码写回这个文件。
+// 绛惧悕瀵嗛挜涓庡瘑鐮?*涓嶅叆搴?*锛氫紭鍏堣椤圭洰涓凡蹇界暐鐨?local.properties锛屽叾娆¤鍚屽悕鐜鍙橀噺銆?
+// 涓よ€呴兘鍙栦笉鍒帮紙渚嬪浠?GitHub 鍏嬮殕鍚庣紪璇戯級鏃朵笉鍒涘缓 release 绛惧悕閰嶇疆 鈥斺€?鏋勫缓渚濈劧鎴愬姛锛?
+// 鍙槸浜у嚭鏈鍚?APK锛岃€屾簮鐮佹爲閲屼笉鍚换浣曞彛浠ゃ€傚垏鍕挎妸瀵嗙爜鍐欏洖杩欎釜鏂囦欢銆?
+// S-01：签名文件统一放在上一级「项目根目录」（与手机端共用一个仓库根）：
+//   LMPlayerTV-release.jks + LMPlayerTV-signing.properties
+// 根目录没有时回落到本工程旧位置（signing.properties / app/lmplayer-tv-release.jks），兼容旧编译环境。
+val signingRoot: File = rootProject.projectDir.parentFile
+val rootSigningProps = signingRoot.resolve("LMPlayerTV-signing.properties")
+val rootStoreFile = signingRoot.resolve("LMPlayerTV-release.jks")
 val signingProps = Properties().apply {
     val f = rootProject.file("local.properties")
     if (f.exists()) f.inputStream().use { load(it) }
+    val sf = rootSigningProps.takeIf { it.exists() } ?: rootProject.file("signing.properties")
+    if (sf.exists()) sf.inputStream().use { load(it) }
 }
 fun signingSecret(propKey: String, envKey: String): String? =
     (signingProps.getProperty(propKey) ?: System.getenv(envKey))?.takeIf { it.isNotBlank() }
 
-val releaseStoreFile = signingSecret("lmplayer.storeFile", "LMPLAYER_STORE_FILE")?.let { file(it) }
+// 根目录的 jks 优先；否则按 lmplayer.storeFile（相对工程根目录解析）或 app/lmplayer-tv-release.jks。
+val releaseStoreFile = rootStoreFile.takeIf { it.exists() }
+    ?: signingSecret("lmplayer.storeFile", "LMPLAYER_STORE_FILE")?.let { rootProject.file(it) }?.takeIf { it.exists() }
     ?: file("lmplayer-tv-release.jks").takeIf { it.exists() }
 val releaseStorePassword = signingSecret("lmplayer.storePassword", "LMPLAYER_STORE_PASSWORD")
 val releaseKeyAlias = signingSecret("lmplayer.keyAlias", "LMPLAYER_KEY_ALIAS")
@@ -32,8 +42,10 @@ android {
         applicationId = "com.lm.player.tv"
         minSdk = 23
         targetSdk = 34
-        versionCode = 78
-        versionName = "1.10.31"
+        // 版本号唯一来源：代码中通过 BuildConfig.VERSION_NAME / VERSION_CODE 读取，禁止再在 Kotlin 里硬编码
+        // 【版本号已锁定】按维护者要求固定为 1.10.32 (79)，编译出包时不要自动递增；如需变更请先征得维护者同意
+        versionCode = 79
+        versionName = "1.10.32"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -67,7 +79,7 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            // findByName 而非 getByName：没有本地密钥时返回 null，产出未签名 APK 而不是让构建失败
+            // findByName 鑰岄潪 getByName锛氭病鏈夋湰鍦板瘑閽ユ椂杩斿洖 null锛屼骇鍑烘湭绛惧悕 APK 鑰屼笉鏄鏋勫缓澶辫触
             signingConfig = signingConfigs.findByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android.txt"),
@@ -76,7 +88,7 @@ android {
         }
         debug {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.findByName("release")
+            // S-04：debug 包使用 Android 默认 debug 签名，不再借用 release 私钥
         }
     }
 
@@ -98,6 +110,8 @@ android {
 
     buildFeatures {
         compose = true
+        // 生成 BuildConfig.VERSION_NAME / VERSION_CODE，AppUpdateManager 由此读取版本号，避免与 defaultConfig 不一致
+        buildConfig = true
     }
 
     composeOptions {

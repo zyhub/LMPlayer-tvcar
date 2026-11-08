@@ -103,6 +103,10 @@ interface SongDao {
     @Query("UPDATE songs SET isFavorite = :isFavorite WHERE id = :songId")
     suspend fun updateFavorite(songId: String, isFavorite: Boolean)
 
+    /** 本地扫描「补封面」阶段使用 */
+    @Query("UPDATE songs SET coverUrl = :coverUrl WHERE id = :songId")
+    suspend fun updateCoverUrl(songId: String, coverUrl: String)
+
     @Query("UPDATE songs SET isFavorite = :isFavorite WHERE id = :idOrPath OR localFilePath = :idOrPath")
     suspend fun updateFavoriteByIdOrPath(idOrPath: String, isFavorite: Boolean)
 
@@ -148,6 +152,13 @@ interface SongDao {
 
     @Query("DELETE FROM songs WHERE serverId = :serverId")
     suspend fun deleteSongsByServer(serverId: String)
+
+    /**
+     * 第二十三节：删除服务器前，先把已下载 / 扫描关联到本机文件的曲目转为本地记录，
+     * 否则 deleteSongsByServer 会连本地文件的记录一起删掉，要重新扫描才回来。
+     */
+    @Query("UPDATE songs SET serverId = 'local_storage' WHERE serverId = :serverId AND downloadStatus = 'DOWNLOADED' AND localFilePath IS NOT NULL AND localFilePath != ''")
+    suspend fun migrateDownloadedSongsToLocal(serverId: String)
 
     @Query("DELETE FROM songs WHERE downloadStatus != 'DOWNLOADED' AND (localFilePath IS NULL OR localFilePath = '')")
     suspend fun clearNonDownloadedSongs()
@@ -205,6 +216,9 @@ interface ServerDao {
 
     @Query("UPDATE servers SET isCurrentActive = 0")
     suspend fun clearActiveServer()
+
+    @Query("UPDATE servers SET serverUrl = :url WHERE id = :serverId")
+    suspend fun updateServerUrl(serverId: String, url: String)
 
     @Query("DELETE FROM servers WHERE id = :serverId")
     suspend fun deleteServer(serverId: String)

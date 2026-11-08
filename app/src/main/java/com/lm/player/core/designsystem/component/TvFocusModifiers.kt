@@ -1,5 +1,6 @@
 package com.lm.player.core.designsystem.component
 
+import com.lm.player.core.designsystem.component.TvDialog as Dialog
 import android.view.KeyEvent
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
@@ -45,7 +46,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.zIndex
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions

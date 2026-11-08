@@ -35,6 +35,7 @@ private val RingGreen = Color(0xFF34C759)
 private val RingRed = Color(0xFFFF3B30)
 private val RingOrange = Color(0xFFFF9F0A)
 private val RingGray = Color(0xFF8E8E93)
+private val RingYellow = Color(0xFFFFCC00)
 
 /** 4 环极简看板（大屏/TV 遥控版）：在线 / 延迟 / 激活源 / 音源加速。无多余层级、支持 D-Pad 焦点。 */
 @Composable
@@ -58,10 +59,11 @@ fun ServerSourceStatusCard(
     val active = if (online) (meta?.activeSourceCount ?: sources.count { it.isActive }).coerceAtLeast(0) else 0
     val total = if (online) (meta?.totalSourceCount ?: sources.size).coerceAtLeast(0) else 0
     val accelReady = session.isReady
-    val accelLoading = session.state == SourceAccelerationSession.State.LOADING
+    // 拉取中（含已就绪后的后台刷新）一律黄色；拉取完成可用绿色；离线 / 未拉取 / 失败红色
+    val accelLoading = session.pulling || session.state == SourceAccelerationSession.State.LOADING
     val accelColor = when {
+        accelLoading -> RingYellow
         accelReady -> RingGreen
-        accelLoading -> RingGray
         else -> RingRed
     }
     val onlineColor = if (online) RingGreen else RingRed
@@ -79,7 +81,7 @@ fun ServerSourceStatusCard(
         color = MaterialTheme.colorScheme.surface,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)),
         modifier = Modifier.fillMaxWidth().semantics {
-            contentDescription = "在线:${if (online) "正常" else "未连接"}; 延迟:${if (latency > 0L) "${latency}毫秒" else "未知"}; 激活源:${active}/${total}; 音源加速:${if (accelReady) "正常" else "未加速"}" + (error?.let { "; ${it}" } ?: "")
+            contentDescription = "在线:${if (online) "正常" else "未连接"}; 延迟:${if (latency > 0L) "${latency}毫秒" else "未知"}; 激活源:${active}/${total}; 音源加速:${if (accelLoading) "拉取中" else if (accelReady) "正常" else "未拉取"}" + (error?.let { "; ${it}" } ?: "")
         }
     ) {
         Column(modifier = Modifier.padding(horizontal = 22.dp, vertical = 20.dp)) {
@@ -128,7 +130,7 @@ fun ServerSourceStatusCard(
                 verticalAlignment = Alignment.Top
             ) {
                 StatusRingColumn(
-                    label = "服务连通",
+                    label = "在线",
                     progress = if (online) 1f else 0f,
                     color = onlineColor,
                     modifier = Modifier.weight(1f)
@@ -141,7 +143,7 @@ fun ServerSourceStatusCard(
                     )
                 }
                 StatusRingColumn(
-                    label = "控制延迟",
+                    label = "延迟",
                     progress = if (latency > 0L) (latency / 200f).coerceIn(0.05f, 1f) else 0f,
                     color = latencyColor,
                     modifier = Modifier.weight(1f)
@@ -152,7 +154,7 @@ fun ServerSourceStatusCard(
                     }
                 }
                 StatusRingColumn(
-                    label = "可用音源",
+                    label = "激活源",
                     progress = if (total > 0) active.toFloat() / total else 0f,
                     color = activeColor,
                     segments = total.coerceIn(1, 8),
@@ -161,8 +163,8 @@ fun ServerSourceStatusCard(
                     Text(if (total > 0) "${active}/${total}" else "—", fontSize = 17.sp, fontWeight = FontWeight.Bold)
                 }
                 StatusRingColumn(
-                    label = "本地加速",
-                    progress = if (accelLoading) 0f else 1f,
+                    label = "音源加速",
+                    progress = if (accelLoading) session.pullProgress else 1f,
                     color = accelColor,
                     modifier = Modifier.weight(1f)
                 ) {

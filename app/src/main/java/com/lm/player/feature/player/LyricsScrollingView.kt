@@ -1,9 +1,12 @@
 package com.lm.player.feature.player
 
+import com.lm.player.core.designsystem.component.TvDialog as Dialog
+import com.lm.player.core.designsystem.component.TvDropdownMenu as DropdownMenu
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.snap
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -41,7 +44,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.lm.player.core.designsystem.component.tvButtonFocusable
 import com.lm.player.core.designsystem.component.tvFocusable
@@ -53,7 +55,8 @@ import com.lm.player.core.model.LyricLine
 @Composable
 fun LyricsScrollingView(
     lyrics: List<LyricLine>,
-    currentPositionMs: Long,
+    /** 性能优化 A3：传入取值函数而非数值，进度只在本组件内读取，不会带动调用方整页重组 */
+    currentPositionMsProvider: () -> Long,
     onSeekToLyric: (Long) -> Unit,
     fontSizeSp: Float = 22f,
     lyricsOffsetMs: Long = 0L,
@@ -81,6 +84,8 @@ fun LyricsScrollingView(
      * 表现为浮层弹出来了却收不到遥控器按键。宿主需把该状态并入 anyPopupExpanded。
      */
     onOverlayStateChanged: (Boolean) -> Unit = {},
+    /** 性能优化 A1：本组件被全屏播放页盖住时传 false，逐字流光不再订阅动画时钟 */
+    animationsActive: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -112,7 +117,7 @@ fun LyricsScrollingView(
     val listState = rememberLazyListState()
 
     // 结合用户快慢偏置时间计算有效播放时间戳
-    val effectivePositionMs = (currentPositionMs + lyricsOffsetMs).coerceAtLeast(0L)
+    val effectivePositionMs = (currentPositionMsProvider() + lyricsOffsetMs).coerceAtLeast(0L)
 
     // 逐字歌词高刷帧级平滑时间插值，消除 400ms 刷新周期产生的逐字流光顿挫跳跃
     var lastTickPos by remember { mutableLongStateOf(effectivePositionMs) }
@@ -124,14 +129,9 @@ fun LyricsScrollingView(
     }
 
     val isPlaying by com.lm.player.core.media.PlaybackQueueManager.isPlayingFlow.collectAsState()
-    var frameTick by remember { mutableLongStateOf(0L) }
-    LaunchedEffect(isKaraokeEnabled, isPlaying) {
-        if (isKaraokeEnabled && isPlaying) {
-            while (true) {
-                withFrameMillis { frameTick = it }
-            }
-        }
-    }
+    // 性能优化 A2：逐字流光改挂全局限帧时钟 (~30 帧/秒)，与黑胶旋转同一帧失效，
+    // 不再按屏幕刷新率每秒 60 次让整窗重绘。frameClock 只在 drawWithContent 内读取。
+    val frameClock = com.lm.player.core.designsystem.theme.rememberThrottledFrameClock(isKaraokeEnabled && isPlaying && animationsActive)
 
     // 计算当前处于哪一行歌词 (采用二分查找匹配对应行)
     val activeIndex = remember(cleanLyrics, effectivePositionMs) {
@@ -244,12 +244,17 @@ fun LyricsScrollingView(
                             label = "lyric_line_alpha"
                         )
                         val targetScale = if (isActive) 1.0f else if (distance == 1) 0.93f else 0.88f
+                        // 流畅模式 (第二批)：缩放直接到位、不做过渡动画 (每次换行省掉约 0.4 秒的满帧动画)，透明度渐变保留
                         val animatedScale by animateFloatAsState(
                             targetValue = targetScale,
-                            animationSpec = tween(
-                                durationMillis = 380,
-                                easing = FastOutSlowInEasing
-                            ),
+                            animationSpec = if (com.lm.player.core.designsystem.theme.SmoothMode.isActive) {
+                                snap()
+                            } else {
+                                tween(
+                                    durationMillis = 380,
+                                    easing = FastOutSlowInEasing
+                                )
+                            },
                             label = "lyric_line_scale"
                         )
                         val baseColor = if (isActive) activeColor else inactiveColor.copy(alpha = 1f)
@@ -275,6 +280,9 @@ fun LyricsScrollingView(
                                 .height(rowHeight)
                                 .graphicsLayer {
                                     alpha = animatedAlpha
+                                    // 性能优化 A4：半透明歌词行直接调制透明度，不再为每行单独开离屏缓冲 (纯文本无重叠，视觉一致)
+                                    // 当前行 (逐字歌词为两层文字叠绘) 保持默认策略，避免淡入过程中底层文字透出
+                                    compositingStrategy = if (isActive) androidx.compose.ui.graphics.CompositingStrategy.Auto else androidx.compose.ui.graphics.CompositingStrategy.ModulateAlpha
                                     scaleX = animatedScale
                                     scaleY = animatedScale
                                     transformOrigin = when (textAlign) {
@@ -323,7 +331,7 @@ fun LyricsScrollingView(
                                         maxLines = if (lines <= 5) 1 else 2,
                                         overflow = TextOverflow.Ellipsis,
                                         modifier = Modifier.drawWithContent {
-                                            val _tick = frameTick
+                                            val _tick = frameClock.value
                                             val elapsed = (android.os.SystemClock.uptimeMillis() - lastTickUptime).coerceIn(0L, 600L)
                                             val smoothPos = lastTickPos + elapsed
                                             val startMs = item.timestampMs
@@ -445,7 +453,7 @@ fun LyricsScrollingView(
                                             lineHeight = currentLineHeight
                                         ),
                                         modifier = Modifier.drawWithContent {
-                                            val _tick = frameTick
+                                            val _tick = frameClock.value
                                             val elapsed = (android.os.SystemClock.uptimeMillis() - lastTickUptime).coerceIn(0L, 600L)
                                             val smoothPos = lastTickPos + elapsed
                                             val startMs = item.timestampMs

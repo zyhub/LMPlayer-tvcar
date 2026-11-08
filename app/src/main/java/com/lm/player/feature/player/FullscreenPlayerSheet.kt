@@ -1,5 +1,6 @@
 package com.lm.player.feature.player
 
+import com.lm.player.core.designsystem.component.TvDropdownMenu as DropdownMenu
 import android.content.Intent
 import android.content.res.Configuration
 import android.provider.Settings
@@ -57,6 +58,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.onPreviewKeyEvent
+import com.lm.player.core.designsystem.component.RecomposeIsolation
 import com.lm.player.core.designsystem.component.AddToPlaylistDialog
 import com.lm.player.core.designsystem.component.AddToPlaylistDropdownMenu
 import com.lm.player.core.designsystem.component.AlbumArtworkImage
@@ -64,6 +66,7 @@ import com.lm.player.core.designsystem.component.DownloadQualityDropdownMenu
 import com.lm.player.core.designsystem.component.LocalPlatformMode
 import com.lm.player.core.designsystem.component.tvButtonFocusable
 import com.lm.player.core.designsystem.component.tvFocusable
+import com.lm.player.core.designsystem.component.tvDismissOnBack
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
 import com.lm.player.core.designsystem.theme.PlayerThemeStyle
@@ -125,6 +128,8 @@ fun FullscreenPlayerSheet(
     onCreatePlaylistAndAddSong: (String, UnifiedSong) -> Unit = { _, _ -> },
     /** 播放页主题切换回调：宿主据此决定进入/退出播放页的转场动画 (如「全屏封面」走底部滑入滑出) */
     onPlayerThemeStyleChange: (PlayerThemeStyle) -> Unit = {},
+    /** 性能优化 A1：本页是否完全盖住下层主界面 (下拉最小化手势进行中为 false) */
+    onCoversBackgroundChanged: (Boolean) -> Unit = {},
     onDismiss: () -> Unit
 ) {
     val configuration = LocalConfiguration.current
@@ -163,6 +168,13 @@ fun FullscreenPlayerSheet(
     // 下拉滑动最小化手势位移
     var dragOffsetY by remember { mutableStateOf(0f) }
     val animatedOffsetY by animateFloatAsState(targetValue = dragOffsetY, label = "dismiss_drag_offset")
+
+    // 性能优化 A1：向宿主报告「本页是否完全盖住下层主界面」。下拉最小化手势使本页下移时为 false，
+    // 宿主据此恢复绘制主界面，避免下拉时露出空白。用 snapshotFlow 观察，不在组合期读取偏移量。
+    val currentOnCoversBackgroundChanged by rememberUpdatedState(onCoversBackgroundChanged)
+    LaunchedEffect(Unit) {
+        snapshotFlow { animatedOffsetY < 0.5f }.collect { currentOnCoversBackgroundChanged(it) }
+    }
 
     // 界面内嵌浮层状态 (融为一体，取消弹窗)
     var showQueueSheet by remember { mutableStateOf(false) }
@@ -275,6 +287,21 @@ fun FullscreenPlayerSheet(
             )
         }
     }
+
+    // 系统状态栏 / 导航栏与播放页背景渐变的首尾色一致（离开播放页自动恢复）
+    val isKaraokeStyle = playerThemeStyle == com.lm.player.core.designsystem.theme.PlayerThemeStyle.KARAOKE_COVER
+    com.lm.player.core.designsystem.theme.SystemBarsColor(
+        statusBar = when {
+            isKaraokeStyle -> if (isDark) Color(0xFF1E2028) else Color(0xFFEBE8E3)
+            isDark -> Color(0xFF14171A)
+            else -> Color(0xFFFFFFFF)
+        },
+        navigationBar = when {
+            isKaraokeStyle -> if (isDark) Color(0xFF0F1014) else Color(0xFFD8D3CA)
+            isDark -> Color(0xFF08090B)
+            else -> Color(0xFFEDEDF2)
+        }
+    )
 
     val primaryTextColor = if (isDark) Color.White else Color(0xFF111113)
     val secondaryTextColor = if (isDark) Color.White.copy(alpha = 0.65f) else Color(0xFF636366)
@@ -402,8 +429,9 @@ fun FullscreenPlayerSheet(
     // 直接不担任驱动方，省掉这份逐帧动画开销。
     val vinylRotation = com.lm.player.core.designsystem.theme.rememberVinylRotation(isPlaying && !isNeteaseCoverMode)
 
-    // 进度状态在这里才被读取：订阅范围收窄到本播放页，不再牵连调用方的整棵组合树
-    val progressMs = progressMsProvider()
+    // 性能优化 A3：进度不再在本页顶层读取 —— 本页约 3500 行，顶层读取会让整页每 0.4 秒重算一次。
+    // 现在只在进度条 / 时间文字 (RecomposeIsolation 或 BoxWithConstraints 内) 与歌词组件内部读取；
+    // 按键回调里直接调用 progressMsProvider() 取实时值 (事件回调里读取不会建立重组订阅)。
 
     // 浮层总开关：**必须包含页面上所有会抢焦点的浮层**。
     // 此前漏掉了 showQueueSheet / showPortraitAddToPlaylistMenu / showDownloadMenu / 歌词调节浮层，
@@ -624,13 +652,17 @@ fun FullscreenPlayerSheet(
                 val effectiveTotalDurationMs = if (totalDurationMs > 0L) totalDurationMs else song.durationMs.coerceAtLeast(1L)
                 var neteaseDragFraction by remember { mutableStateOf<Float?>(null) }
                 var neteaseTrackWidthPx by remember { mutableFloatStateOf(1f) }
-                val progressFraction = neteaseDragFraction ?: if (effectiveTotalDurationMs > 0L) {
-                    (progressMs.toFloat() / effectiveTotalDurationMs.toFloat()).coerceIn(0f, 1f)
+                // 只能在隔离作用域 / 事件回调内调用，见上方 A3 说明
+                fun neteaseProgressFraction(): Float = neteaseDragFraction ?: if (effectiveTotalDurationMs > 0L) {
+                    (progressMsProvider().toFloat() / effectiveTotalDurationMs.toFloat()).coerceIn(0f, 1f)
                 } else 0f
-                val displayedProgressMs = if (neteaseDragFraction != null) {
-                    (neteaseDragFraction!! * effectiveTotalDurationMs).toLong().coerceIn(0L, effectiveTotalDurationMs)
-                } else {
-                    progressMs
+                fun neteaseDisplayedProgressMs(): Long {
+                    val drag = neteaseDragFraction
+                    return if (drag != null) {
+                        (drag * effectiveTotalDurationMs).toLong().coerceIn(0L, effectiveTotalDurationMs)
+                    } else {
+                        progressMsProvider()
+                    }
                 }
                 val shortQualityTag = remember(displayQualityBadge) {
                     displayQualityBadge.substringBefore(" ").ifBlank { displayQualityBadge }
@@ -668,22 +700,28 @@ fun FullscreenPlayerSheet(
                                 transformOrigin = androidx.compose.ui.graphics.TransformOrigin.Center
                             }
                     ) {
+                        // 流畅模式 (第二批)：去掉整屏背景封面层、切歌封面直接切换
+                        val smoothMode = com.lm.player.core.designsystem.theme.SmoothMode.isActive
                         // 1. 底层氛围背景（取自封面的深色暗化衬底，支持切歌渐变）
-                        androidx.compose.animation.Crossfade(
-                            targetState = Pair(song.id, song.coverUrl),
-                            animationSpec = tween(durationMillis = 650, easing = LinearEasing),
-                            label = "netease_bg_cover_crossfade",
-                            modifier = Modifier.fillMaxSize()
-                        ) { (seedId, coverUrl) ->
-                            // 解码尺寸与左侧大封面保持一致 (1080)：Coil 的内存缓存按 (url, size) 建键，
-                            // 用同一个尺寸能让背景与主封面命中同一份位图，避免同图解两遍、两张位图同时常驻
-                            AlbumArtworkImage(
-                                model = coverUrl,
-                                seedId = seedId,
-                                targetSize = 1080,
-                                modifier = Modifier.fillMaxSize(),
-                                cornerRadius = 0.dp
-                            )
+                        // 流畅模式下省掉这一层：它被下面 88% 不透明的遮罩盖住，只透出 12%，
+                        // 却要每帧多画一整屏大图；去掉后只剩外层的纯色衬底，观感几乎一致
+                        if (!smoothMode) {
+                            androidx.compose.animation.Crossfade(
+                                targetState = Pair(song.id, song.coverUrl),
+                                animationSpec = tween(durationMillis = 650, easing = LinearEasing),
+                                label = "netease_bg_cover_crossfade",
+                                modifier = Modifier.fillMaxSize()
+                            ) { (seedId, coverUrl) ->
+                                // 解码尺寸与左侧大封面保持一致 (1080)：Coil 的内存缓存按 (url, size) 建键，
+                                // 用同一个尺寸能让背景与主封面命中同一份位图，避免同图解两遍、两张位图同时常驻
+                                AlbumArtworkImage(
+                                    model = coverUrl,
+                                    seedId = seedId,
+                                    targetSize = 1080,
+                                    modifier = Modifier.fillMaxSize(),
+                                    cornerRadius = 0.dp
+                                )
+                            }
                         }
                         Box(
                             modifier = Modifier
@@ -691,10 +729,10 @@ fun FullscreenPlayerSheet(
                                 .background(Color(0xFF232D49).copy(alpha = 0.88f))
                         )
 
-                        // 2. 左半边：歌曲超清封面大图（占据左半屏，切歌时平滑渐变切换）
+                        // 2. 左半边：歌曲超清封面大图（占据左半屏，切歌时平滑渐变切换；流畅模式下直接切换）
                         androidx.compose.animation.Crossfade(
                             targetState = Pair(song.id, song.coverUrl),
-                            animationSpec = tween(durationMillis = 650, easing = LinearEasing),
+                            animationSpec = if (smoothMode) snap() else tween(durationMillis = 650, easing = LinearEasing),
                             label = "netease_left_cover_crossfade",
                             modifier = Modifier
                                 .fillMaxHeight()
@@ -789,7 +827,7 @@ fun FullscreenPlayerSheet(
                             // 右半边 7 列滚动歌词 (行高倍数放宽，歌词行间距更大更透气)
                             LyricsScrollingView(
                                 lyrics = lyrics.lines,
-                                currentPositionMs = progressMs,
+                                currentPositionMsProvider = progressMsProvider,
                                 onSeekToLyric = onSeekTo,
                                 fontSizeSp = 24f,
                                 lyricsOffsetMs = lyricsOffsetMs,
@@ -815,7 +853,11 @@ fun FullscreenPlayerSheet(
                                 .fillMaxWidth()
                                 .height(210.dp)
                                 .align(Alignment.BottomCenter)
-                                .graphicsLayer { alpha = neteaseBottomShadeAlpha }
+                                .graphicsLayer {
+                                    alpha = neteaseBottomShadeAlpha
+                                    // 性能优化 A4：单层渐变无重叠，直接调制透明度，不开离屏缓冲
+                                    compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.ModulateAlpha
+                                }
                                 .background(
                                     remember {
                                         Brush.verticalGradient(
@@ -868,7 +910,7 @@ fun FullscreenPlayerSheet(
                                             onLeftKey = { repeatCount ->
                                                 lastUserInteractionTick++
                                                 val step = if (repeatCount > 3) 15_000L else 5_000L
-                                                val target = (displayedProgressMs - step).coerceAtLeast(0L)
+                                                val target = (neteaseDisplayedProgressMs() - step).coerceAtLeast(0L)
                                                 neteaseDragFraction = null
                                                 onSeekTo(target)
                                                 showTvHud("⏪ 快退 ${step / 1000} 秒 · ${formatDuration(target)}")
@@ -877,7 +919,7 @@ fun FullscreenPlayerSheet(
                                             onRightKey = { repeatCount ->
                                                 lastUserInteractionTick++
                                                 val step = if (repeatCount > 3) 15_000L else 5_000L
-                                                val target = (displayedProgressMs + step).coerceAtMost(effectiveTotalDurationMs)
+                                                val target = (neteaseDisplayedProgressMs() + step).coerceAtMost(effectiveTotalDurationMs)
                                                 neteaseDragFraction = null
                                                 onSeekTo(target)
                                                 showTvHud("⏩ 快进 ${step / 1000} 秒 · ${formatDuration(target)}")
@@ -894,12 +936,14 @@ fun FullscreenPlayerSheet(
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                                 ) {
-                                    Text(
-                                        text = formatDuration(displayedProgressMs),
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = Color.White.copy(alpha = 0.85f)
-                                    )
+                                    RecomposeIsolation {
+                                        Text(
+                                            text = formatDuration(neteaseDisplayedProgressMs()),
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color.White.copy(alpha = 0.85f)
+                                        )
+                                    }
                                     BoxWithConstraints(
                                         modifier = Modifier
                                             .weight(1f)
@@ -947,6 +991,8 @@ fun FullscreenPlayerSheet(
                                             },
                                         contentAlignment = Alignment.CenterStart
                                     ) {
+                                        // BoxWithConstraints 的内容自带独立重组作用域，进度在这里读取只重算进度条本身
+                                        val progressFraction = neteaseProgressFraction()
                                         val trackH = if (isSeekBarFocused || neteaseDragFraction != null) 6.dp else 3.5.dp
                                         val thumbD = if (isSeekBarFocused || neteaseDragFraction != null) 14.dp else 10.dp
                                         Box(
@@ -1841,6 +1887,9 @@ fun FullscreenPlayerSheet(
                     // 3. 进度条与时间（定制无内部焦点抢夺的 TV 专属进度条：光标置于进度条时按左右键直接快退/快进 10 秒）
                     // 时长兜底：内核上报时长为 0 时退回本地元数据时长，避免 seek 目标被算成 0
                     val seekDurationMs = if (totalDurationMs > 0L) totalDurationMs else song.durationMs.coerceAtLeast(1L)
+                    // 性能优化 A3：整个进度条区块放进隔离作用域，进度刷新只重算这一块
+                    RecomposeIsolation {
+                    val progressMs = progressMsProvider()
                     val progressFraction = seekDragFraction
                         ?: (progressMs.toFloat() / seekDurationMs.toFloat()).coerceIn(0f, 1f)
                     val seekDisplayMs = if (seekDragFraction != null) {
@@ -1864,14 +1913,14 @@ fun FullscreenPlayerSheet(
                                 focusedScale = 1.01f,
                                 onFocusChange = { isSeekBarFocused = it },
                                 onLeftKey = { _ ->
-                                    val target = (progressMs - 10_000L).coerceAtLeast(0L)
+                                    val target = (progressMsProvider() - 10_000L).coerceAtLeast(0L)
                                     onSeekTo(target)
                                     showTvHud("⏪ 快退 10 秒 · ${formatDuration(target)}")
                                     true
                                 },
                                 onRightKey = { _ ->
                                     val maxDur = if (totalDurationMs > 0L) totalDurationMs else Long.MAX_VALUE
-                                    val target = (progressMs + 10_000L).coerceAtMost(maxDur)
+                                    val target = (progressMsProvider() + 10_000L).coerceAtMost(maxDur)
                                     onSeekTo(target)
                                     showTvHud("⏩ 快进 10 秒 · ${formatDuration(target)}")
                                     true
@@ -1966,6 +2015,7 @@ fun FullscreenPlayerSheet(
                             Text(text = formatDuration(seekDurationMs), fontSize = 11.sp, color = secondaryTextColor)
                         }
                     }
+                    } // RecomposeIsolation
 
                     // 4. 5 大主控播放按键（支持遥控器方向键左右移动选中、OK 键操作）
                     Row(
@@ -2327,7 +2377,7 @@ fun FullscreenPlayerSheet(
                                 if (landscapeRightPaneMode == 0) {
                                     LyricsScrollingView(
                                         lyrics = lyrics.lines,
-                                        currentPositionMs = progressMs,
+                                        currentPositionMsProvider = progressMsProvider,
                                         onSeekToLyric = onSeekTo,
                                         fontSizeSp = if (isKaraokeTheme) lyricsFontSize.coerceAtLeast(24f) else lyricsFontSize,
                                         lyricsOffsetMs = lyricsOffsetMs,
@@ -2590,7 +2640,7 @@ fun FullscreenPlayerSheet(
                         // 页面 1: 实时滚动全屏歌词
                         LyricsScrollingView(
                             lyrics = lyrics.lines,
-                            currentPositionMs = progressMs,
+                            currentPositionMsProvider = progressMsProvider,
                             onSeekToLyric = onSeekTo,
                             fontSizeSp = lyricsFontSize,
                             lyricsOffsetMs = lyricsOffsetMs,
@@ -2742,9 +2792,12 @@ fun FullscreenPlayerSheet(
                 Spacer(modifier = Modifier.height(14.dp))
 
                 // 4. 进度条与播放时间
+                // 性能优化 A3：进度只在这个隔离作用域内读取
+                RecomposeIsolation {
                 Column(modifier = Modifier.fillMaxWidth()) {
                     // 时长兜底：部分流媒体内核上报时长为 0，退回本地元数据时长，避免 seek 目标被算成 0
                     val seekDurationMs = if (totalDurationMs > 0L) totalDurationMs else song.durationMs.coerceAtLeast(1L)
+                    val progressMs = progressMsProvider()
                     val progressRatio = seekDragFraction
                         ?: (progressMs.toFloat() / seekDurationMs.toFloat()).coerceIn(0f, 1f)
                     val displayProgressMs = if (seekDragFraction != null) {
@@ -2785,6 +2838,7 @@ fun FullscreenPlayerSheet(
                         )
                     }
                 }
+                } // RecomposeIsolation
 
                 Spacer(modifier = Modifier.height(12.dp))
 
@@ -2912,6 +2966,7 @@ fun FullscreenPlayerSheet(
         if (showQueueSheet) {
             ModalBottomSheet(
                 onDismissRequest = { showQueueSheet = false },
+                modifier = Modifier.tvDismissOnBack { showQueueSheet = false },
                 containerColor = MaterialTheme.colorScheme.surface
             ) {
                 Column(

@@ -52,6 +52,35 @@ object PlaybackQueueManager {
     private var playJob: Job? = null
     private var positionSaveJob: Job? = null
 
+    // ==================== C-12：播放链接过期后同音质重新取链 ====================
+    private var lastLinkRefreshSongId: String = ""
+    private var lastLinkRefreshAt: Long = 0L
+
+    /**
+     * 播放错误是否属于「链接失效」（HTTP 401/403/410）：柠檬服务端在线流带 2 小时 ticket、
+     * 第三方 CDN 直链带签名时效，暂停久了再拖动/续播就会命中。返回状态码，其它错误返回 null。
+     */
+    fun expiredLinkHttpCode(error: androidx.media3.common.PlaybackException): Int? {
+        var t: Throwable? = error
+        while (t != null) {
+            if (t is androidx.media3.datasource.HttpDataSource.InvalidResponseCodeException) {
+                return t.responseCode.takeIf { it == 401 || it == 403 || it == 410 }
+            }
+            t = t.cause
+        }
+        return null
+    }
+
+    /** 同一首歌 60 秒内只允许一次同音质重新取链，避免链接确实不可用时陷入死循环 */
+    @Synchronized
+    fun tryClaimLinkRefresh(songId: String): Boolean {
+        val now = System.currentTimeMillis()
+        if (songId == lastLinkRefreshSongId && now - lastLinkRefreshAt < 60_000L) return false
+        lastLinkRefreshSongId = songId
+        lastLinkRefreshAt = now
+        return true
+    }
+
     /**
      * 串行 IO 执行器（单线程 = 严格按提交顺序执行）：
      * 1) 「最近播放」足迹的读-改-写在这里排队：每次播放都要落盘一份最多 60 首的 JSON
@@ -676,6 +705,95 @@ object PlaybackQueueManager {
         savePlaybackState(song = song, commitSync = false)
     }
 
+    private val favoriteJobs = java.util.concurrent.ConcurrentHashMap<String, Job>()
+
+    /**
+     * 切换当前歌曲的收藏状态（桌面小部件红心用，App 可能并未打开）。
+     * 与 MainActivity 红心同一套落库口径：本地 songs 表 + 「我喜欢的音乐」(lemon_favorites) 歌单，
+     * 再同步到当前柠檬服务器。连点时只保留最后一次（取消上一次未完成的同步）。
+     */
+    fun toggleFavorite(context: Context) {
+        val appCtx = context.applicationContext
+        val target = _currentSongFlow.value ?: return
+        if (com.lm.player.core.podcast.PodcastSongs.isPodcast(target)) {
+            // 播客单集不进「我喜欢的音乐」（黑胶卡 / 通知栏 / 小组件上的红心都会走到这里）
+            Toast.makeText(appCtx, "播客单集不支持收藏", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val newFav = !target.isFavorite
+        val serverId = if (target.serverId.isNotBlank() && target.serverId != "lemon_online") target.serverId else "lemon_online"
+        val updated = target.copy(isFavorite = newFav, serverId = serverId)
+        updateCurrentSong(updated)
+        favoriteJobs[target.id]?.cancel()
+        favoriteJobs[target.id] = coroutineScope.launch(Dispatchers.IO) {
+            try {
+                val db = ZdsDatabase.getInstance(appCtx)
+                if (db.songDao().getSongById(updated.id) == null) {
+                    db.songDao().insertSongs(
+                        listOf(
+                            com.lm.player.core.database.entity.SongEntity(
+                                id = updated.id,
+                                title = updated.title.ifBlank { "未知曲目" },
+                                artist = updated.artist.ifBlank { "未知歌手" },
+                                artistId = updated.artistId.ifBlank { "artist_${updated.artist.hashCode()}" },
+                                album = updated.album.ifBlank { "单曲精选" },
+                                albumId = updated.albumId.ifBlank { "album_${updated.album.hashCode()}" },
+                                durationMs = updated.durationMs,
+                                coverUrl = updated.coverUrl,
+                                streamUrl = updated.streamUrl,
+                                serverId = updated.serverId,
+                                localFilePath = updated.localFilePath,
+                                downloadStatus = updated.downloadStatus,
+                                bitRate = updated.bitRate,
+                                format = updated.format,
+                                isFavorite = newFav,
+                                relativeFolderPath = updated.rawMetaJson ?: updated.relativeFolderPath,
+                                addedTimestamp = System.currentTimeMillis()
+                            )
+                        )
+                    )
+                } else {
+                    db.songDao().updateFavorite(updated.id, newFav)
+                }
+                if (newFav) {
+                    db.playlistDao().addSongToPlaylist(
+                        com.lm.player.core.database.entity.PlaylistSongEntity(playlistId = "lemon_favorites", songId = updated.id)
+                    )
+                } else {
+                    db.playlistDao().removeSongFromPlaylist("lemon_favorites", updated.id)
+                }
+                db.playlistDao().updateSongCount("lemon_favorites")
+
+                val servers = db.serverDao().getAllServers()
+                val server = servers.firstOrNull { it.isCurrentActive && it.type == com.lm.player.core.model.ServerType.LEMON_MUSIC }
+                    ?: servers.firstOrNull { it.type == com.lm.player.core.model.ServerType.LEMON_MUSIC }
+                if (server != null) {
+                    val protocol = com.lm.player.core.network.LemonMusicProtocol(
+                        com.lm.player.core.network.NetworkClientFactory.createOkHttpClient(appCtx),
+                        server.serverUrl,
+                        server.username,
+                        server.tokenOrApiKey
+                    )
+                    val r = protocol.toggleFavoriteSongOnServer(updated, newFav)
+                    if (r.isFailure) {
+                        val reason = r.exceptionOrNull()?.message.orEmpty()
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(
+                                appCtx,
+                                "收藏未同步到服务器，请稍后重试${if (reason.isNotBlank()) "：$reason" else ""}",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Log.w(TAG, "toggleFavorite failed", e)
+            }
+        }
+    }
+
     fun setShuffle(shuffle: Boolean) {
         _isShuffleFlow.value = shuffle
         try {
@@ -783,9 +901,19 @@ object PlaybackQueueManager {
 
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED) {
+                    val endedSong = _currentSongFlow.value
+                    val endedIsPodcast = com.lm.player.core.podcast.PodcastSongs.isPodcast(endedSong)
+                    if (endedIsPodcast && endedSong != null) {
+                        com.lm.player.core.podcast.PodcastController.onEpisodeCompleted(endedSong)
+                    }
                     if (sleepTimerStopAfterCurrent) {
                         setSleepTimer(0)
                         pause(context)
+                        return
+                    }
+                    // 播客：不受单曲循环 / 随机影响，按队列顺序播下一集，最后一集播完即停
+                    if (endedIsPodcast) {
+                        playNextPodcast(context, auto = true)
                         return
                     }
                     val list = _playlistFlow.value
@@ -805,6 +933,11 @@ object PlaybackQueueManager {
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                val cur = _currentSongFlow.value
+                if (cur != null && com.lm.player.core.podcast.PodcastSongs.isPodcast(cur)) {
+                    handlePodcastPlayError(context, cur, player.currentPosition.coerceAtLeast(0L))
+                    return
+                }
                 handlePlayerError(error, context)
             }
         }
@@ -942,6 +1075,155 @@ object PlaybackQueueManager {
         }
     }
 
+    // ==================== 下一首预取（切歌提速） ====================
+    // 当前歌曲开始播放几秒后，后台提前解析「下一首」的播放地址；切到下一首时直接用，
+    // 省掉点击后才取链的 1~2 秒。预取结果按「歌曲 + 音质 + 服务器」校验，超时作废；
+    // 万一预取的链接已过期，onPlayerError 的 401/403/410 重新取链逻辑会兜底。
+
+    private class PrefetchedItem(
+        val songId: String,
+        val quality: String,
+        val serverKey: String,
+        val mediaItem: MediaItem,
+        val capture: PlaybackRouter.PrefetchCapture,
+        val createdAt: Long
+    )
+
+    private const val PREFETCH_DELAY_MS = 3_000L
+    private const val PREFETCH_TTL_MS = 15 * 60_000L
+
+    private var prefetchJob: Job? = null
+    @Volatile private var prefetchedItem: PrefetchedItem? = null
+    /** 随机播放时预先选定的下一首：playNext 优先使用它，保证预取能命中 */
+    @Volatile private var plannedShuffleNextId: String? = null
+
+    private suspend fun activeServerKeyForPrefetch(ctx: Context): String = withContext(Dispatchers.IO) {
+        runCatching {
+            ZdsDatabase.getInstance(ctx).serverDao().getActiveServer()?.let { "${it.id}|${it.serverUrl}" }
+        }.getOrNull().orEmpty()
+    }
+
+    private fun hasLocalFileForPrefetch(song: UnifiedSong): Boolean {
+        val path = song.localFilePath
+        return !path.isNullOrBlank() && java.io.File(path).let { it.exists() && it.length() > 0 }
+    }
+
+    // ==================== 播客单集（与手机端一致） ====================
+
+    /** 已经换成服务器代理地址重试过的单集，避免反复重试 */
+    private val podcastProxyTried = java.util.Collections.synchronizedSet(HashSet<String>())
+
+    /**
+     * 播客顺序续播：auto = true（自然播完）到最后一集就停；手动「下一首」到最后一集时提示。
+     * 不受单曲循环 / 随机影响。
+     */
+    fun playNextPodcast(context: Context, auto: Boolean) {
+        val current = _currentSongFlow.value ?: return
+        val list = _playlistFlow.value
+        val idx = list.indexOfFirst { it.id == current.id }
+        val next = if (idx >= 0) list.drop(idx + 1).firstOrNull { com.lm.player.core.podcast.PodcastSongs.isPodcast(it) } else null
+        if (next == null) {
+            if (auto) pause(context) else Toast.makeText(context.applicationContext, "已经是最后一集", Toast.LENGTH_SHORT).show()
+            return
+        }
+        playSong(next, context, startPositionMs = com.lm.player.core.podcast.PodcastController.resumePositionFor(next))
+    }
+
+    private fun playPreviousPodcast(context: Context) {
+        val current = _currentSongFlow.value ?: return
+        val list = _playlistFlow.value
+        val idx = list.indexOfFirst { it.id == current.id }
+        val prev = if (idx > 0) list.take(idx).lastOrNull { com.lm.player.core.podcast.PodcastSongs.isPodcast(it) } else null
+        if (prev == null) {
+            try { Media3Factory.getSharedExoPlayer(context).seekTo(0L) } catch (_: Exception) {}
+            return
+        }
+        playSong(prev, context, startPositionMs = com.lm.player.core.podcast.PodcastController.resumePositionFor(prev))
+    }
+
+    /** 播客音频直连失败（防盗链 / 证书 / 地区限制）：改走柠檬服务器代理重试一次 */
+    private fun handlePodcastPlayError(context: Context, song: UnifiedSong, resumePos: Long) {
+        val alreadyProxied = song.streamUrl.contains("/api/play/proxy") || !podcastProxyTried.add(song.id)
+        if (alreadyProxied) {
+            Toast.makeText(context.applicationContext, "播客《${song.title}》无法播放，请稍后再试或拉取最新", Toast.LENGTH_SHORT).show()
+            return
+        }
+        coroutineScope.launch {
+            val proxy = com.lm.player.core.podcast.PodcastController.resolveProxyUrl(context, song)
+            if (_currentSongFlow.value?.id != song.id) return@launch
+            if (proxy.isNullOrBlank()) {
+                Toast.makeText(context.applicationContext, "播客《${song.title}》无法播放，服务器也没能提供播放地址", Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+            Log.w(TAG, "Podcast direct url failed, retrying via server proxy: ${song.title}")
+            playSong(song.copy(streamUrl = proxy), context, startPositionMs = resumePos, forceRefresh = true)
+        }
+    }
+
+    private fun pickNextSongForPrefetch(): UnifiedSong? {
+        if (_isRepeatFlow.value) return null // 单曲循环：下一首还是自己
+        if (com.lm.player.core.podcast.PodcastSongs.isPodcast(_currentSongFlow.value)) return null // 播客直连音频无需预取
+        val list = _playlistFlow.value
+        if (list.size < 2) return null
+        val current = _currentSongFlow.value ?: return null
+        return if (_isShuffleFlow.value) {
+            val candidates = list.filter { it.id != current.id }
+            val planned = plannedShuffleNextId?.let { id -> candidates.firstOrNull { it.id == id } }
+            (planned ?: candidates.randomOrNull())?.also { plannedShuffleNextId = it.id }
+        } else {
+            val idx = list.indexOfFirst { it.id == current.id }
+            if (idx >= 0 && idx < list.size - 1) list[idx + 1] else list.first()
+        }
+    }
+
+    private fun schedulePrefetchNext(ctx: Context, playingSongId: String) {
+        prefetchJob?.cancel()
+        prefetchJob = coroutineScope.launch {
+            delay(PREFETCH_DELAY_MS) // 先让当前歌曲缓冲，避免抢带宽
+            if (_currentSongFlow.value?.id != playingSongId) return@launch
+            val next = pickNextSongForPrefetch() ?: return@launch
+            if (next.id == playingSongId || hasLocalFileForPrefetch(next)) return@launch
+            val existing = prefetchedItem
+            if (existing != null && existing.songId == next.id &&
+                System.currentTimeMillis() - existing.createdAt < PREFETCH_TTL_MS
+            ) return@launch
+            try {
+                val quality = com.lm.player.core.network.LemonMusicProtocol.getPreferredStreamQuality(ctx)
+                val serverKey = activeServerKeyForPrefetch(ctx)
+                val capture = PlaybackRouter.PrefetchCapture()
+                val db = ZdsDatabase.getInstance(ctx)
+                val item = PlaybackRouter(db.downloadDao(), ctx)
+                    .resolveMediaItem(next, prefetch = capture) ?: return@launch
+                val uri = item.localConfiguration?.uri?.toString().orEmpty()
+                if (uri.isBlank() || uri.startsWith("lemon_online://")) return@launch
+                prefetchedItem = PrefetchedItem(next.id, quality, serverKey, item, capture, System.currentTimeMillis())
+                Log.i(TAG, "Prefetched next song link: ${next.title}")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Prefetch next song failed: ${e.message}")
+            }
+        }
+    }
+
+    /** 取出并作废预取结果；不匹配（换歌/换音质/换服务器/超时）时返回 null，走正常取链 */
+    private suspend fun takePrefetchedItem(ctx: Context, song: UnifiedSong): MediaItem? {
+        val p = prefetchedItem ?: return null
+        prefetchedItem = null
+        if (p.songId != song.id) return null
+        if (System.currentTimeMillis() - p.createdAt > PREFETCH_TTL_MS) return null
+        if (p.quality != com.lm.player.core.network.LemonMusicProtocol.getPreferredStreamQuality(ctx)) return null
+        if (p.serverKey != activeServerKeyForPrefetch(ctx)) return null
+        // 回放预取时暂存的副作用：更新当前歌曲的流地址/格式/封面，补弹降档提示
+        val updates = synchronized(p.capture.songUpdates) { p.capture.songUpdates.toList() }
+        updates.forEach { if (_currentSongFlow.value?.id == song.id) updateCurrentSong(it) }
+        p.capture.pendingToast?.let { msg ->
+            withContext(Dispatchers.Main) { Toast.makeText(ctx.applicationContext, msg, Toast.LENGTH_SHORT).show() }
+        }
+        Log.i(TAG, "Using prefetched link for ${song.title}")
+        return p.mediaItem
+    }
+
     fun playSong(
         targetSong: UnifiedSong,
         context: Context,
@@ -953,8 +1235,10 @@ object PlaybackQueueManager {
     ) {
         ensurePlayerListener(context)
         _currentSongFlow.value = targetSong
-        // 写入本地播放足迹：离线时「最近播放」卡片即展示这份记录
-        promoteToRecentPlay(context, targetSong)
+        // 写入本地播放足迹：离线时「最近播放」卡片即展示这份记录（播客单集不计入，播客有「继续收听」）
+        if (!com.lm.player.core.podcast.PodcastSongs.isPodcast(targetSong)) {
+            promoteToRecentPlay(context, targetSong)
+        }
         if (newPlaylist != null && newPlaylist.isNotEmpty()) {
             _playlistFlow.value = newPlaylist
         } else if (_playlistFlow.value.isEmpty()) {
@@ -972,16 +1256,18 @@ object PlaybackQueueManager {
         )
 
         playJob?.cancel()
+        prefetchJob?.cancel()
         playJob = coroutineScope.launch {
             try {
                 val db = ZdsDatabase.getInstance(context)
                 val router = PlaybackRouter(db.downloadDao(), context)
-                val mediaItem: MediaItem? = router.resolveMediaItem(
-                    targetSong,
-                    forceRefresh = forceRefresh,
-                    streamPreResolved = streamPreResolved,
-                    overrideQuality = overrideQuality
-                )
+                val mediaItem: MediaItem? = (if (!forceRefresh && !streamPreResolved && overrideQuality == null) takePrefetchedItem(context, targetSong) else null)
+                    ?: router.resolveMediaItem(
+                        targetSong,
+                        forceRefresh = forceRefresh,
+                        streamPreResolved = streamPreResolved,
+                        overrideQuality = overrideQuality
+                    )
                 if (mediaItem == null) {
                     // 明确告知用户"这首放不了"，而不是让它显示成正在播放却毫无声音
                     Log.e(TAG, "playSong 中断：无法解析播放地址 (${targetSong.title})")
@@ -1001,9 +1287,13 @@ object PlaybackQueueManager {
                 } else {
                     player.setMediaItem(mediaItem)
                 }
+                // 播客与音乐各自的倍速（播客常用 1.5x，切回音乐要恢复）
+                val speed = com.lm.player.core.podcast.PodcastController.speedFor(context, targetSong)
+                if (player.playbackParameters.speed != speed) player.setPlaybackSpeed(speed)
                 player.prepare()
                 player.play()
                 Log.i(TAG, "playSong started: ${targetSong.title} (startPos=${startPositionMs}ms, forceRefresh=$forceRefresh)")
+                schedulePrefetchNext(context, targetSong.id)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -1029,13 +1319,20 @@ object PlaybackQueueManager {
             return
         }
         val current = _currentSongFlow.value
+        if (com.lm.player.core.podcast.PodcastSongs.isPodcast(current)) {
+            playNextPodcast(context, auto = false)
+            return
+        }
         val isShuffle = _isShuffleFlow.value
 
         val nextSong: UnifiedSong = if (isShuffle) {
             // 队列只有 1 首、或队列里与当前曲目同 id 的条目占满时，filter 结果会是空列表，
             // 直接 random() 会抛 NoSuchElementException（该回调运行在 ExoPlayer 主线程 → 必崩）。
             val candidates = list.filter { it.id != current?.id }.ifEmpty { list }
-            candidates.randomOrNull() ?: return
+            // 优先使用预取时选定的下一首，让预取的播放地址能命中
+            val planned = plannedShuffleNextId?.let { id -> candidates.firstOrNull { it.id == id } }
+            plannedShuffleNextId = null
+            planned ?: candidates.randomOrNull() ?: return
         } else {
             val currentIndex = list.indexOfFirst { it.id == current?.id }
             if (currentIndex >= 0 && currentIndex < list.size - 1) {
@@ -1063,6 +1360,10 @@ object PlaybackQueueManager {
             return
         }
         val current = _currentSongFlow.value
+        if (com.lm.player.core.podcast.PodcastSongs.isPodcast(current)) {
+            playPreviousPodcast(context)
+            return
+        }
         val isShuffle = _isShuffleFlow.value
 
         val prevSong: UnifiedSong = if (isShuffle) {

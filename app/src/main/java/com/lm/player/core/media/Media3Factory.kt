@@ -259,6 +259,11 @@ object Media3Factory {
             Log.w(TAG, "Failed to release shared ExoPlayer", e)
         }
     }
+
+    /** 只读取已存在的共享播放器，不会创建（桌面小部件取歌词进度用，避免冷进程里白建播放器） */
+    @Synchronized
+    fun peekSharedExoPlayer(): ExoPlayer? = sharedExoPlayer
+
     @Synchronized
     fun getSharedExoPlayer(context: Context): ExoPlayer {
         sharedExoPlayer?.let { return it }

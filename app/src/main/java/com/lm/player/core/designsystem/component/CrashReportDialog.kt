@@ -1,5 +1,6 @@
 package com.lm.player.core.designsystem.component
 
+import com.lm.player.core.designsystem.component.TvDialog as Dialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -40,7 +41,6 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
 import com.lm.player.core.security.LogRedactor

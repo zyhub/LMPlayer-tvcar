@@ -20,6 +20,7 @@ import androidx.compose.material3.*
 import androidx.compose.material3.windowsizeclass.WindowWidthSizeClass
 import androidx.compose.foundation.focusable
 import com.lm.player.core.designsystem.component.TvFocusScope
+import com.lm.player.core.designsystem.component.RecomposeIsolation
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -223,7 +224,7 @@ fun AdaptiveAppScaffold(
                 }
             }
 
-            // 中间：四大核心页面切换按钮（我的 · 搜索 · 发现 · 设置），光标移到即自动切换
+            // 中间：五大核心页面切换按钮（我的 · 搜索 · 发现 · 播客 · 设置），光标移到即自动切换
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(14.dp)
@@ -243,6 +244,11 @@ fun AdaptiveAppScaffold(
                     isSelected = effectiveScreen == Screen.HOME,
                     modifier = Modifier.focusRequester(discoverTabFocusRequester),
                     onClick = { onNavigate(Screen.HOME) }
+                )
+                KuwoTopTabButton(
+                    label = "播客",
+                    isSelected = effectiveScreen == Screen.PODCASTS,
+                    onClick = { onNavigate(Screen.PODCASTS) }
                 )
                 KuwoTopTabButton(
                     label = "设置",
@@ -268,6 +274,7 @@ fun AdaptiveAppScaffold(
             TvPersistentVinylPlayerCard(
                 song = currentPlayingSong,
                 isPlaying = isPlaying,
+                animateVinyl = !isFullPlayerVisible,
                 progressMsProvider = progressMsProvider,
                 totalDurationMs = totalDurationMs,
                 currentLyrics = currentLyrics,
@@ -396,6 +403,8 @@ private fun KuwoTopTabButton(
 private fun TvPersistentVinylPlayerCard(
     song: UnifiedSong?,
     isPlaying: Boolean,
+    /** 性能优化 A1：全屏播放页盖住主界面时不再推进黑胶角度 (看不见，无需让本卡片随时钟失效) */
+    animateVinyl: Boolean = true,
     progressMsProvider: () -> Long,
     totalDurationMs: Long,
     currentLyrics: LyricResult,
@@ -436,11 +445,10 @@ private fun TvPersistentVinylPlayerCard(
 
     // 黑胶唱片旋转角度与全屏播放页共享同一全局角度，两处转速与相位始终一致。
     // 返回只读 State：在 graphicsLayer 内延迟读取，逐帧只失效那一层，不触发整卡/整页重组。
-    val vinylRotation = rememberVinylRotation(isPlaying)
+    val vinylRotation = rememberVinylRotation(isPlaying && animateVinyl)
 
-    // 进度状态在这里才被真正读取：订阅范围因此收窄到本卡片，
-    // 而不是上一层的整个 Activity 组合树 (见 progressMsProvider 参数的注释)。
-    val progressMs = progressMsProvider()
+    // 性能优化 A3：进度不再在卡片顶层读取 (否则每 0.5 秒整张卡片重算一次)，
+    // 只在进度条、时间文字 (RecomposeIsolation 内) 与歌词组件内部读取。
 
     val streamQualityVer by LemonMusicProtocol.streamQualityConfigVersion.collectAsState()
     val (qualityBadge, bitrateBadge, sizeBadge) = remember(
@@ -491,14 +499,13 @@ private fun TvPersistentVinylPlayerCard(
     val effectiveDuration = if (totalDurationMs > 0L) totalDurationMs else (song?.durationMs ?: 0L)
     // 进度条支持点击/拖动跳转：拖动期间由手势比例接管显示，松手才真正 seek，避免被外部进度弹回
     var cardSeekDragFraction by remember(song?.id) { mutableStateOf<Float?>(null) }
-    val actualProgressFraction = if (effectiveDuration > 0L) {
-        (progressMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
+    // 以下两个取值函数只能在 RecomposeIsolation 内调用，读取进度的重组范围才不会扩散到整张卡片
+    fun currentProgressFraction(): Float = cardSeekDragFraction ?: if (effectiveDuration > 0L) {
+        (progressMsProvider().toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
     } else 0f
-    val progressFraction = cardSeekDragFraction ?: actualProgressFraction
-    val displayedProgressMs = if (cardSeekDragFraction != null && effectiveDuration > 0L) {
-        (cardSeekDragFraction!! * effectiveDuration).toLong()
-    } else {
-        progressMs
+    fun currentDisplayedProgressMs(): Long {
+        val drag = cardSeekDragFraction
+        return if (drag != null && effectiveDuration > 0L) (drag * effectiveDuration).toLong() else progressMsProvider()
     }
 
     Surface(
@@ -614,7 +621,8 @@ private fun TvPersistentVinylPlayerCard(
                     if (song != null) {
                         LyricsScrollingView(
                             lyrics = currentLyrics.lines,
-                            currentPositionMs = progressMs,
+                            currentPositionMsProvider = progressMsProvider,
+                            animationsActive = animateVinyl,
                             onSeekToLyric = onSeekTo,
                             fontSizeSp = dimensions.cardHeaderSize.value,
                             showAdjustButton = false,
@@ -828,24 +836,28 @@ private fun TvPersistentVinylPlayerCard(
                         .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.16f)),
                     contentAlignment = Alignment.CenterStart
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth(progressFraction)
-                            .fillMaxHeight()
-                            .clip(RoundedCornerShape(2.dp))
-                            .background(Color(0xFFFFC947))
-                    )
+                    RecomposeIsolation {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(currentProgressFraction())
+                                .fillMaxHeight()
+                                .clip(RoundedCornerShape(2.dp))
+                                .background(Color(0xFFFFC947))
+                        )
+                    }
                 }
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text(
-                        text = formatVinylTime(displayedProgressMs),
-                        fontSize = dimensions.badgeSize,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    RecomposeIsolation {
+                        Text(
+                            text = formatVinylTime(currentDisplayedProgressMs()),
+                            fontSize = dimensions.badgeSize,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                     Text(
                         text = formatVinylTime(effectiveDuration),
                         fontSize = dimensions.badgeSize,

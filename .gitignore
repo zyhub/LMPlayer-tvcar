@@ -17,7 +17,11 @@ local.properties
 *.ap_
 *.aab
 
-# IDE
+# 调试与审计文档（切勿提交）
+*audit*.md
+*审计*.md
+tvcar审计报告.md
+
 .idea/
 *.iml
 .DS_Store

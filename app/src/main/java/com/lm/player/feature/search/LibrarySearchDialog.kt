@@ -1,5 +1,7 @@
 package com.lm.player.feature.search
 
+import com.lm.player.core.designsystem.component.TvDialog as Dialog
+import com.lm.player.core.designsystem.component.tvTextFieldKeys
 import android.os.Build
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -30,7 +32,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
 import com.lm.player.core.designsystem.component.DownloadQualityChoiceDialog
 import com.lm.player.core.designsystem.component.LocalPlatformMode
 import com.lm.player.core.designsystem.component.tvButtonFocusable
@@ -331,6 +332,8 @@ fun LibrarySearchDialog(
     onParseExternalPlaylist: (suspend (url: String, source: OnlineMusicSource) -> List<UnifiedSong>)? = null,
     isServerConnected: Boolean = true,
     contentPadding: PaddingValues = PaddingValues(0.dp),
+    // 桌面搜索小部件带来的关键词：打开即搜索；已在搜索页时又从小部件搜了一次则替换当前输入
+    initialQuery: String = "",
     onDismiss: () -> Unit
 ) {
     val dimensions = LocalAppDimensions.current
@@ -339,7 +342,10 @@ fun LibrarySearchDialog(
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val borderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
 
-    var query by remember { mutableStateOf("") }
+    var query by remember { mutableStateOf(initialQuery) }
+    LaunchedEffect(initialQuery) {
+        if (initialQuery.isNotBlank() && query != initialQuery) query = initialQuery
+    }
     var selectedSource by remember(initialOnlineSource) { mutableStateOf(initialOnlineSource) }
     var sourceMenuExpanded by remember { mutableStateOf(false) }
     var onlineResults by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
@@ -1346,7 +1352,7 @@ fun LibrarySearchDialog(
                         placeholder = { Text("输入中文歌名、歌手，或粘贴外部歌单 URL...") },
                         singleLine = true,
                         shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.tvTextFieldKeys().fillMaxWidth()
                     )
                     Row(
                         modifier = Modifier.fillMaxWidth(),

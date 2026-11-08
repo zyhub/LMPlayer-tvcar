@@ -1,5 +1,7 @@
 package com.lm.player.feature.download
 
+import com.lm.player.core.designsystem.component.TvAlertDialog as AlertDialog
+import com.lm.player.core.designsystem.component.TvDialog as Dialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -29,7 +31,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
 import com.lm.player.core.designsystem.component.AlbumArtworkImage
 import com.lm.player.core.designsystem.component.tvButtonFocusable
 import com.lm.player.core.designsystem.component.tvFocusable
@@ -102,9 +103,10 @@ fun DownloadManagerScreen(
 
     LaunchedEffect(selectedTab, serverDownloads) {
         if (selectedTab == 1) {
+            // 服务端排队状态是 waiting：此前只看 downloading，排队中的任务不会自动刷新出进度
             val hasActiveTasks = serverDownloads.any {
                 val s = it.status.lowercase()
-                s == "downloading" || s == "pending" || s == "running"
+                s == "downloading" || s == "waiting" || s == "pending" || s == "running"
             }
             if (hasActiveTasks) {
                 kotlinx.coroutines.delay(3000L)
@@ -974,13 +976,54 @@ fun DownloadManagerScreen(
         )
     }
 
-    // 6.0 假无损拦截/换源降级决策弹窗
+    // 6.0 服务端「待确认」下载任务决策弹窗：降档 (await_confirm) / 换源 (await_source) / 同名文件 (await_exist)
+    // 严格对齐 server/routes/download.js 的 confirm-*/reject-*/skip-exist/:id 接口
     if (taskPendingConfirm != null) {
         val targetTask = taskPendingConfirm!!
+        val pendingStatus = targetTask.status.lowercase()
+        fun runTaskAction(successMsg: String, block: suspend () -> Result<Boolean>) {
+            taskPendingConfirm = null
+            coroutineScope.launch {
+                block()
+                    .onSuccess {
+                        Toast.makeText(context, successMsg, Toast.LENGTH_SHORT).show()
+                        refreshServerDownloads()
+                    }
+                    .onFailure {
+                        Toast.makeText(context, "处理失败: ${it.message}", Toast.LENGTH_SHORT).show()
+                        refreshServerDownloads()
+                    }
+            }
+        }
+        val dialogTitle = when (pendingStatus) {
+            "await_source" -> "音源切换确认"
+            "await_exist" -> "同名文件已存在"
+            else -> "音质降档确认"
+        }
+        val dialogDesc = when (pendingStatus) {
+            "await_source" -> {
+                val failed = targetTask.sourceFailedName.ifBlank { "当前音源" }
+                if (targetTask.sourceAlternatives.isEmpty()) {
+                    "音源「$failed」取链失败，且没有其他已激活的音源可切换。可在设置中激活更多音源后重试，或放弃该任务。"
+                } else {
+                    "音源「$failed」取链失败，可切换到以下已激活音源重新下载："
+                }
+            }
+            "await_exist" -> {
+                val local = targetTask.existLocalLabel.ifBlank { "已有文件" }
+                val wanted = targetTask.existRequestedLabel.ifBlank { targetTask.quality.uppercase() }
+                "服务器上已有同名文件（$local），本次请求下载 $wanted。请选择处理方式："
+            }
+            else -> {
+                val from = targetTask.downgradeFromLabel.ifBlank { targetTask.quality.uppercase() }
+                val to = targetTask.downgradeToLabel.ifBlank { "低一档音质" }
+                "$from 多次下载失败，可改用 $to 继续下载。确认后，本批其余等待降档的任务也会自动降档。"
+            }
+        }
         AlertDialog(
             onDismissRequest = { taskPendingConfirm = null },
             title = {
-                Text("音质校验与换源决策", fontWeight = FontWeight.Bold)
+                Text(dialogTitle, fontWeight = FontWeight.Bold)
             },
             text = {
                 Column {
@@ -991,61 +1034,132 @@ fun DownloadManagerScreen(
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "服务端检测到该曲目当前音源为假无损（或源文件失效），已智能暂停下载。请选择处理策略：",
+                        text = dialogDesc,
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    when (pendingStatus) {
+                        "await_source" -> {
+                            // 每个备用音源一个按钮：服务端要求 sourceApiId 必须取自 alternatives
+                            targetTask.sourceAlternatives.forEach { alt ->
+                                Button(
+                                    onClick = {
+                                        runTaskAction("已切换到「${alt.name}」重新下载") {
+                                            LemonMusicProtocol.confirmDownloadSource(targetTask.id, alt.id, context)
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .tvButtonFocusable(shape = RoundedCornerShape(10.dp))
+                                ) {
+                                    Text("切换到「${alt.name}」", maxLines = 1)
+                                }
+                                Spacer(modifier = Modifier.height(6.dp))
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    runTaskAction("已放弃换源，任务标记为失败") {
+                                        LemonMusicProtocol.runDownloadTaskAction(targetTask.id, "reject-source", context = context)
+                                    }
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .tvButtonFocusable(shape = RoundedCornerShape(10.dp))
+                            ) {
+                                Text("不切换（标记为失败）")
+                            }
+                        }
+                        "await_exist" -> {
+                            // 服务端 confirm-exist / skip-exist 支持 applyToRest：对本批其余同名文件任务套用同一选择
+                            var existApplyToRest by remember(targetTask.id) { mutableStateOf(false) }
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .tvButtonFocusable(shape = RoundedCornerShape(10.dp))
+                                    .clickable { existApplyToRest = !existApplyToRest }
+                                    .padding(vertical = 2.dp)
+                            ) {
+                                androidx.compose.material3.Checkbox(
+                                    checked = existApplyToRest,
+                                    onCheckedChange = null,
+                                    colors = androidx.compose.material3.CheckboxDefaults.colors(checkedColor = AppleRed)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    "本批其余同名文件也按此处理",
+                                    fontSize = 13.sp,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Button(
+                                onClick = {
+                                    runTaskAction("已跳过，沿用服务器上的已有文件") {
+                                        LemonMusicProtocol.runDownloadTaskAction(targetTask.id, "skip-exist", applyToRest = existApplyToRest, context = context)
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .tvButtonFocusable(shape = RoundedCornerShape(10.dp))
+                            ) {
+                                Text("跳过，沿用已有文件")
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            OutlinedButton(
+                                onClick = {
+                                    runTaskAction("已确认继续下载") {
+                                        LemonMusicProtocol.runDownloadTaskAction(targetTask.id, "confirm-exist", applyToRest = existApplyToRest, context = context)
+                                    }
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .tvButtonFocusable(shape = RoundedCornerShape(10.dp))
+                            ) {
+                                Text("仍然下载（与已有文件并存）")
+                            }
+                        }
+                        else -> {
+                            val toLabel = targetTask.downgradeToLabel.ifBlank { "低一档音质" }
+                            Button(
+                                onClick = {
+                                    runTaskAction("已确认改用 $toLabel 下载") {
+                                        LemonMusicProtocol.confirmDownloadDowngrade(targetTask.id, context)
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .tvButtonFocusable(shape = RoundedCornerShape(10.dp))
+                            ) {
+                                Text("✔ 改用 $toLabel 下载")
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            OutlinedButton(
+                                onClick = {
+                                    runTaskAction("已拒绝降档，任务标记为失败") {
+                                        LemonMusicProtocol.runDownloadTaskAction(targetTask.id, "reject-downgrade", context = context)
+                                    }
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .tvButtonFocusable(shape = RoundedCornerShape(10.dp))
+                            ) {
+                                Text("不降档（标记为失败）")
+                            }
+                        }
+                    }
                 }
             },
             confirmButton = {
-                Button(
-                    onClick = {
-                        val taskId = targetTask.id
-                        taskPendingConfirm = null
-                        coroutineScope.launch {
-                            LemonMusicProtocol.confirmDownloadDowngrade(taskId, "320k", context)
-                                .onSuccess {
-                                    Toast.makeText(context, "已确认降档为 320K 极高品质", Toast.LENGTH_SHORT).show()
-                                    refreshServerDownloads()
-                                }
-                                .onFailure {
-                                    Toast.makeText(context, "处理失败: ${it.message}", Toast.LENGTH_SHORT).show()
-                                }
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                TextButton(
+                    onClick = { taskPendingConfirm = null },
                     modifier = Modifier.tvButtonFocusable(shape = RoundedCornerShape(10.dp))
                 ) {
-                    Text("✔ 确认降档 (320k)")
-                }
-            },
-            dismissButton = {
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    OutlinedButton(
-                        onClick = {
-                            val taskId = targetTask.id
-                            taskPendingConfirm = null
-                            coroutineScope.launch {
-                                LemonMusicProtocol.confirmDownloadSource(taskId, "auto", context)
-                                    .onSuccess {
-                                        Toast.makeText(context, "已触发服务端自动换源重试", Toast.LENGTH_SHORT).show()
-                                        refreshServerDownloads()
-                                    }
-                                    .onFailure {
-                                        Toast.makeText(context, "换源重试失败: ${it.message}", Toast.LENGTH_SHORT).show()
-                                    }
-                            }
-                        },
-                        modifier = Modifier.tvButtonFocusable(shape = RoundedCornerShape(10.dp))
-                    ) {
-                        Text("换源重试")
-                    }
-                    TextButton(
-                        onClick = { taskPendingConfirm = null },
-                        modifier = Modifier.tvButtonFocusable(shape = RoundedCornerShape(10.dp))
-                    ) {
-                        Text("取消")
-                    }
+                    Text("稍后处理")
                 }
             }
         )
@@ -1721,7 +1835,9 @@ private fun ServerDownloadTaskRow(
         "waiting" -> "排队中"
         "error" -> if (task.error.isNotBlank()) "失败: ${task.error}" else "下载失败"
         "paused" -> "已暂停"
-        "await_confirm" -> "待确认"
+        "await_confirm" -> "待确认降档"
+        "await_source" -> "待切换音源"
+        "await_exist" -> "同名文件待处理"
         else -> task.status
     }
 
@@ -1731,8 +1847,10 @@ private fun ServerDownloadTaskRow(
         "waiting" -> Color(0xFFFF9500)
         "error" -> Color(0xFFFF3B30)
         "paused" -> Color.Gray
+        "await_confirm", "await_source", "await_exist" -> Color(0xFFFF9500)
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
+    val needsDecision = task.status.lowercase() in setOf("await_confirm", "await_source", "await_exist")
 
     Surface(
         shape = RoundedCornerShape(14.dp),
@@ -1744,7 +1862,8 @@ private fun ServerDownloadTaskRow(
                 shape = RoundedCornerShape(14.dp),
                 focusedScale = 1.015f,
                 onClick = {
-                    if (task.status.lowercase() == "await_confirm") {
+                    // 降档 / 换源 / 同名文件三类待确认任务都需要用户决策，否则会一直卡在队列里
+                    if (needsDecision) {
                         onConfirmDowngrade()
                     }
                 }
@@ -1861,6 +1980,18 @@ private fun ServerDownloadTaskRow(
                         modifier = Modifier.size(20.dp)
                     )
                 }
+            }
+
+            // 待确认任务：展示服务端给出的原因，并提示按确认键处理（整行可聚焦点击）
+            if (needsDecision) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = (if (task.error.isNotBlank()) task.error + " · " else "") + "按确认键处理",
+                    fontSize = 11.sp,
+                    color = Color(0xFFFF9500),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
 
             // 若在下载中，展示进度条

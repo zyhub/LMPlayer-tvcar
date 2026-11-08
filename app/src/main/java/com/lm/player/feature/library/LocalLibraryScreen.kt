@@ -1,5 +1,8 @@
 package com.lm.player.feature.library
 
+import com.lm.player.core.designsystem.component.TvAlertDialog as AlertDialog
+import com.lm.player.core.designsystem.component.TvDialog as Dialog
+import com.lm.player.core.designsystem.component.tvTextFieldKeys
 import android.util.Log
 import android.widget.Toast
 import java.io.File
@@ -43,7 +46,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
 import com.lm.player.core.designsystem.component.AlbumArtworkImage
 import com.lm.player.core.designsystem.component.BatchDownloadQualityChoiceDialog
 import com.lm.player.core.designsystem.component.DownloadQualityChoiceDialog
@@ -2448,7 +2450,7 @@ fun LocalLibraryScreen(
                         onValueChange = { newPlaylistName = it },
                         label = { Text("歌单名称") },
                         singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.tvTextFieldKeys().fillMaxWidth(),
                         shape = RoundedCornerShape(12.dp)
                     )
                     Spacer(modifier = Modifier.height(14.dp))

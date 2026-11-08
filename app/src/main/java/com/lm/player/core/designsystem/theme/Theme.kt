@@ -180,11 +180,8 @@ fun LMPlayerTheme(
         SideEffect {
             val window = (view.context as? Activity)?.window
             if (window != null) {
-                window.statusBarColor = Color.Transparent.toArgb()
-                window.navigationBarColor = Color.Transparent.toArgb()
-                val controller = WindowCompat.getInsetsController(window, view)
-                controller.isAppearanceLightStatusBars = !darkTheme
-                controller.isAppearanceLightNavigationBars = !darkTheme
+                // 系统栏按主题显式着色（透明会露出浅色窗口底，深色模式下顶部一条白）
+                SystemBarsStyler.applyBase(window, view, darkTheme)
             }
         }
     }

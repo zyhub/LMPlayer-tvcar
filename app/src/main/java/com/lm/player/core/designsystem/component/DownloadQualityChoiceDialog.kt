@@ -1,5 +1,7 @@
 package com.lm.player.core.designsystem.component
 
+import com.lm.player.core.designsystem.component.TvDialog as Dialog
+import com.lm.player.core.designsystem.component.TvDropdownMenu as DropdownMenu
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.expandVertically
@@ -25,7 +27,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.model.AudioQuality
 import com.lm.player.core.model.DownloadTarget
@@ -48,6 +49,10 @@ fun DownloadQualityDropdownMenu(
     onConfirm: (target: DownloadTarget, quality: AudioQuality) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    // 服务器确认离线 / 已删除时不再提供「服务器下载 / 双端下载」
+    val serverLinkState by com.lm.player.core.source.ServerLinkState.state.collectAsState()
+    @Suppress("NAME_SHADOWING")
+    val isServerConnected = isServerConnected && !serverLinkState.isLost
     val context = androidx.compose.ui.platform.LocalContext.current
     val savedDefaultTarget = remember(context, expanded) {
         val raw = context.getSharedPreferences("lemon_settings_prefs", android.content.Context.MODE_PRIVATE)
@@ -152,6 +157,10 @@ fun DownloadQualityDropdownMenu(
                             Triple(DownloadTarget.SERVER, "☁️ 服务器下载", isServerConnected),
                             Triple(DownloadTarget.BOTH, "🔄 双端下载", isServerConnected)
                         )
+                    }.let { opts ->
+                        // 服务器离线：直接隐藏服务器相关选项，只保留本地下载（已在本地的也允许重新下载）
+                        if (isServerConnected) opts
+                        else listOf(Triple(DownloadTarget.LOCAL, "📱 本地下载", true))
                     }
                 }
 
@@ -332,6 +341,10 @@ fun DownloadQualityChoiceDialog(
     onConfirm: (target: DownloadTarget, quality: AudioQuality) -> Unit,
     onDismiss: () -> Unit
 ) {
+    // 服务器确认离线 / 已删除时不再提供「服务器下载 / 双端下载」
+    val serverLinkState by com.lm.player.core.source.ServerLinkState.state.collectAsState()
+    @Suppress("NAME_SHADOWING")
+    val isServerConnected = isServerConnected && !serverLinkState.isLost
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
     val surfaceBg = if (isDark) Color(0xFF222228) else Color.White
     val borderColor = if (isDark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
@@ -363,7 +376,9 @@ fun DownloadQualityChoiceDialog(
         runCatching { confirmFocusRequester.requestFocus() }
     }
 
-    val visibleTargets = remember(hasLocal, hasServer) {
+    val visibleTargets = remember(hasLocal, hasServer, isServerConnected) {
+        // 服务器离线：只保留本地下载
+        if (!isServerConnected) return@remember listOf(DownloadTarget.LOCAL)
         when {
             hasLocal && !hasServer -> listOf(DownloadTarget.SERVER, DownloadTarget.BOTH)
             !hasLocal && hasServer -> listOf(DownloadTarget.LOCAL, DownloadTarget.BOTH)

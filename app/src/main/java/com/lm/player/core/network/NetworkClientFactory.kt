@@ -70,9 +70,71 @@ object NetworkClientFactory {
 
     fun getActiveAuthToken(): String = activeAuthToken
 
+    /**
+     * 发往**已登记的柠檬服务器主机**的请求：把 URL 里的 `token=` 参数移到 Authorization 头里。
+     * 旧版本把 Token 拼在播放/封面地址里并存进了数据库，这里保证它不会再出现在请求行（服务端访问日志、
+     * 反向代理日志）里。优先使用当前有效的 Token，没有时才用 URL 里的旧值。
+     * 未登记任何主机时不处理（避免误删第三方地址里同名的 token 参数）。
+     */
+    private fun moveTokenParamToHeader(request: okhttp3.Request, reqBuilder: okhttp3.Request.Builder): Boolean {
+        val tokenParam = request.url.queryParameter("token")?.takeIf { it.isNotBlank() } ?: return false
+        if (authTokenHosts.isEmpty() || !isTokenHostAllowed(request.url.host)) return false
+        reqBuilder.url(request.url.newBuilder().removeAllQueryParameters("token").build())
+        if (request.header("Authorization").isNullOrBlank()) {
+            val bearer = activeAuthToken.takeIf { it.isNotBlank() } ?: tokenParam
+            reqBuilder.header("Authorization", "Bearer $bearer")
+        }
+        return true
+    }
+
     fun clearActiveAuthToken() {
         activeAuthToken = ""
         authTokenHosts.clear()
+    }
+
+    /**
+     * 会话失效（401）时的重新登录回调：返回该主机的新 Token；无法重登（无保存密码 / 密码错误 / 网络失败）返回 null。
+     * 由 LemonMusicProtocol.installSessionReauth 在 Application 启动时注册。
+     */
+    fun interface ReauthProvider {
+        fun refreshToken(host: String, failedToken: String?): String?
+    }
+
+    @Volatile
+    var reauthProvider: ReauthProvider? = null
+
+    /**
+     * 柠檬服务端会话过期（30 天未活跃、改密码、恢复备份、重建容器等）后所有接口都会 401。
+     * 此前客户端没有任何 401 处理，只能删掉服务器重新添加。这里对**已登记的服务器主机**的 /api/ 请求
+     * 做一次自动重登并重试；以下情况不处理，直接把 401 交还调用方：
+     * - /api/auth/ 下的接口（登录、会话校验本身，避免递归）；
+     * - 带 ?ticket= 的流媒体地址（服务端只认 ticket，换 Bearer 也无效，应由播放层重新取链）；
+     * - 非本服务器主机（第三方 CDN 等）；
+     * - 已经重试过一次的请求。
+     */
+    private val sessionAuthenticator: okhttp3.Authenticator = object : okhttp3.Authenticator {
+        override fun authenticate(route: okhttp3.Route?, response: okhttp3.Response): okhttp3.Request? {
+            val request = response.request
+            if (response.priorResponse != null) return null
+            val provider = reauthProvider ?: return null
+            val path = request.url.encodedPath
+            if (!path.startsWith("/api/") || path.startsWith("/api/auth/") || path.startsWith("/api/v1/auth/")) {
+                return null
+            }
+            if (request.url.queryParameter("ticket") != null) return null
+            // 注意 isTokenHostAllowed 在白名单为空时放行所有主机，这里必须显式要求已登记
+            if (authTokenHosts.isEmpty() || !isTokenHostAllowed(request.url.host)) return null
+            val failedToken = request.header("Authorization")
+                ?.removePrefix("Bearer ")
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?: request.url.queryParameter("token")
+            val fresh = runCatching { provider.refreshToken(request.url.host, failedToken) }.getOrNull()
+            if (fresh.isNullOrBlank() || fresh == failedToken) return null
+            return request.newBuilder()
+                .header("Authorization", "Bearer $fresh")
+                .build()
+        }
     }
 
     fun createOkHttpClient(context: Context): OkHttpClient {
@@ -118,10 +180,15 @@ object NetworkClientFactory {
             // 正常情况下单次读取不会超时），只用来兜住「长时间挂死」的极端情况。
             .callTimeout(300, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
+            // 会话过期 401 → 用本地保存的密码自动重登一次并重试（见 sessionAuthenticator）
+            .authenticator(sessionAuthenticator)
 
         if (cache != null) {
             builder.cache(cache)
         }
+
+        // 本地目录网关（必须最先执行）：目录类接口本地加速 + 服务器离线熔断，见 LocalCatalogGateway
+        builder.addInterceptor(com.lm.player.core.source.catalog.LocalCatalogGateway)
 
         // 统一注入现代主流 User-Agent 与自动补齐柠檬服务端 Authorization 头
         builder.addInterceptor { chain ->
@@ -151,7 +218,9 @@ object NetworkClientFactory {
             // 若 URL 中携带 token 参数或访问柠檬服务端 API 且未显式指定 Authorization 请求头，自动补充 Bearer Token
             // 严格做 Host 白名单核验，避免把柠檬服务端 Bearer Token 泄露给第三方 /api/ 接口 (TV-P0-01)
             val tokenParam = request.url.queryParameter("token")
-            if (request.header("Authorization").isNullOrBlank()) {
+            if (moveTokenParamToHeader(request, reqBuilder)) {
+                // 已把 URL 中的 token 移到请求头
+            } else if (request.header("Authorization").isNullOrBlank()) {
                 if (!tokenParam.isNullOrBlank() && isTokenHostAllowed(request.url.host)) {
                     reqBuilder.header("Authorization", "Bearer $tokenParam")
                 } else if (activeAuthToken.isNotBlank() && encodedPath.startsWith("/api/") && isTokenHostAllowed(request.url.host)) {
@@ -176,10 +245,14 @@ object NetworkClientFactory {
                         elapsedMs = elapsed,
                         success = response.isSuccessful
                     )
+                    // 反代 502/503/504 或返回 HTML 页面（柠檬服务被删、反代还在）说明柠檬服务本身已不可用：
+                    // 上报失败，触发 /api/health 语义探活
+                    val respType = response.header("Content-Type").orEmpty().lowercase()
+                    val notLemon = response.code in 502..504 || respType.contains("text/html")
                     com.lm.player.core.source.SourceAccelerationController.onServerSample(
                         host = request.url.host,
                         elapsedMs = elapsed,
-                        success = true
+                        success = !notLemon
                     )
                 }
                 response
@@ -234,8 +307,10 @@ object NetworkClientFactory {
 
         val pool = okhttp3.ConnectionPool(64, 5, java.util.concurrent.TimeUnit.MINUTES)
         val dispatcher = okhttp3.Dispatcher().apply {
-            maxRequests = 128
-            maxRequestsPerHost = 32
+            // 流畅模式 (第二批)：老设备上并发请求过多会与界面线程抢 CPU，降到 16 / 单主机 8 (启动时生效)
+            val smooth = com.lm.player.core.designsystem.theme.SmoothMode.activeAtStartup
+            maxRequests = if (smooth) 16 else 128
+            maxRequestsPerHost = if (smooth) 8 else 32
         }
 
         val client = OkHttpClient.Builder()
@@ -248,6 +323,8 @@ object NetworkClientFactory {
             .followRedirects(true)
             .followSslRedirects(true)
             .retryOnConnectionFailure(true)
+            // 服务器封面 /api/tag/cover 同样会因会话过期 401，与共享客户端共用自动重登逻辑
+            .authenticator(sessionAuthenticator)
             .addInterceptor { chain ->
                 val origReq = chain.request()
                 var urlStr = origReq.url.toString()
@@ -281,7 +358,9 @@ object NetworkClientFactory {
 
                 // 4. 若图片请求指向柠檬音乐服务器 (/api/tag/cover, /api/cover 等)，自动注入服务端鉴权 Bearer Token，杜绝 401 Unauthorized 导致歌曲封面加载失败
                 val tokenParam = origReq.url.queryParameter("token")
-                if (origReq.header("Authorization").isNullOrBlank()) {
+                if (moveTokenParamToHeader(origReq, reqBuilder)) {
+                    // 已把 URL 中的 token 移到请求头
+                } else if (origReq.header("Authorization").isNullOrBlank()) {
                     if (!tokenParam.isNullOrBlank() && isTokenHostAllowed(origReq.url.host)) {
                         reqBuilder.header("Authorization", "Bearer $tokenParam")
                     } else if (activeAuthToken.isNotBlank() && isTokenHostAllowed(origReq.url.host)) {

@@ -1,5 +1,6 @@
 package com.lm.player.feature.settings
 
+import com.lm.player.core.designsystem.component.TvDialog as Dialog
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -16,7 +17,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.update.UpdateInfo

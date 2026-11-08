@@ -1,5 +1,9 @@
 package com.lm.player.feature.settings
 
+import com.lm.player.core.designsystem.component.TvAlertDialog as AlertDialog
+import com.lm.player.core.designsystem.component.TvDialog as Dialog
+import com.lm.player.core.designsystem.component.TvDropdownMenu as DropdownMenu
+import com.lm.player.core.designsystem.component.tvTextFieldKeys
 import android.content.Context
 import android.widget.Toast
 import androidx.compose.animation.*
@@ -36,7 +40,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
 import com.lm.player.core.database.ZdsDatabase
 import com.lm.player.core.designsystem.component.LocalPlatformMode
 import com.lm.player.core.designsystem.component.tvButtonFocusable
@@ -108,6 +111,9 @@ fun SettingsScreen(
     onChooseDownloadDirectory: () -> Unit = {},
     onImportCustomFolder: () -> Unit = {},
     onOpenLocalFolderPicker: () -> Unit = {},
+    /** 存储相关操作前统一检查 / 申请权限 (needWrite, 就绪后执行的动作)；被拒绝时由 Activity 弹出说明 */
+    requestStoragePermission: (Boolean, () -> Unit) -> Unit = { _, onReady -> onReady() },
+    onOpenAppPermissionSettings: () -> Unit = {},
     onLocalScanCompleted: () -> Unit = {},
     onOpenDownloads: () -> Unit,
     onExitAppCompletely: () -> Unit = {},
@@ -234,6 +240,12 @@ fun SettingsScreen(
     }
 
     var isScanningLocalAndServer by remember { mutableStateOf(false) }
+    var showStorageDiagnostics by remember { mutableStateOf(false) }
+    // 第十九节：扫描状态来自进程级后台扫描引擎 (离开设置页再回来仍能看到进度)
+    val localScanState by com.lm.player.core.media.LocalScanEngine.state.collectAsState()
+    LaunchedEffect(localScanState?.isRunning) {
+        isScanningLocalAndServer = localScanState?.isRunning == true
+    }
     var showAddLocalPathDialog by remember { mutableStateOf(false) }
     var newLocalPathInput by remember { mutableStateOf("") }
 
@@ -1008,46 +1020,18 @@ fun SettingsScreen(
 
                                 Button(
                                     onClick = {
-                                        if (!isScanningLocalAndServer) {
-                                            isScanningLocalAndServer = true
-                                            coroutineScope.launch {
-                                                try {
-                                                    withContext(Dispatchers.Main) {
-                                                        Toast.makeText(context, "正在全盘及配置目录扫描音频并与服务器比对...", Toast.LENGTH_SHORT).show()
-                                                    }
-                                                    var totalScanned = 0
-                                                    // 1. 自动聚合用户配置目录与所有探测到的外接 U 盘 / SD 卡目录
-                                                    val scanTargets = LinkedHashSet<String>()
-                                                    scanTargets.addAll(localMusicPaths)
-                                                    scanTargets.addAll(LocalMediaScanner.detectMountedScanDirs(context))
-
-                                                    for (path in scanTargets) {
-                                                        if (java.io.File(path).exists()) {
-                                                            totalScanned += LocalMediaScanner.scanCustomDirectory(context, path, database)
-                                                        }
-                                                    }
-                                                    // 2. 扫描系统媒体库
-                                                    totalScanned += LocalMediaScanner.scanSystemMediaStore(context, database)
-
-                                                    // 3. 与服务器曲库智能比对与真实性校验
-                                                    val dlDir = java.io.File(downloadSettings.customDownloadPath.ifBlank { context.getExternalFilesDir(null)?.absolutePath ?: "" })
-                                                    val matched = LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, dlDir)
-                                                    LocalMediaScanner.matchAndMergeLocalWithServer(database)
-
-                                                    withContext(Dispatchers.Main) {
-                                                        Toast.makeText(context, "本地扫描与比对完成！已收录 $totalScanned 首本地歌曲，比对匹配 $matched 首服务器歌曲已标为本地已下载", Toast.LENGTH_LONG).show()
-                                                        onLocalScanCompleted()
-                                                    }
-                                                } catch (e: Exception) {
-                                                    withContext(Dispatchers.Main) {
-                                                        Toast.makeText(context, "扫描比对异常: ${e.message}", Toast.LENGTH_SHORT).show()
-                                                    }
-                                                } finally {
-                                                    withContext(Dispatchers.Main) {
-                                                        isScanningLocalAndServer = false
-                                                    }
-                                                }
-                                            }
+                                        // 第十九节：交给后台扫描引擎 (离开设置页不中断，进度显示在下方卡片)
+                                        if (!isScanningLocalAndServer) requestStoragePermission(false) {
+                                            val scanTargets = LinkedHashSet<String>()
+                                            scanTargets.addAll(localMusicPaths)
+                                            scanTargets.addAll(LocalMediaScanner.detectMountedScanDirs(context))
+                                            val dlDir = java.io.File(downloadSettings.customDownloadPath.ifBlank { context.getExternalFilesDir(null)?.absolutePath ?: "" })
+                                            com.lm.player.core.media.LocalScanEngine.start(
+                                                context,
+                                                scanTargets.toList(),
+                                                includeMediaStore = true,
+                                                downloadDir = dlDir
+                                            )
                                         }
                                     },
                                     enabled = !isScanningLocalAndServer,
@@ -1063,7 +1047,7 @@ fun SettingsScreen(
                                     if (isScanningLocalAndServer) {
                                         CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
                                         Spacer(modifier = Modifier.width(6.dp))
-                                        Text("比对中...", fontSize = dimensions.bodySize)
+                                        Text("扫描中...", fontSize = dimensions.bodySize)
                                     } else {
                                         Icon(Icons.Default.Sync, contentDescription = null, modifier = Modifier.size(16.dp))
                                         Spacer(modifier = Modifier.width(4.dp))
@@ -1071,6 +1055,18 @@ fun SettingsScreen(
                                     }
                                 }
                             }
+
+                            // 第十九节：扫描 / 比对进度卡片
+                            LocalScanProgressCard()
+
+                            // 第十八节：存储权限诊断 (车机上截图即可确认读写权限与各存储卷状态)
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SettingActionRow(
+                                title = "存储权限诊断",
+                                subtitle = "查看读取 / 写入权限、系统文件夹选择器，以及内部存储与各 U 盘能否读写",
+                                actionText = "查看",
+                                onAction = { showStorageDiagnostics = true }
+                            )
                         }
                     }
 
@@ -1696,6 +1692,45 @@ fun SettingsScreen(
                                 },
                                 onSelect = { onThemeModeChange(it) }
                             )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            // 流畅模式 (性能优化第二批)：自动按设备性能判定，也可强制开启 / 关闭
+                            val smoothSetting = com.lm.player.core.designsystem.theme.SmoothMode.setting
+                            val smoothActive = com.lm.player.core.designsystem.theme.SmoothMode.isActive
+                            val smoothDeviceHint = if (com.lm.player.core.designsystem.theme.SmoothMode.isLowEndDevice) {
+                                "本机判定为低性能设备（${com.lm.player.core.designsystem.theme.SmoothMode.lowEndReason}）"
+                            } else {
+                                "本机性能充足"
+                            }
+                            SettingDropdownRow(
+                                title = "流畅模式",
+                                subtitle = "老车机 / 老电视卡顿时开启：动画降到 20 帧、切歌封面不渐变、全屏封面主题去掉背景大图。" +
+                                    "当前${if (smoothActive) "已开启" else "未开启"}，$smoothDeviceHint",
+                                icon = Icons.Default.Speed,
+                                selectedValue = smoothSetting,
+                                options = listOf(
+                                    com.lm.player.core.designsystem.theme.SmoothModeSetting.AUTO,
+                                    com.lm.player.core.designsystem.theme.SmoothModeSetting.ON,
+                                    com.lm.player.core.designsystem.theme.SmoothModeSetting.OFF
+                                ),
+                                getLabel = { mode ->
+                                    when (mode) {
+                                        com.lm.player.core.designsystem.theme.SmoothModeSetting.AUTO -> "自动"
+                                        com.lm.player.core.designsystem.theme.SmoothModeSetting.ON -> "开启"
+                                        com.lm.player.core.designsystem.theme.SmoothModeSetting.OFF -> "关闭"
+                                    }
+                                },
+                                onSelect = { mode ->
+                                    com.lm.player.core.designsystem.theme.SmoothMode.updateSetting(context, mode)
+                                    // 动画与界面效果立即生效；图片加载器在启动时创建，并发限制要重启后才变
+                                    if (com.lm.player.core.designsystem.theme.SmoothMode.isActive !=
+                                        com.lm.player.core.designsystem.theme.SmoothMode.activeAtStartup
+                                    ) {
+                                        Toast.makeText(context, "已切换。图片加载优化将在重启应用后生效", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            )
                         }
                     }
 
@@ -1875,7 +1910,7 @@ fun SettingsScreen(
                             if (it.isNotBlank()) selectedServerPathChoice = it
                         },
                         placeholder = { Text("例如: /volume1/music/downloads", fontSize = dimensions.captionSize) },
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.tvTextFieldKeys().fillMaxWidth(),
                         singleLine = true,
                         shape = RoundedCornerShape(10.dp)
                     )
@@ -2012,7 +2047,7 @@ fun SettingsScreen(
                         onValueChange = { newLocalPathInput = it },
                         label = { Text("目录绝对路径", fontSize = dimensions.captionSize) },
                         placeholder = { Text("/storage/emulated/0/Music", fontSize = dimensions.captionSize) },
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.tvTextFieldKeys().fillMaxWidth(),
                         singleLine = true,
                         shape = RoundedCornerShape(10.dp)
                     )
@@ -2074,15 +2109,17 @@ fun SettingsScreen(
                                     prefs.edit().putStringSet("local_music_scan_folders", HashSet(updated)).apply()
                                     showAddLocalPathDialog = false
                                     newLocalPathInput = ""
-                                    Toast.makeText(context, "已添加扫描目录，正在即时扫描: $path", Toast.LENGTH_SHORT).show()
-                                    coroutineScope.launch {
-                                        val count = LocalMediaScanner.scanCustomDirectory(context, path, database)
-                                        val dlDir = java.io.File(downloadSettings.customDownloadPath.ifBlank { context.getExternalFilesDir(null)?.absolutePath ?: "" })
-                                        val matched = LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, dlDir)
-                                        LocalMediaScanner.matchAndMergeLocalWithServer(database)
-                                        withContext(Dispatchers.Main) {
-                                            Toast.makeText(context, "目录扫描完成：收录 $count 首，匹配 $matched 首已下载", Toast.LENGTH_LONG).show()
-                                            onLocalScanCompleted()
+                                    requestStoragePermission(false) {
+                                        // 第十九节：交给后台扫描引擎，进度显示在「本地音乐路径」卡片里
+                                        // 只做轻量判断：主线程上不列目录 (1500 首的文件夹列一次也要上百毫秒)
+                                        val readable = java.io.File(path).let { it.isDirectory && it.canRead() }
+                                        if (!readable) {
+                                            Toast.makeText(context, "无法读取该目录（路径不存在或缺少存储读取权限）。可在 设置 → 存储权限诊断 中查看", Toast.LENGTH_LONG).show()
+                                        } else {
+                                            val dlDir = java.io.File(downloadSettings.customDownloadPath.ifBlank { context.getExternalFilesDir(null)?.absolutePath ?: "" })
+                                            if (com.lm.player.core.media.LocalScanEngine.start(context, listOf(path), includeMediaStore = false, downloadDir = dlDir)) {
+                                                Toast.makeText(context, "已添加扫描目录，正在后台扫描，进度见「本地音乐路径」", Toast.LENGTH_SHORT).show()
+                                            }
                                         }
                                     }
                                 }
@@ -2100,6 +2137,14 @@ fun SettingsScreen(
                 }
             }
         }
+    }
+
+    if (showStorageDiagnostics) {
+        StorageDiagnosticsDialog(
+            onRequestPermission = { requestStoragePermission(true) {} },
+            onOpenAppSettings = onOpenAppPermissionSettings,
+            onDismiss = { showStorageDiagnostics = false }
+        )
     }
 
     // 导入落雪脚本弹窗
@@ -2141,7 +2186,7 @@ fun SettingsScreen(
                             label = { Text("脚本远程地址 (URL)") },
                             placeholder = { Text("https://example.com/source.js") },
                             singleLine = true,
-                            modifier = Modifier.fillMaxWidth()
+                            modifier = Modifier.tvTextFieldKeys().fillMaxWidth()
                         )
                     } else {
                         OutlinedTextField(
@@ -2149,7 +2194,7 @@ fun SettingsScreen(
                             onValueChange = { importScriptCode = it },
                             label = { Text("脚本 JS 源码") },
                             placeholder = { Text("粘贴落雪脚本 JavaScript 代码...") },
-                            modifier = Modifier.fillMaxWidth().height(140.dp)
+                            modifier = Modifier.tvTextFieldKeys().fillMaxWidth().height(140.dp)
                         )
                     }
 
@@ -2417,7 +2462,17 @@ fun SettingsScreen(
     if (showAddServerDialog) {
         var serverNameInput by remember { mutableStateOf(editingServer?.name ?: "") }
         var serverTypeInput by remember { mutableStateOf(editingServer?.type ?: ServerType.LEMON_MUSIC) }
-        var serverUrlInput by remember { mutableStateOf(editingServer?.serverUrl ?: "") }
+        // 地址与端口分两栏：编辑时把已保存的完整地址拆开；新建时端口预填柠檬默认端口 7983
+        val initialUrlSplit = remember {
+            editingServer?.serverUrl?.let { com.lm.player.core.network.ServerUrlPolicy.splitForEditing(it) }
+        }
+        var serverUrlInput by remember { mutableStateOf(initialUrlSplit?.first ?: "") }
+        var portInput by remember {
+            mutableStateOf(
+                if (editingServer != null) initialUrlSplit?.second.orEmpty()
+                else com.lm.player.core.network.ServerUrlPolicy.DEFAULT_PORT.toString()
+            )
+        }
         var usernameInput by remember { mutableStateOf(editingServer?.username ?: "") }
         var tokenInput by remember { mutableStateOf(editingServer?.tokenOrApiKey ?: "") }
         var showPassword by remember { mutableStateOf(false) }
@@ -2426,15 +2481,17 @@ fun SettingsScreen(
         var testResultMsg by remember { mutableStateOf<String?>(null) }
         var isTestSuccess by remember { mutableStateOf<Boolean?>(null) }
 
-        fun normalizeServerUrl(raw: String): String {
-            val trimmed = raw.trim()
-            if (trimmed.isBlank()) return ""
-            val withProto = if (!trimmed.startsWith("http://", ignoreCase = true) && !trimmed.startsWith("https://", ignoreCase = true)) {
-                "http://$trimmed"
-            } else {
-                trimmed
+        /** 拼出规范化的完整地址（协议/主机名转小写），并把两栏回填为规范形式；格式不对时提示并返回 null */
+        fun resolveServerUrl(): String? {
+            val policy = com.lm.player.core.network.ServerUrlPolicy
+            val composed = policy.compose(serverUrlInput, portInput).getOrElse {
+                Toast.makeText(context, it.message ?: "服务器地址格式不正确", Toast.LENGTH_LONG).show()
+                return null
             }
-            return withProto.trimEnd('/')
+            val (addr, port) = policy.splitForEditing(composed)
+            serverUrlInput = addr
+            portInput = port
+            return composed
         }
 
         Dialog(onDismissRequest = { if (!isSavingAndConnecting) showAddServerDialog = false }) {
@@ -2454,7 +2511,7 @@ fun SettingsScreen(
                         onValueChange = { serverNameInput = it },
                         label = { Text("服务器名称 (如 客厅柠檬)") },
                         singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.tvTextFieldKeys().fillMaxWidth()
                     )
                     Spacer(modifier = Modifier.height(8.dp))
 
@@ -2464,9 +2521,24 @@ fun SettingsScreen(
                             serverUrlInput = it
                             testResultMsg = null
                         },
-                        label = { Text("服务器地址 (支持内网IP如 192.168.1.100:3000)") },
+                        label = { Text("服务器地址 (如 192.168.1.100 或 https://域名)") },
                         singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.tvTextFieldKeys().fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = portInput,
+                        onValueChange = { v ->
+                            portInput = v.filter { it.isDigit() }.take(5)
+                            testResultMsg = null
+                        },
+                        label = { Text("端口 (默认 7983，反向代理域名可留空)") },
+                        singleLine = true,
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                            keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
+                        ),
+                        modifier = Modifier.tvTextFieldKeys().fillMaxWidth()
                     )
                     Spacer(modifier = Modifier.height(8.dp))
 
@@ -2475,7 +2547,7 @@ fun SettingsScreen(
                         onValueChange = { usernameInput = it },
                         label = { Text("用户名 (可选)") },
                         singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.tvTextFieldKeys().fillMaxWidth()
                     )
                     Spacer(modifier = Modifier.height(8.dp))
 
@@ -2493,7 +2565,7 @@ fun SettingsScreen(
                                 )
                             }
                         },
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.tvTextFieldKeys().fillMaxWidth()
                     )
 
                     if (testResultMsg != null) {
@@ -2517,12 +2589,7 @@ fun SettingsScreen(
                         // 测试连接按钮
                         OutlinedButton(
                             onClick = {
-                                val cleanUrl = normalizeServerUrl(serverUrlInput)
-                                if (cleanUrl.isBlank()) {
-                                    Toast.makeText(context, "请输入服务器地址", Toast.LENGTH_SHORT).show()
-                                    return@OutlinedButton
-                                }
-                                serverUrlInput = cleanUrl
+                                val cleanUrl = resolveServerUrl() ?: return@OutlinedButton
                                 isTestingConnection = true
                                 testResultMsg = null
                                 isTestSuccess = null
@@ -2594,12 +2661,7 @@ fun SettingsScreen(
                         // 保存按钮 (保存前先进行连接与鉴权检测，连接正常才保存并登录，连接失败给出明确提示且不进行保存)
                         Button(
                             onClick = {
-                                val cleanUrl = normalizeServerUrl(serverUrlInput)
-                                if (cleanUrl.isBlank()) {
-                                    Toast.makeText(context, "请输入服务器地址", Toast.LENGTH_SHORT).show()
-                                    return@Button
-                                }
-                                serverUrlInput = cleanUrl
+                                val cleanUrl = resolveServerUrl() ?: return@Button
                                 isSavingAndConnecting = true
                                 testResultMsg = null
                                 isTestSuccess = null

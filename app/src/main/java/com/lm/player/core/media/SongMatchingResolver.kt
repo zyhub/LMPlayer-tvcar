@@ -176,7 +176,7 @@ object SongMatchingResolver {
             " ($ver)"
         }
         t = t.replace(MULTI_SPACE_REGEX, " ").trim()
-        if (normalizedTitleCache.size > 8192) normalizedTitleCache.clear()
+        if (normalizedTitleCache.size > 32768) normalizedTitleCache.clear() // 第十九节：大曲库比对时 8192 会反复清空导致重算
         normalizedTitleCache[title] = t
         return t
     }
@@ -283,6 +283,25 @@ object SongMatchingResolver {
     }
 
     /**
+     * 第二十一节：已关联的本地文件是否**明确**属于另一个版本。
+     *
+     * 只看文件名本身：文件名里出现了服务器歌曲 (歌名 + 专辑 + 歌手) 都没有的版本标记 (Live / 伴奏 / Remix 等) 才算。
+     * **不再把所在文件夹的名字当成专辑名** —— 用户的歌通常放在「无损音乐」这类总文件夹里，
+     * 文件夹名与每首歌的专辑都对不上，原先会把所有正确关联的歌判成冲突并解绑。
+     */
+    fun fileNameHasForeignEdition(
+        fileNameWithoutExt: String,
+        title: String,
+        album: String,
+        artist: String
+    ): Boolean {
+        val fileMarkers = extractEditionMarkers(fileNameWithoutExt)
+        if (fileMarkers.isEmpty()) return false
+        val trackMarkers = extractEditionMarkers(title, "$album $artist")
+        return fileMarkers.any { it !in trackMarkers }
+    }
+
+    /**
      * 规范化艺术家名称
      */
     fun normalizeArtist(artist: String): String {
@@ -290,7 +309,7 @@ object SongMatchingResolver {
         normalizedArtistCache[artist]?.let { return it }
         val a = unescapeMusicText(artist).lowercase()
         val result = if (a.contains("<unknown>") || a.contains("未知") || a == "local_storage" || a == "local_folder" || a == "local_saf") "" else a
-        if (normalizedArtistCache.size > 4096) normalizedArtistCache.clear()
+        if (normalizedArtistCache.size > 16384) normalizedArtistCache.clear()
         normalizedArtistCache[artist] = result
         return result
     }
@@ -343,6 +362,29 @@ object SongMatchingResolver {
             }
         }
         return false
+    }
+
+    /**
+     * 第十九节：文件名可能推出的所有规范化歌名 (用于建索引)。
+     *
+     * [matchFileNameToTrack] 只有在目标歌名规范化后**等于**这里返回的某一项时才可能为 true：
+     * 整个文件名、或 "A - B" 两侧任一侧。因此按这些键查索引得到的候选，
+     * 与逐首调用 [matchFileNameToTrack] 遍历全部歌曲的结果完全一致，只是不再做无谓的比对。
+     */
+    fun fileNameTitleKeys(fileNameWithoutExt: String): Set<String> {
+        val rawClean = unescapeMusicText(fileNameWithoutExt).replace(TRACK_NUM_REGEX, "").trim()
+        if (rawClean.isBlank()) return emptySet()
+        val keys = LinkedHashSet<String>(3)
+        keys.add(normalizeTrackTitle(rawClean))
+        if (rawClean.contains(" - ")) {
+            val parts = rawClean.split(" - ", limit = 2)
+            if (parts.size == 2) {
+                keys.add(normalizeTrackTitle(parts[0]))
+                keys.add(normalizeTrackTitle(parts[1]))
+            }
+        }
+        keys.remove("")
+        return keys
     }
 
     /**
@@ -811,7 +853,11 @@ object SongMatchingResolver {
                 listOf(effectiveServerId)
             }
             val existingServerSongs = existingSongs.filter { it.serverId in serverIdsToCheck }
-            val orphanedSongs = existingServerSongs.filter { !incomingIds.contains(it.id) && !it.isFavorite }
+            // 服务器曲库已没有的曲目一律清理（收藏过的也不例外，否则服务端删掉的歌会一直留在曲库里）；
+            // 只保留在线收藏曲目（lemon_online_*）：它们本来就不在曲库列表里，由收藏同步单独维护。
+            val orphanedSongs = existingServerSongs.filter {
+                !incomingIds.contains(it.id) && !it.id.startsWith("lemon_online_")
+            }
 
             if (orphanedSongs.isNotEmpty()) {
                 val claimedLocalPaths = preservedEntities.mapNotNull { it.localFilePath?.takeIf { p -> p.isNotBlank() } }.toSet()

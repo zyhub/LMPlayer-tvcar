@@ -33,8 +33,9 @@ data class UpdateInfo(
 object AppUpdateManager {
 
     private const val TAG = "AppUpdateManager"
-    const val CURRENT_VERSION_NAME = "1.10.31"
-    const val CURRENT_VERSION_CODE = 78
+    // 版本号锁定为 app/build.gradle.kts defaultConfig 的唯一来源（此前在这里硬编码，升级时容易漏改导致不一致）
+    const val CURRENT_VERSION_NAME = com.lm.player.BuildConfig.VERSION_NAME
+    const val CURRENT_VERSION_CODE = com.lm.player.BuildConfig.VERSION_CODE
     const val AUTHOR_NAME = "Zhou"
     const val AUTHOR_EMAIL = "1390999045@qq.com"
     const val APP_DESCRIPTION = "本软件为 TV车机版，专为智能电视、机顶盒与车载中控横屏大屏量身打造的高保真无损音乐播放器。专属接入柠檬音乐服务端，支持5大音源全网融合搜索与无损畅听、全盘本地音频深度扫描、智能歌词联动以及电视遥控器与车机触控双栖深度适配。"
@@ -415,14 +416,16 @@ object AppUpdateManager {
 
             when {
                 archiveInfo == null -> "无法解析安装包（文件可能已损坏）"
+                archiveInfo.packageName != context.packageName ->
+                    "安装包不是本应用（包名 ${archiveInfo.packageName}）"
                 installedSha == null || apkSha == null -> "读取签名失败"
                 !installedSha.contentEquals(apkSha) -> "与当前应用签名不一致（可能被替换为第三方包）"
                 else -> null
             }
         } catch (e: Exception) {
             Log.w(TAG, "签名比对失败", e)
-            // 比对过程本身异常时不阻断安装，交由系统安装器做最终校验
-            null
+            // S-10：比对过程异常时拒绝安装（fail-closed），不能默认放行
+            "签名校验出错（${e.javaClass.simpleName}），已拒绝安装"
         }
     }
 

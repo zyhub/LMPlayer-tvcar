@@ -1,5 +1,8 @@
 package com.lm.player.feature.settings
 
+import com.lm.player.core.designsystem.component.TvAlertDialog as AlertDialog
+import com.lm.player.core.designsystem.component.TvDialog as Dialog
+import com.lm.player.core.designsystem.component.tvTextFieldKeys
 import android.os.Environment
 import android.widget.Toast
 import androidx.compose.foundation.BorderStroke
@@ -25,13 +28,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.lm.player.core.designsystem.component.LocalPlatformMode
 import com.lm.player.core.designsystem.component.tvButtonFocusable
 import com.lm.player.core.designsystem.component.tvFocusable
 import com.lm.player.core.designsystem.theme.AppleRed
 import com.lm.player.core.model.PlatformMode
+import com.lm.player.core.util.StoragePermissionHelper
 import com.lm.player.core.util.StorageVolumeHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -48,6 +51,10 @@ import java.util.Locale
 @Composable
 fun LocalFolderPickerDialog(
     initialPath: String = "",
+    /** true = 选择扫描目录 (只需可读)；false = 选择下载目录 (必须可写) */
+    forScan: Boolean = false,
+    /** 显示每个存储卷上「应用专属目录」的快捷项 (无需任何权限即可写入，U 盘上也可以) */
+    showAppSpecificShortcuts: Boolean = false,
     onDismiss: () -> Unit,
     onConfirm: (String) -> Unit
 ) {
@@ -67,6 +74,33 @@ fun LocalFolderPickerDialog(
     var currentDir by remember {
         val initialFile = if (initialPath.isNotBlank()) File(initialPath) else null
         mutableStateOf(if (initialFile != null && initialFile.exists() && initialFile.isDirectory) initialFile else defaultStorageDir)
+    }
+
+    // 每个存储卷上的应用专属音乐目录 (第十八节)：Android 10 上 U 盘的普通文件夹无法用文件方式写入，
+    // 这里是唯一不依赖系统文件选择器、一定可写的位置
+    val appSpecificDirs = remember(showAppSpecificShortcuts) {
+        if (!showAppSpecificShortcuts) emptyList()
+        else StoragePermissionHelper.appSpecificMusicDirs(context).map { dir ->
+            val root = StoragePermissionHelper.volumeRootOf(dir)
+            val volName = storageVolumes.firstOrNull { it.path == root }?.name
+            val isRemovable = StoragePermissionHelper.isOnRemovableVolume(dir.absolutePath)
+            val label = when {
+                !isRemovable -> "内部存储专属目录"
+                volName != null -> "$volName 专属目录"
+                else -> "U 盘专属目录 (${File(root).name})"
+            }
+            Triple(dir, label, isRemovable)
+        }
+    }
+
+    // 当前目录的实际读写状态：真实写入探针文件判定 (canWrite() 在车机挂载点上不可靠)，在 IO 线程执行
+    val currentDirAccess by produceState(initialValue = null as Pair<Boolean, Boolean>?, key1 = currentDir) {
+        value = null
+        value = withContext(Dispatchers.IO) {
+            val readable = StoragePermissionHelper.probeReadable(currentDir)
+            val writable = if (forScan) false else StoragePermissionHelper.probeWritable(currentDir)
+            readable to writable
+        }
     }
 
     // 新建文件夹弹窗状态
@@ -129,11 +163,11 @@ fun LocalFolderPickerDialog(
                         Spacer(modifier = Modifier.width(10.dp))
                         Column {
                             Text(
-                                text = "选择离线存储目录",
+                                text = if (forScan) "选择本地音乐扫描目录" else "选择离线存储目录",
                                 style = TextStyle(fontSize = 17.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
                             )
                             Text(
-                                text = "歌曲文件将保存至此文件夹",
+                                text = if (forScan) "将扫描此文件夹内的歌曲" else "歌曲文件将保存至此文件夹",
                                 style = TextStyle(fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             )
                         }
@@ -214,6 +248,61 @@ fun LocalFolderPickerDialog(
                     Spacer(modifier = Modifier.height(10.dp))
                 }
 
+                // 1.6 应用专属目录快捷项 (一定可写；卸载应用时会被系统清除)
+                if (appSpecificDirs.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        appSpecificDirs.forEach { (dir, label, isRemovable) ->
+                            val isSelected = currentDir.absolutePath == dir.absolutePath
+                            val goTo: () -> Unit = {
+                                runCatching { if (!dir.exists()) dir.mkdirs() }
+                                currentDir = dir
+                            }
+                            val chipModifier = if (isCarMode) {
+                                Modifier.clip(RoundedCornerShape(10.dp)).clickable { goTo() }
+                            } else {
+                                Modifier
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .tvFocusable(shape = RoundedCornerShape(10.dp), focusedScale = 1.05f, onClick = goTo)
+                            }
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = Color(0xFF34C759).copy(alpha = if (isSelected) 0.18f else 0.08f),
+                                border = BorderStroke(1.dp, Color(0xFF34C759).copy(alpha = if (isSelected) 0.9f else 0.45f)),
+                                modifier = chipModifier
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = if (isRemovable) Icons.Default.Usb else Icons.Default.Verified,
+                                        contentDescription = null,
+                                        tint = Color(0xFF34C759),
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "$label（一定可写）",
+                                        style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    Text(
+                        text = "专属目录无需任何权限即可写入，U 盘上也可以；卸载应用时系统会一并清除其中的歌曲",
+                        style = TextStyle(fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant),
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                }
+
                 // 2. 当前路径指示条与上级目录按钮
                 Surface(
                     shape = RoundedCornerShape(12.dp),
@@ -260,7 +349,41 @@ fun LocalFolderPickerDialog(
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f)
                         )
+
+                        // 当前目录读写状态徽标
+                        val access = currentDirAccess
+                        val (badgeText, badgeColor) = when {
+                            access == null -> "检测中…" to MaterialTheme.colorScheme.onSurfaceVariant
+                            forScan && access.first -> "可读取" to Color(0xFF34C759)
+                            forScan -> "无法读取" to MaterialTheme.colorScheme.error
+                            access.second -> "可写入" to Color(0xFF34C759)
+                            access.first -> "只读" to Color(0xFFFF9F0A)
+                            else -> "无法访问" to MaterialTheme.colorScheme.error
+                        }
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = badgeColor.copy(alpha = 0.14f),
+                            border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.5f))
+                        ) {
+                            Text(
+                                text = badgeText,
+                                style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Bold, color = badgeColor),
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                            )
+                        }
                     }
+                }
+
+                // 下载模式且当前目录不可写：直接说明原因，不用等点确认后才知道
+                val accessNow = currentDirAccess
+                if (!forScan && accessNow != null && !accessNow.second) {
+                    Text(
+                        text = StoragePermissionHelper.explainWriteFailure(context, currentDir.absolutePath),
+                        style = TextStyle(fontSize = 11.sp, color = Color(0xFFFF9F0A)),
+                        maxLines = 3,
+                        modifier = Modifier.padding(top = 6.dp)
+                    )
                 }
 
                 Spacer(modifier = Modifier.height(12.dp))
@@ -424,23 +547,25 @@ fun LocalFolderPickerDialog(
                     ) {
                         Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text(text = "选择此文件夹作为存储目录", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        Text(text = if (forScan) "扫描此文件夹" else "选择此文件夹作为存储目录", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                     }
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        OutlinedButton(
-                            onClick = {
-                                onConfirm("") // 传空代表恢复默认目录
-                            },
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier
-                                .weight(1f)
-                                .tvButtonFocusable(shape = RoundedCornerShape(12.dp))
-                        ) {
-                            Text("恢复默认目录", fontSize = 13.sp)
+                        if (!forScan) {
+                            OutlinedButton(
+                                onClick = {
+                                    onConfirm("") // 传空代表恢复默认目录
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .tvButtonFocusable(shape = RoundedCornerShape(12.dp))
+                            ) {
+                                Text("恢复默认目录", fontSize = 13.sp)
+                            }
                         }
 
                         TextButton(
@@ -470,7 +595,7 @@ fun LocalFolderPickerDialog(
                     placeholder = { Text("如: ZDSMusic") },
                     singleLine = true,
                     shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.tvTextFieldKeys().fillMaxWidth()
                 )
             },
             confirmButton = {
@@ -484,7 +609,11 @@ fun LocalFolderPickerDialog(
                                     Toast.makeText(context, "文件夹「$name」创建成功", Toast.LENGTH_SHORT).show()
                                     currentDir = newFolder
                                 } else {
-                                    Toast.makeText(context, "创建失败，请检查存储权限", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(
+                                        context,
+                                        "创建失败。" + StoragePermissionHelper.explainWriteFailure(context, newFolder.absolutePath),
+                                        Toast.LENGTH_LONG
+                                    ).show()
                                 }
                             } else {
                                 Toast.makeText(context, "同名文件夹已存在", Toast.LENGTH_SHORT).show()

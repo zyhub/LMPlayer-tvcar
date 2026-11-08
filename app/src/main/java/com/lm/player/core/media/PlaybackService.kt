@@ -77,6 +77,44 @@ class PlaybackService : MediaSessionService() {
         override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) {
             updateForegroundNotification(exoPlayer?.isPlaying == true)
         }
+
+        // 封面常在切歌之后才补齐 (PlaybackRouter 解析出封面后更新元数据)，此时也刷新一次通知封面
+        override fun onMediaMetadataChanged(mediaMetadata: androidx.media3.common.MediaMetadata) {
+            updateForegroundNotification(exoPlayer?.isPlaying == true)
+        }
+    }
+
+    // 第二十三节：通知封面 (部分车机桌面卡片读的是媒体通知的大图标)。
+    // 后台加载缩小后的封面，加载好再刷新通知；通知本身始终同步构建，不等图片。
+    @Volatile private var notificationCover: android.graphics.Bitmap? = null
+    @Volatile private var notificationCoverKey: String? = null
+    private var notificationCoverJob: Job? = null
+
+    private fun currentCoverUrl(): String {
+        val fromItem = try {
+            exoPlayer?.currentMediaItem?.mediaMetadata?.artworkUri?.toString()
+        } catch (_: Throwable) {
+            null
+        }
+        return fromItem?.takeIf { it.isNotBlank() }
+            ?: PlaybackQueueManager.currentSongFlow.value?.coverUrl.orEmpty()
+    }
+
+    private fun refreshNotificationCover() {
+        val url = currentCoverUrl()
+        if (url == notificationCoverKey) return
+        notificationCoverKey = url
+        notificationCoverJob?.cancel()
+        // 换歌时先清掉旧封面，避免新歌名配着上一首的封面
+        notificationCover = null
+        if (url.isBlank()) return
+        notificationCoverJob = serviceScope.launch {
+            val bmp = withContext(Dispatchers.IO) { SessionCoverBitmapLoader.load(this@PlaybackService, url) }
+            if (notificationCoverKey == url) {
+                notificationCover = bmp
+                updateForegroundNotification(exoPlayer?.isPlaying == true)
+            }
+        }
     }
 
     /** 硬件解码降级后播放内核被重建，此处把 MediaSession 换绑到新实例，保证遥控器/通知栏控制不失效 */
@@ -185,6 +223,20 @@ class PlaybackService : MediaSessionService() {
         private const val WATCHDOG_STALL_TICKS = 3
         private const val WATCHDOG_MAX_REPAIRS = 3
 
+        /** 启动播放服务（桌面小部件在应用未打开时点播放 / 切歌用，与 MainActivity.startPlaybackService 一致） */
+        fun startPlaybackService(context: Context) {
+            try {
+                companionIsExplicitStopping = false
+                val appCtx = context.applicationContext
+                val serviceIntent = Intent(appCtx, PlaybackService::class.java).apply {
+                    setPackage(appCtx.packageName)
+                }
+                androidx.core.content.ContextCompat.startForegroundService(appCtx, serviceIntent)
+            } catch (e: Throwable) {
+                Log.w(TAG, "startPlaybackService warning: ${e.message}")
+            }
+        }
+
         /**
          * 彻底关闭播放服务并停止音乐播放
          */
@@ -264,13 +316,19 @@ class PlaybackService : MediaSessionService() {
                     session: MediaSession,
                     controller: MediaSession.ControllerInfo
                 ): MediaSession.ConnectionResult {
-                    val sessionCommands = MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
-                        .add(SessionCommand(CMD_NEXT, Bundle.EMPTY))
-                        .add(SessionCommand(CMD_PREV, Bundle.EMPTY))
-                        .add(SessionCommand(CMD_TOGGLE, Bundle.EMPTY))
-                        .add(SessionCommand(CMD_PLAY, Bundle.EMPTY))
-                        .add(SessionCommand(CMD_PAUSE, Bundle.EMPTY))
-                        .build()
+                    // S-12：自定义命令只开放给本 App 自己的控制器；
+                    // 遥控器/蓝牙/系统媒体控件走标准播放命令（播放、暂停、切歌、拖动），不受影响。
+                    val sessionCommands = if (controller.packageName == packageName) {
+                        MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
+                            .add(SessionCommand(CMD_NEXT, Bundle.EMPTY))
+                            .add(SessionCommand(CMD_PREV, Bundle.EMPTY))
+                            .add(SessionCommand(CMD_TOGGLE, Bundle.EMPTY))
+                            .add(SessionCommand(CMD_PLAY, Bundle.EMPTY))
+                            .add(SessionCommand(CMD_PAUSE, Bundle.EMPTY))
+                            .build()
+                    } else {
+                        MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS
+                    }
                     val playerCommands = MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS.buildUpon()
                         .add(Player.COMMAND_SEEK_TO_NEXT)
                         .add(Player.COMMAND_SEEK_TO_PREVIOUS)
@@ -296,6 +354,10 @@ class PlaybackService : MediaSessionService() {
                     customCommand: SessionCommand,
                     args: Bundle
                 ): ListenableFuture<SessionResult> {
+                    if (controller.packageName != packageName) {
+                        Log.w(TAG, "Rejected custom command ${customCommand.customAction} from ${controller.packageName}")
+                        return Futures.immediateFuture(SessionResult(SessionResult.RESULT_ERROR_PERMISSION_DENIED))
+                    }
                     when (customCommand.customAction) {
                         CMD_NEXT -> {
                             PlaybackQueueManager.playNext(this@PlaybackService)
@@ -421,6 +483,8 @@ class PlaybackService : MediaSessionService() {
             val session = MediaSession.Builder(this, forwardingPlayer)
                 .setSessionActivity(sessionActivityPendingIntent)
                 .setCallback(sessionCallback)
+                // 第二十三节：封面走 App 自己的图片通道 (自签证书 / 鉴权) 并缩小，车机桌面卡片才能拿到封面
+                .setBitmapLoader(androidx.media3.session.CacheBitmapLoader(SessionCoverBitmapLoader(this)))
                 .build()
             mediaSession = session
 
@@ -559,6 +623,8 @@ class PlaybackService : MediaSessionService() {
                 (player.playWhenReady || PlaybackQueueManager.currentSongFlow.value != null)
             if (player == null || (player.playbackState == Player.STATE_IDLE && !hasPlaybackIntent)) {
                 // 确实没有任何播放意图：保留服务没有意义，按常规收摊
+                // 程序关闭：服务器删除后 30 分钟内没有登录连接则清理本地音源脚本
+                com.lm.player.core.source.SourceAccelerationController.onAppClosing(this)
                 stopKeepAliveWatchdog()
                 unregisterScreenStateReceiver()
                 PlaybackWakeLockManager.release()
@@ -790,7 +856,8 @@ class PlaybackService : MediaSessionService() {
             launchIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        refreshNotificationCover()
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle(title)
             .setContentText(artist)
@@ -798,7 +865,17 @@ class PlaybackService : MediaSessionService() {
             .setOngoing(isPlaying)
             .setSilent(true)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .build()
+        // 第二十三节：带上封面大图标，并声明为媒体播放通知 (关联媒体会话)，
+        // 车机桌面卡片 / 系统媒体中心读通知时也能拿到封面与会话
+        notificationCover?.let { builder.setLargeIcon(it) }
+        mediaSession?.let { session ->
+            try {
+                builder.setStyle(androidx.media3.session.MediaStyleNotificationHelper.MediaStyle(session))
+            } catch (e: Throwable) {
+                Log.w(TAG, "attach media style failed: ${e.message}")
+            }
+        }
+        return builder.build()
     }
 
     private fun startImmediateForeground() {
