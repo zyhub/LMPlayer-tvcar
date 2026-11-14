@@ -91,7 +91,27 @@
                 <category android:name="android.intent.category.LAUNCHER" />
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
+            <!-- 语音点歌：安卓标准的「按搜索词播放」意图（语音助手说「打开柠檬音乐播放某某」时发出），见 VoicePlayRouter -->
+            <intent-filter>
+                <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <!-- 语音点歌：本应用自定义的点歌意图（extra: keyword / artist / title / album） -->
+            <intent-filter>
+                <action android:name="com.lm.player.tv.action.PLAY_SEARCH" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
         </activity>
+
+        <!-- 语音点歌：自定义点歌广播（不把界面带到前台，直接搜索并播放），给支持「自定义指令 → 发广播」的
+             语音中转工具和 adb 测试用。只接受一个搜索词并开始播放，不涉及任何数据读写。 -->
+        <receiver
+            android:name=".core.voice.VoiceCommandReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.lm.player.tv.action.PLAY_SEARCH" />
+            </intent-filter>
+        </receiver>
 
         <!-- Media3 后台播放服务
              stopWithTask="false"：任务栈被移除 (回到电视桌面/进入屏保) 时不销毁服务。

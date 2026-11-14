@@ -170,6 +170,7 @@ class PlaybackService : MediaSessionService() {
                 val now = System.currentTimeMillis()
                 if (now - lastNextTimestamp < 300L) return
                 lastNextTimestamp = now
+                SkipLatencyStats.noteSource("系统媒体控制（语音 / 媒体中心）")
                 PlaybackQueueManager.playNext(this@PlaybackService)
             }
 
@@ -181,6 +182,7 @@ class PlaybackService : MediaSessionService() {
                 val now = System.currentTimeMillis()
                 if (now - lastPrevTimestamp < 300L) return
                 lastPrevTimestamp = now
+                SkipLatencyStats.noteSource("系统媒体控制（语音 / 媒体中心）")
                 PlaybackQueueManager.playPrevious(this@PlaybackService)
             }
 
@@ -360,9 +362,11 @@ class PlaybackService : MediaSessionService() {
                     }
                     when (customCommand.customAction) {
                         CMD_NEXT -> {
+                            SkipLatencyStats.noteSource("通知栏 / 系统")
                             PlaybackQueueManager.playNext(this@PlaybackService)
                         }
                         CMD_PREV -> {
+                            SkipLatencyStats.noteSource("通知栏 / 系统")
                             PlaybackQueueManager.playPrevious(this@PlaybackService)
                         }
                         CMD_TOGGLE -> {
@@ -378,6 +382,46 @@ class PlaybackService : MediaSessionService() {
                         }
                     }
                     return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+                }
+
+                // 语音点歌：语音助手 / 车机语音中转工具通过系统媒体会话的「按搜索词播放」
+                // (MediaController.playFromSearch) 点歌时，Media3 会把搜索词放在 requestMetadata.searchQuery 里
+                // 走到这里。本应用的播放链路是 PlaybackQueueManager（队列、取链、本地优先），不能让 Media3
+                // 直接往播放器里塞条目，所以交给 VoicePlayRouter 处理，并返回失败的 Future 让 Media3 不再继续。
+                // 不带搜索词的请求（按媒体 ID / 地址播放）保持原有的默认行为。
+                private fun interceptVoiceSearch(mediaItems: List<androidx.media3.common.MediaItem>): Boolean {
+                    val item = mediaItems.firstOrNull { it.requestMetadata.searchQuery != null } ?: return false
+                    com.lm.player.core.voice.VoicePlayRouter.requestFromExtras(
+                        this@PlaybackService,
+                        item.requestMetadata.searchQuery,
+                        item.requestMetadata.extras,
+                        "media_session"
+                    )
+                    return true
+                }
+
+                override fun onSetMediaItems(
+                    mediaSession: MediaSession,
+                    controller: MediaSession.ControllerInfo,
+                    mediaItems: MutableList<androidx.media3.common.MediaItem>,
+                    startIndex: Int,
+                    startPositionMs: Long
+                ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+                    if (interceptVoiceSearch(mediaItems)) {
+                        return Futures.immediateFailedFuture(UnsupportedOperationException("handled by VoicePlayRouter"))
+                    }
+                    return super.onSetMediaItems(mediaSession, controller, mediaItems, startIndex, startPositionMs)
+                }
+
+                override fun onAddMediaItems(
+                    mediaSession: MediaSession,
+                    controller: MediaSession.ControllerInfo,
+                    mediaItems: MutableList<androidx.media3.common.MediaItem>
+                ): ListenableFuture<MutableList<androidx.media3.common.MediaItem>> {
+                    if (interceptVoiceSearch(mediaItems)) {
+                        return Futures.immediateFailedFuture(UnsupportedOperationException("handled by VoicePlayRouter"))
+                    }
+                    return super.onAddMediaItems(mediaSession, controller, mediaItems)
                 }
 
                 override fun onMediaButtonEvent(
@@ -423,6 +467,7 @@ class PlaybackService : MediaSessionService() {
                                 KeyEvent.KEYCODE_CHANNEL_UP,
                                 KeyEvent.KEYCODE_NAVIGATE_NEXT,
                                 KeyEvent.KEYCODE_PAGE_DOWN -> {
+                                    SkipLatencyStats.noteSource("方向盘 / 媒体按键")
                                     PlaybackQueueManager.playNext(this@PlaybackService)
                                     return true
                                 }
@@ -434,6 +479,7 @@ class PlaybackService : MediaSessionService() {
                                 KeyEvent.KEYCODE_CHANNEL_DOWN,
                                 KeyEvent.KEYCODE_NAVIGATE_PREVIOUS,
                                 KeyEvent.KEYCODE_PAGE_UP -> {
+                                    SkipLatencyStats.noteSource("方向盘 / 媒体按键")
                                     PlaybackQueueManager.playPrevious(this@PlaybackService)
                                     return true
                                 }
@@ -567,9 +613,11 @@ class PlaybackService : MediaSessionService() {
             val cmd = intent.getStringExtra(EXTRA_COMMAND)
             when (cmd) {
                 CMD_NEXT -> {
+                    SkipLatencyStats.noteSource("通知栏 / 系统")
                     PlaybackQueueManager.playNext(this)
                 }
                 CMD_PREV -> {
+                    SkipLatencyStats.noteSource("通知栏 / 系统")
                     PlaybackQueueManager.playPrevious(this)
                 }
                 CMD_TOGGLE -> {

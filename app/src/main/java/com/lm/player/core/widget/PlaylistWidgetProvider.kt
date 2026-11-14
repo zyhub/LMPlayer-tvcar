@@ -147,7 +147,7 @@ object PlaylistWidgetController {
     }
 
     private fun toast(context: Context, msg: String) {
-        mainHandler.post { Toast.makeText(context, msg, Toast.LENGTH_SHORT).show() }
+        mainHandler.post { com.lm.player.core.designsystem.component.AppToast.makeText(context, msg, Toast.LENGTH_SHORT).show() }
     }
 
     private fun idsOf(mgr: AppWidgetManager, context: Context, spec: Spec): IntArray =
@@ -286,7 +286,7 @@ object PlaylistWidgetController {
             val active = t == tab
             rv.setInt(viewId, "setBackgroundResource", if (active) R.drawable.bg_widget_tab_active else R.drawable.bg_widget_tab_inactive)
             rv.setTextColor(viewId, if (active) activeColor else inactiveColor)
-            val intent = Intent(context, PlaylistWidgetActionReceiver::class.java).setAction(action)
+            val intent = Intent(context, PlaylistWidgetActionReceiver::class.java).setAction(action).addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
             rv.setOnClickPendingIntent(viewId, PendingIntent.getBroadcast(context, 401 + i, intent, pFlags))
         }
 
@@ -302,7 +302,7 @@ object PlaylistWidgetController {
                 tab == PlaylistTab.RECOMMEND -> "暂无推荐" to "点击重试"
                 else -> "加载失败" to "点击重试"
             }
-            val refresh = Intent(context, PlaylistWidgetActionReceiver::class.java).setAction(ACTION_PLAYLIST_REFRESH)
+            val refresh = Intent(context, PlaylistWidgetActionReceiver::class.java).setAction(ACTION_PLAYLIST_REFRESH).addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
             val refreshPending = PendingIntent.getBroadcast(context, 409, refresh, pFlags)
             for (i in 0 until slots) {
                 if (i == 0) {
@@ -335,6 +335,7 @@ object PlaylistWidgetController {
 
             val open = Intent(context, PlaylistWidgetActionReceiver::class.java).apply {
                 action = ACTION_PLAYLIST_OPEN
+                addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
                 putExtra(EXTRA_PLAYLIST_ID, item.id)
                 putExtra(EXTRA_PLAYLIST_TITLE, item.title)
                 putExtra(EXTRA_PLAYLIST_TAB, tab.name)

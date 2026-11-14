@@ -24,9 +24,21 @@ class LMApplication : Application(), ImageLoaderFactory {
 
         // 0. 安装全局崩溃捕获：电视/车机无法取 logcat，闪退后把堆栈留在本机供下次启动展示
         CrashLogger.install(this)
+        // 0.001 没有崩溃日志的闪退（主线程卡死 / 系统层崩溃 / 内存不足被结束）也要留下记录（2026-11-13）
+        com.lm.player.core.util.ExitDiagnostics.startWatchdog(this)
+        CoroutineScope(Dispatchers.IO).launch {
+            com.lm.player.core.util.ExitDiagnostics.onProcessStart(this@LMApplication)
+        }
+
+        // 0.01 启动提速：打点 + 启动闸门兜底计时。非续播必需的工作都等闸门放行后再做（见 StartupGate）
+        com.lm.player.core.startup.StartupTrace.mark(com.lm.player.core.startup.StartupTrace.APP_CREATE)
+        com.lm.player.core.startup.StartupGate.armFallback()
+        com.lm.player.core.startup.StartupTrace.schedulePersist(this)
 
         // 0.05 流畅模式 (性能优化第二批)：必须早于图片加载器创建，图片并发限制按启动时的状态决定
         com.lm.player.core.designsystem.theme.SmoothMode.init(this)
+        // 界面偏好（启动页面 / 主界面黑胶旋转 / 大封面淡入）：启动页面要在第一帧之前确定
+        com.lm.player.core.designsystem.theme.AppUiPrefs.init(this)
 
         // 0.1 柠檬服务端会话过期（401）时用本地保存的密码自动重登，避免只能删掉服务器重新添加
         com.lm.player.core.network.LemonMusicProtocol.installSessionReauth(this)
@@ -83,7 +95,14 @@ class LMApplication : Application(), ImageLoaderFactory {
             com.lm.player.core.source.ServerSourceRepository.init(this@LMApplication)
             com.lm.player.core.source.SourceAccelerationSession.init(this@LMApplication)
             com.lm.player.core.source.SourceAccelerationController.init(this@LMApplication)
+            // 启动提速：「连续未登录启动」计数仍在此刻立即记录；
+            // 音源脚本引擎（每个脚本一个 JS 运行时）等首帧与续播完成、启动闸门放行后再加载
+            com.lm.player.core.source.SourceAccelerationController.recordProcessStart(this@LMApplication)
+            com.lm.player.core.startup.StartupGate.await()
             com.lm.player.core.source.SourceAccelerationController.restoreFromCache(this@LMApplication)
+            // 服务器歌曲加速表：旧匹配文件并入（只做一次），再启动后台预匹配（登录、曲库同步后也会再触发）
+            com.lm.player.core.source.ServerTrackAccelStore.ensureLegacyImported()
+            com.lm.player.core.source.ServerTrackPrematcher.init(this@LMApplication)
         }
 
         // 3. 桌面小部件（车机桌面常用）：TV 版播放队列没有逐处埋点，统一监听「当前歌曲 + 播放状态」，
@@ -137,9 +156,24 @@ class LMApplication : Application(), ImageLoaderFactory {
                     .maxSizeBytes(96L * 1024 * 1024)
                     .build()
             }
-            .bitmapConfig(Bitmap.Config.RGB_565)
+            // 界面优化：
+            // - 色彩：低性能设备（流畅模式）仍用 16 位色省内存；其余设备用 32 位色，封面与渐变不再出现一条条色带。
+            //   低性能设备上的大封面由 AlbumArtworkImage 按请求单独升到 32 位色。
+            // - 硬件位图：**关闭**（2026-11-12）。11-08 曾在 Android 9+ 开启，车机（Android 10）上语音点歌
+            //   从后台拉起界面时偶尔出现「启动那一刻已在屏幕上的封面全部不显示、滑动 / 切页后新加载的正常」。
+            //   硬件位图依赖图形上下文：界面在后台被拉起、可见性来回变化时系统会回收图形上下文，
+            //   这期间分配的硬件位图可能是空白的（Android 10 上的已知问题，Glide 为此专门加了等待首帧的规避）。
+            //   它带来的收益只是少一次纹理上传，不值得冒这个险，恢复为普通位图。
+            .bitmapConfig(
+                if (com.lm.player.core.designsystem.theme.SmoothMode.activeAtStartup) Bitmap.Config.RGB_565
+                else Bitmap.Config.ARGB_8888
+            )
             .allowHardware(false)
-            .allowRgb565(true)
+            // 封面加载统计：车机取不到日志，封面不显示时在设置页直接看是失败、异常小图还是一直没结束
+            .eventListener(com.lm.player.core.startup.ImageLoadStats)
+            // 服务器歌曲封面：加速表里有平台封面时与服务器竞速，弱网直接先用平台封面（2026-11-13 服务器歌曲加速第 4 期）
+            .components { add(com.lm.player.core.media.ServerCoverRaceInterceptor) }
+            .allowRgb565(com.lm.player.core.designsystem.theme.SmoothMode.activeAtStartup)
             .respectCacheHeaders(false)
         if (com.lm.player.core.designsystem.theme.SmoothMode.activeAtStartup) {
             // 流畅模式 (第二批)：老设备 CPU 核少，同时解码多张封面会和界面线程抢 CPU，滑动列表时掉帧；

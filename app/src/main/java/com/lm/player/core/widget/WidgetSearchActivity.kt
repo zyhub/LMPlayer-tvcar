@@ -173,7 +173,7 @@ class WidgetSearchActivity : ComponentActivity() {
         findViewById<View>(R.id.btn_clear_history)?.setOnClickListener {
             WidgetDataRepository.clearSearchHistory(this)
             renderHistory()
-            Toast.makeText(this, "搜索历史已清空", Toast.LENGTH_SHORT).show()
+            com.lm.player.core.designsystem.component.AppToast.makeText(this, "搜索历史已清空", Toast.LENGTH_SHORT).show()
         }
 
         etSearchInput.post {
@@ -190,7 +190,7 @@ class WidgetSearchActivity : ComponentActivity() {
     private fun submitInput() {
         val query = etSearchInput.text.toString().trim()
         if (query.isNotEmpty()) performSearch(query)
-        else Toast.makeText(this, "请输入搜索关键词", Toast.LENGTH_SHORT).show()
+        else com.lm.player.core.designsystem.component.AppToast.makeText(this, "请输入搜索关键词", Toast.LENGTH_SHORT).show()
     }
 
     // ---------------- 面板首页：历史 + 热歌榜 ----------------
@@ -336,7 +336,7 @@ class WidgetSearchActivity : ComponentActivity() {
 
     private fun playList(songs: List<UnifiedSong>, index: Int) {
         val song = songs.getOrNull(index) ?: return
-        Toast.makeText(this, "正在播放：${song.title}", Toast.LENGTH_SHORT).show()
+        com.lm.player.core.designsystem.component.AppToast.makeText(this, "正在播放：${song.title}", Toast.LENGTH_SHORT).show()
         // 播放链路跑在全局协程里，面板关闭不影响起播
         val appCtx = applicationContext
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
@@ -356,11 +356,11 @@ class WidgetSearchActivity : ComponentActivity() {
         try {
             voiceLauncher.launch(intent)
         } catch (_: ActivityNotFoundException) {
-            Toast.makeText(this, "本机没有系统语音识别服务，可以用输入法键盘上的语音键说出歌名", Toast.LENGTH_LONG).show()
+            com.lm.player.core.designsystem.component.AppToast.makeText(this, "本机没有系统语音识别服务，可以用输入法键盘上的语音键说出歌名", Toast.LENGTH_LONG).show()
             etSearchInput.requestFocus()
             showKeyboard()
         } catch (_: SecurityException) {
-            Toast.makeText(this, "无法启动语音识别", Toast.LENGTH_SHORT).show()
+            com.lm.player.core.designsystem.component.AppToast.makeText(this, "无法启动语音识别", Toast.LENGTH_SHORT).show()
         }
     }
 

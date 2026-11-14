@@ -52,9 +52,15 @@
 # 10. 保持全屏播放器与歌词相关 Compose 组件，避免 R8 优化合并产生 Dalvik/ART Verifier 异常 (Android 8/9 API 28 兼容)
 -keep class com.lm.player.feature.player.** { *; }
 
-# 11. 关闭 R8 代码优化（关键修复：Android 9 / API 28 上的 VerifyError）
+# 11. R8 代码优化已重新开启（2026-11-08，启动提速）
 #
-# 症状：打开全屏播放页立刻闪退，堆栈为
+# 历史：曾因下面的 Android 8/9 VerifyError 全局关闭优化（-dontoptimize）。
+# 现在的处理：FullscreenPlayerSheet 主函数里的大块界面已用 RecomposeIsolation 拆成独立方法，
+# 主函数寄存器数由 276（未优化）/ 298（优化）降到与其它方法同一量级（构建后用 dexdump 核对）。
+# 发布给 Android 8/9 用户前，务必在 Android 8/9 设备上打开一次全屏播放页确认不闪退；
+# 若仍闪退，恢复本节末尾的 -dontoptimize 并把 build.gradle.kts 换回 proguard-android.txt 即可回退。
+#
+# 当年的症状：打开全屏播放页立刻闪退，堆栈为
 #   java.lang.VerifyError: Verifier rejected class
 #     com.lm.player.feature.player.FullscreenPlayerSheetKt
 #     [0x7F6] register v335 has type Integer but expected Reference: java.lang.Object
@@ -67,4 +73,11 @@
 # -dontoptimize 会关闭 R8 的优化阶段（仍保留压缩、混淆与资源裁剪）。
 # 这是用「牺牲一点运行期优化」换取「Android 8/9 上不再崩溃」的取舍；
 # 若将来把 FullscreenPlayerSheet 拆分成多个小 Composable，可以移除此规则重新验证。
--dontoptimize
+# -dontoptimize   ← 已移除（回退方法见本节开头）
+
+# 2026-11-13 性能优化第 10 项：正式包去掉调试 / 信息级日志（含参数里的字符串拼接），警告和错误日志保留
+-assumenosideeffects class android.util.Log {
+    public static int v(...);
+    public static int d(...);
+    public static int i(...);
+}

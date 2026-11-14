@@ -63,6 +63,9 @@ import com.lm.player.feature.home.SongListItemRow
 import com.lm.player.feature.home.SongListPlayAndBatchDownloadBar
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.ui.focus.onFocusChanged
 
 /**
  * 现代轻奢音乐资料库 (对标柠檬音乐 Library.vue 架构重构)
@@ -108,6 +111,11 @@ fun LocalLibraryScreen(
     onTriggerServerScan: (suspend () -> Unit)? = null,
     onDeleteLocalFilePath: (suspend (String) -> Unit)? = null,
     onDeleteDownloadedSongs: ((List<UnifiedSong>) -> Unit)? = null,
+    /**
+     * 把歌曲移出歌单（2026-11-13）：服务器歌单同步写回服务器，本地歌单只改本机。
+     * 返回实际移出的条数；失败时返回 failure（界面不动、提示原因）
+     */
+    onRemoveSongsFromPlaylist: (suspend (playlistId: String, isOnline: Boolean, songs: List<UnifiedSong>, onProgress: (Float, String) -> Unit) -> Result<Int>)? = null,
     initialCategory: LibraryCategory? = null,
     currentServerName: String = "本地模式",
     configuredServers: List<ServerConfig> = emptyList(),
@@ -142,6 +150,11 @@ fun LocalLibraryScreen(
     var isFromAllFolders by remember { mutableStateOf(false) }
     var isFromAllArtists by remember { mutableStateOf(false) }
     var isFromAllAlbums by remember { mutableStateOf(false) }
+    /** 等待确认移出歌单的歌曲（单首或多选） */
+    var songsPendingRemoval by remember { mutableStateOf<List<UnifiedSong>?>(null) }
+    var isRemovingFromPlaylist by remember { mutableStateOf(false) }
+    var removalProgress by remember { mutableStateOf(0f) }
+    var removalStep by remember { mutableStateOf("") }
 
     LaunchedEffect(activeSubViewTitle) {
         onSubViewActiveChange(activeSubViewTitle != null)
@@ -150,46 +163,26 @@ fun LocalLibraryScreen(
         onDispose { onSubViewActiveChange(false) }
     }
 
-    // 本地文件夹目录结构动态聚合 (根据相对路径或本地物理路径聚合并提取目录名，过滤服务端 JSON 元数据)
-    val localFolders = remember(allSongs) {
-        allSongs.mapNotNull { song ->
-            val rawRelPath = song.relativeFolderPath?.trim()
-            val validRelPath = if (
-                !rawRelPath.isNullOrBlank() &&
-                !rawRelPath.startsWith("{") &&
-                !rawRelPath.contains("\"") &&
-                !rawRelPath.contains("_id__") &&
-                !rawRelPath.startsWith("http")
-            ) rawRelPath else null
-
-            val folderName = when {
-                validRelPath != null -> {
-                    val p = validRelPath.replace('\\', '/')
-                    p.trimEnd('/').substringAfterLast('/')
-                }
-                !song.localFilePath.isNullOrBlank() -> {
-                    val p = song.localFilePath.replace('\\', '/').trimEnd('/')
-                    p.substringBeforeLast('/', "").substringAfterLast('/').ifBlank { null }
-                }
-                else -> null
-            }?.trim()?.ifBlank { null }
-            if (folderName != null && folderName !in listOf("0", "emulated", "sdcard", "storage")) {
-                folderName to song
-            } else null
-        }.groupBy({ it.first }, { it.second })
-        .map { (folderName, songs) ->
-            UnifiedFolder(
-                id = "folder_${folderName.hashCode()}",
-                name = folderName,
-                path = songs.firstOrNull()?.let { s ->
-                    val rp = s.relativeFolderPath?.trim()
-                    if (!rp.isNullOrBlank() && !rp.startsWith("{") && !rp.contains("\"")) rp else s.localFilePath
-                } ?: "",
-                songCount = songs.size,
-                songs = songs
-            )
-        }.sortedByDescending { it.songCount }
+    // 切页提速：文件夹 / 歌手 / 专辑 / 最近添加原先每次进「我的」都在主线程整库重算（切页卡顿主因）。
+    // 现在按曲库列表实例缓存（LibraryAggregateCache）：曲库没变化时切回来直接复用；
+    // 曲库变化后在后台线程重算，算好之前沿用上一份结果。曲库较小时首次进页同步算，不出现空白。
+    // 启动阶段（续播出声前）不在主线程同步算，一律交给后台，避免和首帧抢时间
+    val initialAggregates = remember {
+        LibraryAggregateCache.peek(allSongs)
+            ?: if (com.lm.player.core.startup.StartupGate.isReleased &&
+                allSongs.size <= LibraryAggregateCache.SYNC_COMPUTE_LIMIT
+            ) LibraryAggregateCache.compute(allSongs) else null
     }
+    val libraryAggregates by produceState(initialValue = initialAggregates ?: LibraryAggregates.EMPTY, allSongs) {
+        LibraryAggregateCache.peek(allSongs)?.let {
+            value = it
+            return@produceState
+        }
+        value = withContext(Dispatchers.Default) { LibraryAggregateCache.compute(allSongs) }
+    }
+
+    // 本地文件夹目录结构动态聚合 (根据相对路径或本地物理路径聚合并提取目录名，过滤服务端 JSON 元数据)
+    val localFolders = libraryAggregates.folders
 
     // 本地下载离线歌曲聚合：异步在 IO 线程核验真实文件，杜绝主线程卡顿
     val finalDownloadedSongs by produceState(
@@ -197,6 +190,8 @@ fun LocalLibraryScreen(
         key1 = allSongs,
         key2 = downloadedSongs
     ) {
+        // 启动提速：逐个检查下载文件是否还在，等续播出声后再做（期间先显示数据库里的已下载列表）
+        com.lm.player.core.startup.StartupGate.await()
         val filtered = withContext(Dispatchers.IO) {
             val validLocal = { s: UnifiedSong ->
                 val path = s.localFilePath
@@ -246,38 +241,18 @@ fun LocalLibraryScreen(
     var isSubViewMultiSelect by remember { mutableStateOf(false) }
     val selectedSubViewSongIds = remember { mutableStateListOf<String>() }
 
-    // 动态聚合数据
-    val artists = remember(allSongs) {
-        val countMap = allSongs.groupingBy { it.artist.ifBlank { "未知歌手" } }.eachCount()
-        allSongs.groupBy { it.artist.ifBlank { "未知歌手" } }
-            .map { (artistName, songs) ->
-                val sCount = countMap[artistName] ?: songs.size
-                UnifiedArtist(
-                    id = "artist_${artistName.hashCode()}",
-                    name = artistName,
-                    avatarUrl = songs.firstOrNull { it.coverUrl.isNotBlank() }?.coverUrl ?: "",
-                    albumCount = songs.map { it.album }.distinct().size,
-                    songCount = sCount
-                )
-            }.sortedByDescending { it.songCount }
-    }
+    // 动态聚合数据（计算逻辑在 LibraryAggregateCache，内容与原来一致）
+    val artists = libraryAggregates.artists
 
-    val albums = remember(allSongs) {
-        allSongs.groupBy { it.album.ifBlank { "单曲精选" } }
-            .map { (albumName, songs) ->
-                UnifiedAlbum(
-                    id = "album_${albumName.hashCode()}",
-                    title = albumName,
-                    artist = songs.firstOrNull()?.artist ?: "各种艺术家",
-                    coverUrl = songs.firstOrNull { it.coverUrl.isNotBlank() }?.coverUrl ?: "",
-                    songCount = songs.size
-                )
-            }.sortedByDescending { it.songCount }
-    }
+    val albums = libraryAggregates.albums
 
     // 自动同步服务器歌单 (进入资料库或服务器配置就绪时自动拉取)
-    LaunchedEffect(activeServerConfig?.id) {
+    // 切页保留页面后本页不随切页重建：把「重新显示次数」加进 key，切回来时和原来一样再刷新一次
+    val pageReentry = com.lm.player.ui.rememberPageReentryCount()
+    LaunchedEffect(activeServerConfig?.id, pageReentry) {
         if (activeServerConfig != null && activeServerConfig.type == ServerType.LEMON_MUSIC) {
+            // 启动提速：「我的」是启动页时，服务器歌单刷新等续播出声后再做
+            com.lm.player.core.startup.StartupGate.await()
             onRefreshPlaylists()
         }
     }
@@ -350,7 +325,7 @@ fun LocalLibraryScreen(
     var serverScanStatus by remember { mutableStateOf<LemonScanStatus?>(null) }
     var isTriggeringScan by remember { mutableStateOf(false) }
 
-    LaunchedEffect(activeServerConfig) {
+    LaunchedEffect(activeServerConfig, pageReentry) {
         if (activeServerConfig != null && activeServerConfig.type == ServerType.LEMON_MUSIC) {
             if (onFetchServerGenres != null) {
                 coroutineScope.launch {
@@ -390,39 +365,13 @@ fun LocalLibraryScreen(
     }
 
     // 排序后的歌曲列表
+    // 切页提速：排序结果按（曲库实例 + 排序方式）缓存，切回「我的」不再重排整库（排序逻辑见 LibraryAggregateCache.sorted）
     val filteredSongs = remember(allSongs, songSortMode) {
-        when (songSortMode) {
-            "name" -> allSongs.sortedBy { it.title }
-            "artist" -> allSongs.sortedBy { it.artist }
-            "duration" -> allSongs.sortedByDescending { it.durationMs }
-            "source" -> allSongs.sortedWith(
-                compareBy<UnifiedSong> { getSongSourceTypeRank(it) }
-                    .thenByDescending { it.addedTimestamp }
-                    .thenBy { it.title }
-            )
-            // 按加入时间倒序（新加入的在前）。时间戳缺失(0)的极少数条目自然排在末尾，属预期。
-            // addedTimestamp 的口径由调用方按模式注入，这里不区分：
-            //   在线模式 = 服务器文件的 mtime（即服务器「最近添加」的先后）
-            //   本地模式 = 本地下载完成时间（纯扫描入库的文件回落到文件修改时间）
-            "added" -> allSongs.sortedWith(
-                compareByDescending<UnifiedSong> { it.addedTimestamp }.thenBy { it.title }
-            )
-            else -> allSongs
-        }
+        LibraryAggregateCache.sorted(allSongs, songSortMode) { getSongSourceTypeRank(it) }
     }
 
     // 最近添加歌曲切片 (优先聚合已下载或有明确添加时间戳的曲目，按 addedTimestamp 倒序排序取前20首)
-    val recentAddedSongs = remember(allSongs) {
-        val downloadedOrTimestamped = allSongs.filter { it.downloadStatus == DownloadStatus.DOWNLOADED || it.addedTimestamp > 0 }
-        if (downloadedOrTimestamped.isNotEmpty()) {
-            downloadedOrTimestamped.sortedWith(
-                compareByDescending<UnifiedSong> { it.addedTimestamp }
-                    .thenByDescending { it.downloadStatus == DownloadStatus.DOWNLOADED }
-            ).take(20)
-        } else {
-            allSongs.sortedByDescending { it.addedTimestamp }.take(20)
-        }
-    }
+    val recentAddedSongs = libraryAggregates.recentAdded
 
     // 列表滚动状态必须建在 if 分支**之外**：分支内创建会随子树销毁而丢失，
     // 表现为「下钻后返回，滚动位置回到顶部」；而且焦点恢复依赖目标项在视口内 ——
@@ -455,6 +404,10 @@ fun LocalLibraryScreen(
 
     Box(modifier = Modifier.fillMaxSize()) {
         val isLocalMode = activeServerConfig == null || currentServerName.contains("本地") || currentServerName.contains("已下载")
+        // 歌单详情页可「移出歌单」（2026-11-13）：服务器歌单要连着服务器才能改（本地模式下看到的是缓存，只读）
+        val activePlaylistIsOnline = playlists.firstOrNull { it.id == activePlaylistId }?.isOnline == true
+        val canRemoveFromPlaylist = onRemoveSongsFromPlaylist != null && activePlaylistId != null &&
+            (!activePlaylistIsOnline || !isLocalMode)
         // 主视图：浏览「我的 (融合在线曲库与本地缓存)」各大板块 (当没有进入二级下钻时展示)
         if (activeSubViewTitle == null) {
             val goldColor = Color(0xFFFFC947)
@@ -474,7 +427,14 @@ fun LocalLibraryScreen(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(dimensions.scale(124.dp)),
+                            .height(dimensions.scale(124.dp))
+                            // 遥控器光标进到这两张卡（在线 / 本地模式、同步曲库、配置、下载管理）时整页滚回最顶上：
+                            // 以前列表只把按钮本身滚进可视区，卡片上半截（模式标题、曲库数量）被挡在屏幕外
+                            .onFocusChanged { st ->
+                                if (st.hasFocus && (mainListState.firstVisibleItemIndex != 0 || mainListState.firstVisibleItemScrollOffset != 0)) {
+                                    coroutineScope.launch { runCatching { mainListState.animateScrollToItem(0) } }
+                                }
+                            },
                         horizontalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
                         // 左卡：在线服务器模式与本地模式切换卡片
@@ -572,9 +532,13 @@ fun LocalLibraryScreen(
                                 }
 
                                 // 底部遥控器可聚焦模式切换与同步按钮排
+                                // 四个按钮一排：以前最后的「配置」只能拿到剩下的宽度，被挤压变形。
+                                // 现在每个按钮按文字排、不换行；万一一排放不下就整排横向滚动（光标移过去自动滚到），绝不压缩按钮
                                 Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     // 按钮 1：切换至在线服务器模式
@@ -596,7 +560,7 @@ fun LocalLibraryScreen(
                                                     }
                                                     onSelectServer(targetServer)
                                                 } else {
-                                                    Toast.makeText(context, "尚未配置服务器，请先在设置中添加柠檬音乐服务", Toast.LENGTH_SHORT).show()
+                                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "尚未配置服务器，请先在设置中添加柠檬音乐服务", Toast.LENGTH_SHORT).show()
                                                     onGoToSettings()
                                                 }
                                             }
@@ -614,7 +578,7 @@ fun LocalLibraryScreen(
                                                 modifier = Modifier.size(14.dp)
                                             )
                                             Text(
-                                                text = if (!isLocalMode && configuredServers.size > 1) "切换服务器" else "在线服务器模式",
+                                                text = if (!isLocalMode && configuredServers.size > 1) "切换服务器" else "在线模式",
                                                 fontSize = dimensions.captionSize,
                                                 fontWeight = FontWeight.Bold,
                                                 color = Color.White
@@ -1438,7 +1402,16 @@ fun LocalLibraryScreen(
 
                             Spacer(modifier = Modifier.height(12.dp))
 
-                            if (artists.isEmpty()) {
+                            if (artists.isEmpty() && libraryAggregates === LibraryAggregates.EMPTY && allSongs.isNotEmpty()) {
+                                // 界面美化：曲库统计还在后台计算（大曲库首次进页）→ 骨架占位，而不是误显示「暂无歌手」
+                                com.lm.player.core.designsystem.polish.SkeletonPlaceholder(
+                                    spec = com.lm.player.core.designsystem.polish.SkeletonSpec(
+                                        kind = com.lm.player.core.designsystem.polish.SkeletonKind.CARD_ROW,
+                                        itemCount = 6,
+                                        shimmer = !com.lm.player.core.designsystem.theme.SmoothMode.isActive
+                                    )
+                                )
+                            } else if (artists.isEmpty()) {
                                 Box(
                                     modifier = Modifier
                                         .fillMaxWidth()
@@ -1575,6 +1548,12 @@ fun LocalLibraryScreen(
                                             selectedMainSongIds.addAll(filteredSongs.map { it.id })
                                         }
                                     },
+                                    onBatchAddToPlaylist = {
+                                        com.lm.player.core.designsystem.component.PlaylistBatchOps.startAdd(context, filteredSongs.filter { it.id in selectedMainSongIds }) {
+                                            isMainListMultiSelect = false
+                                            selectedMainSongIds.clear()
+                                        }
+                                    },
                                     onBatchDownloadClick = {
                                         val selected = filteredSongs.filter { it.id in selectedMainSongIds }
                                         if (selected.isNotEmpty()) {
@@ -1676,7 +1655,7 @@ fun LocalLibraryScreen(
                 } else {
                     itemsIndexed(
                         items = filteredSongs,
-                        key = { idx, song -> "libsong_${idx}_${song.id}" },
+                        key = { idx, _ -> com.lm.player.core.designsystem.component.StableListKeys.keyAt(filteredSongs, idx, "libsong_") { it.id } },
                         contentType = { _, _ -> "library_song_item" }
                     ) { idx, song ->
                         val isSelected = song.id in selectedMainSongIds
@@ -1875,12 +1854,24 @@ fun LocalLibraryScreen(
                                     selectedSubViewSongIds.addAll(activeSubViewSongs.map { it.id })
                                 }
                             },
+                            onBatchAddToPlaylist = {
+                                com.lm.player.core.designsystem.component.PlaylistBatchOps.startAdd(context, activeSubViewSongs.filter { it.id in selectedSubViewSongIds }) {
+                                    isSubViewMultiSelect = false
+                                    selectedSubViewSongIds.clear()
+                                }
+                            },
                             onBatchDownloadClick = {
                                 val selected = activeSubViewSongs.filter { it.id in selectedSubViewSongIds }
                                 if (selected.isNotEmpty()) {
                                     songsForBatchDownloadChoice = selected
                                 }
-                            }
+                            },
+                            onBatchRemoveClick = if (canRemoveFromPlaylist) {
+                                {
+                                    val selected = activeSubViewSongs.filter { it.id in selectedSubViewSongIds }
+                                    if (selected.isNotEmpty()) songsPendingRemoval = selected
+                                }
+                            } else null
                         )
                     }
                 }
@@ -2193,7 +2184,8 @@ fun LocalLibraryScreen(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .aspectRatio(1f),
-                                    cornerRadius = 12.dp
+                                    cornerRadius = 12.dp,
+                                    highQuality = true // 专辑网格大封面：按格子实际大小、32 位色解码
                                 )
                                 Spacer(modifier = Modifier.height(6.dp))
                                 Text(
@@ -2247,7 +2239,7 @@ fun LocalLibraryScreen(
                     ) {
                         itemsIndexed(
                             items = activeSubViewSongs,
-                            key = { idx, song -> "subsong_${idx}_${song.id}" },
+                            key = { idx, _ -> com.lm.player.core.designsystem.component.StableListKeys.keyAt(activeSubViewSongs, idx, "subsong_") { it.id } },
                             contentType = { _, _ -> "subview_song_row" }
                         ) { idx, song ->
                             if (isDownloadManagementMode && activeSubViewTitle == "本地下载") {
@@ -2323,6 +2315,98 @@ fun LocalLibraryScreen(
         }
     }
 
+    // 移出歌单确认（2026-11-13）：服务器歌单同步写回服务器；歌曲本身不会被删除
+    val pendingRemoval = songsPendingRemoval
+    val removalPlaylistId = activePlaylistId
+    if (pendingRemoval != null && removalPlaylistId != null && onRemoveSongsFromPlaylist != null && isRemovingFromPlaylist) {
+        // 移出进行中：进度条（2026-11-14）
+        com.lm.player.core.designsystem.component.BatchProgressDialog(
+            title = "正在从「${activeSubViewTitle.orEmpty()}」移出 ${pendingRemoval.size} 首",
+            progress = removalProgress,
+            step = removalStep
+        )
+    } else if (pendingRemoval != null && removalPlaylistId != null && onRemoveSongsFromPlaylist != null) {
+        val removalIsOnline = playlists.firstOrNull { it.id == removalPlaylistId }?.isOnline == true
+        val playlistTitle = activeSubViewTitle.orEmpty()
+        AlertDialog(
+            onDismissRequest = { if (!isRemovingFromPlaylist) songsPendingRemoval = null },
+            title = { Text("移出歌单", fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    (if (pendingRemoval.size == 1) "确定把《${pendingRemoval.first().title}》从「$playlistTitle」移出吗？"
+                    else "确定把选中的 ${pendingRemoval.size} 首歌从「$playlistTitle」移出吗？") +
+                        (if (removalIsOnline) "\n服务器上的歌单会同步更新，" else "\n") + "歌曲本身不会被删除。"
+                )
+            },
+            confirmButton = {
+                Button(
+                    enabled = !isRemovingFromPlaylist,
+                    onClick = {
+                        val songsToRemove = pendingRemoval
+                        coroutineScope.launch {
+                            removalProgress = 0f
+                            removalStep = "准备中…"
+                            isRemovingFromPlaylist = true
+                            val result = try {
+                                onRemoveSongsFromPlaylist(removalPlaylistId, removalIsOnline, songsToRemove) { f, step ->
+                                    removalProgress = f
+                                    removalStep = step
+                                }
+                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                Result.failure(e)
+                            }
+                            isRemovingFromPlaylist = false
+                            songsPendingRemoval = null
+                            result.onSuccess { _ ->
+                                val ids = songsToRemove.map { it.id }.toSet()
+                                if (activePlaylistId == removalPlaylistId) {
+                                    activeSubViewSongs = activeSubViewSongs.filter { it.id !in ids }
+                                    activeSubViewSubtitle = "${if (removalIsOnline) "云端歌单" else "本地歌单"} · ${activeSubViewSongs.size} 首"
+                                    com.lm.player.core.designsystem.component.PlaylistMembership.record(removalPlaylistId, activeSubViewSongs)
+                                }
+                                isSubViewMultiSelect = false
+                                selectedSubViewSongIds.clear()
+                                com.lm.player.core.designsystem.component.AppToast.makeText(
+                                    context,
+                                    "已从「$playlistTitle」移出 ${songsToRemove.size} 首",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }.onFailure { e ->
+                                com.lm.player.core.designsystem.component.AppToast.makeText(
+                                    context,
+                                    "移出失败：${e.message ?: "未知错误"}",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF3B30)),
+                    modifier = Modifier.tvButtonFocusable(
+                        shape = RoundedCornerShape(10.dp),
+                        focusedBorderColor = Color(0xFFFFD60A)
+                    )
+                ) {
+                    if (isRemovingFromPlaylist) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = Color.White)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("移出中…")
+                    } else {
+                        Text("移出")
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    enabled = !isRemovingFromPlaylist,
+                    onClick = { songsPendingRemoval = null },
+                    modifier = Modifier.tvButtonFocusable(shape = RoundedCornerShape(10.dp))
+                ) { Text("取消") }
+            }
+        )
+    }
+
     // 确认删除本地下载歌曲弹窗
     if (showBatchDeleteLocalDialog) {
         AlertDialog(
@@ -2368,7 +2452,7 @@ fun LocalLibraryScreen(
                                 selectedDownloadSongIds.clear()
                                 isDownloadManagementMode = false
                                 val displayCount = if (deletedCount > 0) deletedCount else songsToDelete.size
-                                Toast.makeText(context, "已成功删除 $displayCount 首歌曲并释放空间", Toast.LENGTH_SHORT).show()
+                                com.lm.player.core.designsystem.component.AppToast.makeText(context, "已成功删除 $displayCount 首歌曲并释放空间", Toast.LENGTH_SHORT).show()
                             }
                         }
                     },

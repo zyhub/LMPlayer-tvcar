@@ -606,17 +606,17 @@ fun LocalFolderPickerDialog(
                             val newFolder = File(currentDir, name)
                             if (!newFolder.exists()) {
                                 if (newFolder.mkdirs()) {
-                                    Toast.makeText(context, "文件夹「$name」创建成功", Toast.LENGTH_SHORT).show()
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "文件夹「$name」创建成功", Toast.LENGTH_SHORT).show()
                                     currentDir = newFolder
                                 } else {
-                                    Toast.makeText(
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(
                                         context,
                                         "创建失败。" + StoragePermissionHelper.explainWriteFailure(context, newFolder.absolutePath),
                                         Toast.LENGTH_LONG
                                     ).show()
                                 }
                             } else {
-                                Toast.makeText(context, "同名文件夹已存在", Toast.LENGTH_SHORT).show()
+                                com.lm.player.core.designsystem.component.AppToast.makeText(context, "同名文件夹已存在", Toast.LENGTH_SHORT).show()
                                 currentDir = newFolder
                             }
                             showCreateDirDialog = false

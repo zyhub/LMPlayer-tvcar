@@ -146,7 +146,7 @@ object LocalScanEngine {
 
     private fun toast(app: Context, text: String) {
         Handler(Looper.getMainLooper()).post {
-            try { Toast.makeText(app, text, Toast.LENGTH_LONG).show() } catch (_: Exception) {}
+            try { com.lm.player.core.designsystem.component.AppToast.makeText(app, text, Toast.LENGTH_LONG).show() } catch (_: Exception) {}
         }
     }
 

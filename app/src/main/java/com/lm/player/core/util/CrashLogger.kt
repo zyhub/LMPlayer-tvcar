@@ -73,6 +73,33 @@ object CrashLogger {
         runCatching { file(context).writeText(sanitized) }
     }
 
+    /**
+     * 记一份「非 Java 异常」的报告（主线程卡死、系统层崩溃、被系统结束等，见 [ExitDiagnostics]），
+     * 下次启动与崩溃日志一样弹出。上一份还没展示过时追加在后面，不覆盖。
+     */
+    @Synchronized
+    fun writeExtraReport(context: Context, title: String, body: String) {
+        runCatching {
+            val text = buildString {
+                appendLine("LMPlayer TV车机版 $title")
+                appendLine("时间: " + SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date()))
+                appendLine("版本: " + versionName(context))
+                appendLine(
+                    "设备: " + Build.MANUFACTURER + " " + Build.MODEL +
+                        " / Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")"
+                )
+                appendLine("----------------------------------------")
+                append(body)
+            }
+            val sanitized = LogRedactor.text(text)
+            val f = file(context)
+            val shownStamp = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getLong(KEY_SHOWN_STAMP, 0L)
+            val unshown = f.exists() && f.length() > 0L && f.lastModified() > shownStamp
+            val merged = if (unshown) f.readText() + "\n\n========================================\n\n" + sanitized else sanitized
+            f.writeText(merged.takeLast(MAX_LOG_LENGTH))
+        }
+    }
+
     private fun versionName(context: Context): String = runCatching {
         @Suppress("DEPRECATION")
         context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "?"

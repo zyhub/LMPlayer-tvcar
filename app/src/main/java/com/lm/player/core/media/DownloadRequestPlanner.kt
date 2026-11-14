@@ -151,7 +151,10 @@ object DownloadRequestPlanner {
         skipLocalAcceleration: Boolean
     ): ResolvedDownloadStream? {
         val accelMode = com.lm.player.core.source.SourceAccelerationController.playbackMode()
-        val localOnly = protocol == null || accelMode == com.lm.player.core.source.SourceAccelerationController.Mode.LOCAL_ONLY
+        // 服务器已判定离线：本地音源是唯一出路（TV 按需启动下引擎可能还没加载，此时 accelMode 还不是 LOCAL_ONLY）
+        val serverOffline = protocol != null && com.lm.player.core.source.ServerLinkState.isLost
+        val localOnly = protocol == null || serverOffline || accelMode == com.lm.player.core.source.SourceAccelerationController.Mode.LOCAL_ONLY
+        val tryLocal = serverOffline || com.lm.player.core.source.SourceAccelerationController.shouldAccelerate()
 
         if (protocol == null) {
             // 没有柠檬服务器（已删除/解绑）：在线曲目只能由本地音源取链——完整的「换音源 → 换平台 → 降音质」
@@ -166,14 +169,20 @@ object DownloadRequestPlanner {
         var accelerationAttempted = false
 
         // 服务器曲库没有平台 ID：用本地目录服务搜索同曲目，再做本地取链（结果已经过 CDN 探活）；失败回 NAS。
-        if (!skipLocalAcceleration && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate() && isServerLibrarySong(song)) {
+        if (!skipLocalAcceleration && tryLocal && isServerLibrarySong(song)) {
             accelerationAttempted = true
             val resolved = com.lm.player.core.source.ServerLibraryAccelerationResolver.resolve(
                 protocol = protocol,
                 serverId = song.serverId,
                 song = song,
                 overrideQuality = quality.key,
-                priority = com.lm.player.core.source.ResolvePriority.DOWNLOAD
+                priority = com.lm.player.core.source.ResolvePriority.DOWNLOAD,
+                // 2026-11-13 从手机端移植：本平台各音源同音质 → 其它平台同音质，下载有自己的时间预算。
+                // 服务器在线时只收目标音质（拿不到就交给服务器原文件，不在本地悄悄降档）；
+                // 服务器离线时服务器原文件拿不到了，本地允许逐级降音质
+                floorQuality = if (serverOffline) null else quality,
+                crossPlatform = true,
+                budgetMsOverride = DOWNLOAD_ACCEL_BUDGET_MS
             ).getOrNull()
             resolved?.let { r ->
                 return ResolvedDownloadStream(r.url, r.quality.format.lowercase(), r.quality.bitrate)
@@ -182,7 +191,7 @@ object DownloadRequestPlanner {
 
         // 在线曲目：外网/内网高延迟/服务器离线且会话就绪时，先本地解析同音质直链（下载优先级，不挤占播放）。
         // 失败完全不报错，继续走原来的服务器/音源链路。
-        if (!skipLocalAcceleration && com.lm.player.core.source.SourceAccelerationController.shouldAccelerate()) {
+        if (!skipLocalAcceleration && tryLocal) {
             val accelSource = resolveAccelerationSource(song)
             if (accelSource.isBlank()) {
                 // 服务器曲库 ID 没有平台信息，无法安全匹配本地音源，直接走服务器。
@@ -211,6 +220,13 @@ object DownloadRequestPlanner {
             }
         }
 
+        // 服务器离线：本地上面已经试过完整流程，没取到就到此为止 —— 后面的登录检查、查服务器曲目、
+        // 服务器取音源、拼服务器文件地址每一步都要等超时，最后拿到的地址也下载不了
+        if (serverOffline) {
+            android.util.Log.w("DownloadRequestPlanner", "Server offline and local sources missed: ${song.title}")
+            return null
+        }
+
         protocol.ensureAuthenticated()
 
         var serverPath = LemonMusicProtocol.getServerFilePath(song.id, song.streamUrl, song.coverUrl)
@@ -232,13 +248,17 @@ object DownloadRequestPlanner {
             }
         }
 
+        // 服务器原文件规格从同步时存下的服务器元数据取（2026-11-13 从手机端移植）：本地存过一份低音质文件后，
+        // 记录里的 format / bitRate 是本地文件的，不能拿来判断服务器那份
+        val serverSpecs = com.lm.player.core.model.serverFileSpecsOf(song)
         val serverExt = serverPath?.substringAfterLast('.', "")?.lowercase().orEmpty()
-            .ifBlank { song.format.lowercase() }
+            .ifBlank { serverSpecs?.format ?: song.format.lowercase() }
+        val serverBitRate = serverSpecs?.bitRate ?: song.bitRate
         val serverMatchesTarget = !serverPath.isNullOrBlank() && when (quality) {
-            AudioQuality.Q_128K -> serverExt in LOSSY_EXTS && song.bitRate in 64..192
-            AudioQuality.Q_320K -> serverExt in LOSSY_EXTS && song.bitRate in 193..512
-            AudioQuality.Q_FLAC -> serverExt in LOSSLESS_EXTS && song.bitRate < 1200
-            AudioQuality.Q_HIRES -> serverExt in LOSSLESS_EXTS && song.bitRate >= 1200
+            AudioQuality.Q_128K -> serverExt in LOSSY_EXTS && serverBitRate in 64..192
+            AudioQuality.Q_320K -> serverExt in LOSSY_EXTS && serverBitRate in 193..512
+            AudioQuality.Q_FLAC -> serverExt in LOSSLESS_EXTS && serverBitRate < 1200
+            AudioQuality.Q_HIRES -> serverExt in LOSSLESS_EXTS && serverBitRate >= 1200
         }
 
         var url: String? = null
@@ -255,7 +275,7 @@ object DownloadRequestPlanner {
         val serverCoversTarget = when {
             serverExt in LOSSLESS_EXTS -> true
             targetLossless -> false
-            else -> song.bitRate >= quality.bitrate - 64
+            else -> serverBitRate >= quality.bitrate - 64
         }
         if (preferServerFile && !preferredServerPath.isNullOrBlank() && serverCoversTarget) {
             val serverUrl = protocol.getStreamUrlForPath(preferredServerPath, quality.key)
@@ -263,9 +283,9 @@ object DownloadRequestPlanner {
             if (!serverUrl.isNullOrBlank()) {
                 val actualFormat = serverExt.ifBlank { quality.format.lowercase() }
                 val actualBitRate = when {
-                    actualFormat in LOSSLESS_EXTS && song.bitRate < 800 -> 960
-                    actualFormat in LOSSLESS_EXTS -> song.bitRate
-                    song.bitRate > 0 -> song.bitRate
+                    actualFormat in LOSSLESS_EXTS && serverBitRate < 800 -> 960
+                    actualFormat in LOSSLESS_EXTS -> serverBitRate
+                    serverBitRate > 0 -> serverBitRate
                     else -> quality.bitrate
                 }
                 return ResolvedDownloadStream(serverUrl, actualFormat, actualBitRate)
@@ -379,7 +399,7 @@ object DownloadRequestPlanner {
             else -> AudioQuality.Q_320K
         }
         android.os.Handler(android.os.Looper.getMainLooper()).post {
-            android.widget.Toast.makeText(
+            com.lm.player.core.designsystem.component.AppToast.makeText(
                 ctx,
                 "「${song.title}」暂无【${requested.label}】，已换源后降为【${actual.label}】下载",
                 android.widget.Toast.LENGTH_LONG

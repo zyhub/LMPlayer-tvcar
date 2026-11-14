@@ -136,7 +136,7 @@ object ChartWidgetController {
     }
 
     private fun toast(context: Context, msg: String) {
-        mainHandler.post { Toast.makeText(context, msg, Toast.LENGTH_SHORT).show() }
+        mainHandler.post { com.lm.player.core.designsystem.component.AppToast.makeText(context, msg, Toast.LENGTH_SHORT).show() }
     }
 
     fun hasWidgets(context: Context): Boolean {
@@ -223,7 +223,7 @@ object ChartWidgetController {
             val active = t == tab
             rv.setInt(viewId, "setBackgroundResource", if (active) R.drawable.bg_widget_tab_active else R.drawable.bg_widget_tab_inactive)
             rv.setTextColor(viewId, if (active) activeColor else inactiveColor)
-            val intent = Intent(context, ChartWidgetActionReceiver::class.java).setAction(action)
+            val intent = Intent(context, ChartWidgetActionReceiver::class.java).setAction(action).addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
             rv.setOnClickPendingIntent(viewId, PendingIntent.getBroadcast(context, 301 + i, intent, pFlags))
         }
 
@@ -239,7 +239,7 @@ object ChartWidgetController {
                 noSource -> "暂无榜单数据" to "需要连接柠檬服务器或启用本地音源"
                 else -> "${tab.displayName}加载失败" to "点击重试"
             }
-            val refresh = Intent(context, ChartWidgetActionReceiver::class.java).setAction(ACTION_CHART_REFRESH)
+            val refresh = Intent(context, ChartWidgetActionReceiver::class.java).setAction(ACTION_CHART_REFRESH).addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
             val refreshPending = PendingIntent.getBroadcast(context, 309, refresh, pFlags)
             for (i in 0 until spec.maxItems) {
                 if (i == 0) {
@@ -274,6 +274,7 @@ object ChartWidgetController {
 
             val play = Intent(context, ChartWidgetActionReceiver::class.java).apply {
                 action = ACTION_CHART_PLAY_ITEM
+                addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
                 putExtra(EXTRA_SONG_RANK, i + 1)
                 putExtra(EXTRA_SONG_TITLE, song.title)
                 putExtra(EXTRA_SONG_ARTIST, song.artist)

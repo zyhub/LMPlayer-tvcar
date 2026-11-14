@@ -13,8 +13,11 @@ import com.lm.player.core.source.SourceAccelerationSession
  */
 object OfflineCatalogService {
 
-    /** 是否可以在没有服务器的情况下提供在线目录（本地音源脚本就绪才有意义：否则搜到也播不了）。 */
-    fun isAvailable(): Boolean = SourceAccelerationSession.isReady() || SourceAccelerationController.detached.value
+    /**
+     * 是否可以在没有服务器的情况下提供在线目录（本地音源可用才有意义：否则搜到也播不了）。
+     * TV 按需启动：目录本身不需要 JS 引擎，本机缓存了音源脚本即视为可用；播放时取链再按需加载引擎。
+     */
+    fun isAvailable(): Boolean = SourceAccelerationSession.isReady() || SourceAccelerationController.localSourceConfigured()
 
     suspend fun searchSongs(keyword: String, source: String, page: Int = 1, limit: Int = 30): List<UnifiedSong> {
         val res = LocalCatalogGateway.executeDetached(CatalogOp.Search(keyword, source, page, limit, "music")) ?: return emptyList()

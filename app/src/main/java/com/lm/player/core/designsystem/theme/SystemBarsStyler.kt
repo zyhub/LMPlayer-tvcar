@@ -53,7 +53,17 @@ object SystemBarsStyler {
         val top = topColorFor(dark).toArgb()
         baseStyle = Style(top, bottomColorFor(dark).toArgb())
         window.setBackgroundDrawable(ColorDrawable(top))
+        // 全局沉浸（2026-11-13，与手机端一致）：所有页面都画到状态栏下面、状态栏透明，
+        // 页面自己用 statusBarsPadding 让开内容；播放页的封面 / 底图因此能一直铺到屏幕顶端
+        applyDrawBehind(window)
         render(window, view)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun applyDrawBehind(window: Window) {
+        val decor = window.decorView
+        decor.systemUiVisibility = decor.systemUiVisibility or
+            View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
     }
 
     internal fun push(key: Any, statusBar: Color, navigationBar: Color, window: Window, view: View) {
@@ -70,7 +80,8 @@ object SystemBarsStyler {
         val style = overrides.lastOrNull()?.second ?: baseStyle ?: return
         val controller = WindowCompat.getInsetsController(window, view)
 
-        window.statusBarColor = style.statusBar
+        // 状态栏始终透明（内容画在它下面），只用当前页面的底色决定状态栏图标的深浅
+        window.statusBarColor = android.graphics.Color.TRANSPARENT
         // isAppearanceLightStatusBars = true 表示「浅色底、深色图标」
         controller.isAppearanceLightStatusBars = Color(style.statusBar).luminance() > 0.5f
 

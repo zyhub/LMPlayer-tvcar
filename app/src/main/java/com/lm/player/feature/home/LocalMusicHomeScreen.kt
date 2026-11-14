@@ -12,12 +12,15 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
+import kotlinx.coroutines.launch
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -69,7 +72,7 @@ fun resolveRealLocalFormatAndSize(song: UnifiedSong): Triple<String, Int, String
     } else {
         "${song.id}_${localPath ?: ""}_${song.format}_${song.bitRate}_${song.durationMs}"
     }
-    realSpecsCache.get(cacheKey)?.let { return it }
+    realSpecsCache.get(cacheKey)?.let { realSpecsPeek.put(peekKeyOf(song), it); return it }
 
     val detectedExt = if (localFile != null) {
         val magicExt = try {
@@ -109,7 +112,69 @@ fun resolveRealLocalFormatAndSize(song: UnifiedSong): Triple<String, Int, String
     }
     val result = Triple(detectedExt, realBitRate, sizeStr)
     realSpecsCache.put(cacheKey, result)
+    realSpecsPeek.put(peekKeyOf(song), result)
     return result
+}
+
+// ============ 2026-11-13 性能优化第 5、6 项：磁盘检查移出主线程 ============
+// 列表行 / 播放页 / 首页卡片以前在组合时（主线程）直接调用上面的函数和 File.exists()：每个新出现的行
+// 1～4 次读文件属性，缓存没命中时还要打开文件读文件头。快速滚动、曲库在 U 盘上时会卡。
+// 现在界面先用内存里的上次结果（或不读盘的估算）显示，真正的磁盘检查放到 IO 线程，结果回来再刷新。
+
+/** 不读磁盘就能取到的「上次算过的结果」（按歌曲 + 路径 + 格式 + 码率） */
+private val realSpecsPeek = object : android.util.LruCache<String, Triple<String, Int, String>>(800) {}
+private fun peekKeyOf(song: UnifiedSong) = "${song.id}|${song.localFilePath.orEmpty()}|${song.format}|${song.bitRate}"
+
+fun peekRealLocalFormatAndSize(song: UnifiedSong): Triple<String, Int, String>? = realSpecsPeek.get(peekKeyOf(song))
+
+/** 完全不读磁盘的估算（格式取记录里的、大小按码率 × 时长），后台结果回来前先显示它 */
+fun estimateLocalSpecsWithoutDisk(song: UnifiedSong): Triple<String, Int, String> {
+    val ext = song.format.uppercase().ifBlank { "MP3" }
+    val lossless = ext in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF")
+    val br = if (lossless) song.bitRate.coerceAtLeast(960) else (if (song.bitRate > 0) song.bitRate else 320)
+    val durationSec = (song.durationMs / 1000L).coerceAtLeast(180L)
+    val rate = if (lossless) 900 else br.coerceAtLeast(128)
+    val size = "%.1f MB".format(java.util.Locale.US, (durationSec * rate * 1000L / 8L) / (1024.0 * 1024.0))
+    return Triple(ext, br, size)
+}
+
+/** 本地文件真实「格式 · 码率 · 大小」：先给内存里的结果 / 估算，磁盘检查在 IO 线程做完再刷新 */
+@Composable
+fun rememberRealLocalSpecs(song: UnifiedSong): Triple<String, Int, String> {
+    val key = peekKeyOf(song)
+    val state = androidx.compose.runtime.produceState(
+        initialValue = peekRealLocalFormatAndSize(song) ?: estimateLocalSpecsWithoutDisk(song),
+        key, song.durationMs
+    ) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { resolveRealLocalFormatAndSize(song) }
+    }
+    return state.value
+}
+
+/** 本地文件是否存在的上次结果（按路径），给界面做初值，避免「先显示已下载、再闪成未下载」 */
+private val fileExistsPeek = object : android.util.LruCache<String, Boolean>(2000) {}
+
+/** 本地文件是否存在：content:// 视为存在；普通路径先用上次结果（没有就按存在显示），IO 线程核实后刷新 */
+@Composable
+fun rememberLocalFileExists(path: String?): Boolean {
+    val quick: Boolean? = when {
+        path.isNullOrBlank() -> false
+        path.startsWith("content://") -> true
+        else -> null
+    }
+    val state = androidx.compose.runtime.produceState(
+        initialValue = quick ?: (fileExistsPeek.get(path!!) ?: true),
+        path
+    ) {
+        if (quick == null && path != null) {
+            val exists = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching { java.io.File(path).exists() }.getOrDefault(false)
+            }
+            fileExistsPeek.put(path, exists)
+            value = exists
+        }
+    }
+    return quick ?: state.value
 }
 
 /**
@@ -149,7 +214,11 @@ fun SongListPlayAndBatchDownloadBar(
     onExitMultiSelect: () -> Unit,
     onSelectAllToggle: () -> Unit,
     onBatchDownloadClick: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    /** 歌单详情页：多选后「移出歌单」（2026-11-13）；为 null 时不显示 */
+    onBatchRemoveClick: (() -> Unit)? = null,
+    /** 多选后「加入歌单」（2026-11-14，所有列表）；为 null 时不显示 */
+    onBatchAddToPlaylist: (() -> Unit)? = null
 ) {
     val goldColor = Color(0xFFFFC947)
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
@@ -193,7 +262,7 @@ fun SongListPlayAndBatchDownloadBar(
                 )
                 Spacer(modifier = Modifier.width(4.dp))
                 Text(
-                    "多选下载",
+                    if (onBatchRemoveClick != null || onBatchAddToPlaylist != null) "多选" else "多选下载",
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurface
@@ -232,6 +301,60 @@ fun SongListPlayAndBatchDownloadBar(
                 Spacer(modifier = Modifier.width(4.dp))
                 Text("下载 ($selectedCount)", fontSize = 11.5.sp, fontWeight = FontWeight.Bold)
             }
+            if (onBatchAddToPlaylist != null) {
+                OutlinedButton(
+                    onClick = onBatchAddToPlaylist,
+                    enabled = selectedCount > 0,
+                    shape = RoundedCornerShape(14.dp),
+                    contentPadding = PaddingValues(horizontal = 11.dp, vertical = 5.dp),
+                    border = BorderStroke(1.dp, borderColor),
+                    modifier = Modifier.tvButtonFocusable(
+                        shape = RoundedCornerShape(14.dp),
+                        focusedBorderColor = goldColor
+                    )
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.PlaylistAdd,
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                        tint = MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        "加入歌单 ($selectedCount)",
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
+            if (onBatchRemoveClick != null) {
+                OutlinedButton(
+                    onClick = onBatchRemoveClick,
+                    enabled = selectedCount > 0,
+                    shape = RoundedCornerShape(14.dp),
+                    contentPadding = PaddingValues(horizontal = 11.dp, vertical = 5.dp),
+                    border = BorderStroke(1.dp, if (selectedCount > 0) Color(0xFFFF3B30).copy(alpha = 0.6f) else borderColor),
+                    modifier = Modifier.tvButtonFocusable(
+                        shape = RoundedCornerShape(14.dp),
+                        focusedBorderColor = goldColor
+                    )
+                ) {
+                    Icon(
+                        Icons.Default.RemoveCircleOutline,
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                        tint = if (selectedCount > 0) Color(0xFFFF3B30) else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        "移出歌单 ($selectedCount)",
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (selectedCount > 0) Color(0xFFFF3B30) else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
             TextButton(
                 onClick = onExitMultiSelect,
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 5.dp),
@@ -268,6 +391,9 @@ fun SongListItemRow(
     /** 外部附加修饰符（例如 TV 焦点进入锚点），必须能透传到行根节点上 */
     modifier: Modifier = Modifier
 ) {
+    // 下载状态即时刷新（手机端移植）：下载完成 / 删除后，本行立刻显示最新状态，不等列表数据重读
+    @Suppress("NAME_SHADOWING")
+    val song = com.lm.player.core.media.SongStatusStore.rememberLive(song)
     val context = androidx.compose.ui.platform.LocalContext.current
     val dimensions = LocalAppDimensions.current
     // 只挑属于自己的那条任务：derivedStateOf 的读取方仅在**本行的结果**变化时才失效，
@@ -275,12 +401,10 @@ fun SongListItemRow(
     val activeTask by remember(song.id, activeDownloadTasks) {
         derivedStateOf { activeDownloadTasks().firstOrNull { it.song.id == song.id } }
     }
-    // 磁盘存在性检查并入 remember：原先每次重组都 stat 一次
-    val isDownloaded = remember(song.id, song.localFilePath, song.downloadStatus) {
-        val hasLocal = !song.localFilePath.isNullOrBlank() &&
-                (song.localFilePath.startsWith("content://") || java.io.File(song.localFilePath).exists())
-        hasLocal && (song.downloadStatus == DownloadStatus.DOWNLOADED || !song.localFilePath.isNullOrBlank())
-    }
+    // 磁盘存在性检查：2026-11-13 起放到 IO 线程（性能优化第 5 项），界面先用上次结果
+    val localFileExists = rememberLocalFileExists(song.localFilePath)
+    val isDownloaded = localFileExists &&
+        (song.downloadStatus == DownloadStatus.DOWNLOADED || !song.localFilePath.isNullOrBlank())
     val isDownloading = activeTask != null || song.downloadStatus == DownloadStatus.DOWNLOADING
     val currentProgress = activeTask?.progress ?: song.downloadProgress
     var showTvActionMenu by remember { mutableStateOf(false) }
@@ -303,6 +427,9 @@ fun SongListItemRow(
         )
     }
 
+    // 界面美化：本行是否持有遥控器焦点（驱动歌名滚动）
+    var rowFocused by remember { mutableStateOf(false) }
+
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -318,6 +445,7 @@ fun SongListItemRow(
                 shape = RoundedCornerShape(12.dp),
                 focusedScale = 1.015f,
                 onMenuKey = onDownloadClick,
+                onFocusChange = { rowFocused = it },
                 onClick = {
                     if (isMultiSelectMode && onToggleSelect != null) {
                         onToggleSelect()
@@ -347,10 +475,10 @@ fun SongListItemRow(
         Spacer(modifier = Modifier.width(12.dp))
 
         Column(modifier = Modifier.weight(1f)) {
-            Text(
+            // 界面美化：获得遥控器焦点且歌名放不下时横向滚动（Antigravity 设计）；未获焦时与原来一样显示省略号
+            com.lm.player.core.designsystem.polish.TvMarqueeText(
                 text = song.title,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+                focused = rowFocused,
                 style = TextStyle(
                     fontSize = dimensions.itemTitleSize,
                     fontWeight = if (isCurrentPlaying) FontWeight.Bold else FontWeight.Medium,
@@ -361,9 +489,8 @@ fun SongListItemRow(
             Spacer(modifier = Modifier.height(2.dp))
 
             if (isDownloaded) {
-                val (realFormatStr, realBitRate, realSizeStr) = remember(song.id, song.localFilePath, song.format, song.bitRate) {
-                    resolveRealLocalFormatAndSize(song)
-                }
+                // 真实格式 / 码率 / 大小：IO 线程算（性能优化第 5 项），先显示内存里的上次结果或估算
+                val (realFormatStr, realBitRate, realSizeStr) = rememberRealLocalSpecs(song)
                 val isLosslessLocal = realFormatStr in listOf("FLAC", "WAV", "ALAC", "APE", "DSD", "DSF") || realBitRate >= 800
                 // 已下载歌曲：展示真实音质、码率、大小参数
                 Text(
@@ -655,8 +782,13 @@ fun LocalMusicHomeScreen(
         else -> effectiveRecentAdded
     }
 
+    // 遥控器光标进到顶部两张大卡（同步曲库 / 切至在线 / 配置 …）时，整页滚回最顶上：
+    // 以前列表只把「按钮本身」滚进可视区，卡片上半截（服务器名、在线状态）留在屏幕外看不到
+    val mineListState = androidx.compose.foundation.lazy.rememberLazyListState()
+    val mineScope = androidx.compose.runtime.rememberCoroutineScope()
     Box(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
+            state = mineListState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(
                 top = 4.dp,
@@ -667,7 +799,13 @@ fun LocalMusicHomeScreen(
             // ==================== 1. 顶部双联状态大卡（服务器连接情况 + 本地缓存歌曲概览） ====================
             item {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .onFocusChanged { st ->
+                            if (st.hasFocus && (mineListState.firstVisibleItemIndex != 0 || mineListState.firstVisibleItemScrollOffset != 0)) {
+                                mineScope.launch { runCatching { mineListState.animateScrollToItem(0) } }
+                            }
+                        },
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
                     // 左卡：柠檬音乐服务器连接状态卡
@@ -680,7 +818,7 @@ fun LocalMusicHomeScreen(
                         ),
                         modifier = Modifier
                             .weight(1f)
-                            .height(178.dp)
+                            .heightIn(min = 178.dp) // 大字号时卡片长高，不挤压底部按钮
                     ) {
                         Column(
                             modifier = Modifier
@@ -820,7 +958,8 @@ fun LocalMusicHomeScreen(
                                     icon = Icons.Default.Settings,
                                     label = "配置",
                                     isPrimary = false,
-                                    modifier = Modifier.weight(0.75f),
+                                    // 按文字实际需要的宽度排（不参与等分），大字号下也不会被挤压；剩下的宽度两个按钮平分
+                                    wrapContent = true,
                                     onClick = onGoToSettings
                                 )
                             }
@@ -834,7 +973,7 @@ fun LocalMusicHomeScreen(
                         border = BorderStroke(1.dp, borderColor),
                         modifier = Modifier
                             .weight(1f)
-                            .height(178.dp)
+                            .heightIn(min = 178.dp)
                     ) {
                         Column(
                             modifier = Modifier
@@ -1009,10 +1148,20 @@ fun LocalMusicHomeScreen(
                     }
 
                     if (displayedSongs.isNotEmpty()) {
+                        val batchContext = androidx.compose.ui.platform.LocalContext.current
                         SongListPlayAndBatchDownloadBar(
                             totalCount = displayedSongs.size,
                             isMultiSelectMode = isMultiSelectMode,
                             selectedCount = selectedSongIds.size,
+                            onBatchAddToPlaylist = {
+                                com.lm.player.core.designsystem.component.PlaylistBatchOps.startAdd(
+                                    batchContext,
+                                    displayedSongs.filter { it.id in selectedSongIds }
+                                ) {
+                                    isMultiSelectMode = false
+                                    selectedSongIds.clear()
+                                }
+                            },
                             onPlayAll = { onSongClick(displayedSongs.first(), displayedSongs) },
                             onEnterMultiSelect = {
                                 isMultiSelectMode = true
@@ -1078,7 +1227,7 @@ fun LocalMusicHomeScreen(
             } else {
                 itemsIndexed(
                     items = displayedSongs,
-                    key = { idx, song -> "mine_song_${selectedTabIndex}_${idx}_${song.id}" },
+                    key = { idx, _ -> com.lm.player.core.designsystem.component.StableListKeys.keyAt(displayedSongs, idx, "mine_song_${selectedTabIndex}_") { it.id } },
                     contentType = { _, _ -> "song_row" }
                 ) { _, song ->
                     val isServerOk = configuredServers.any { it.type == ServerType.LEMON_MUSIC }
@@ -1147,16 +1296,18 @@ private fun MineCardActionButton(
     label: String,
     isPrimary: Boolean,
     modifier: Modifier = Modifier,
+    wrapContent: Boolean = false,
     onClick: () -> Unit
 ) {
     val goldColor = Color(0xFFFFC947)
-    val bgColor = if (isPrimary) AppleRed else Color.White.copy(alpha = 0.08f)
+    // 浅色主题下白色半透明底和描边看不见，改用跟随主题的前景色
+    val bgColor = if (isPrimary) AppleRed else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
     val contentColor = if (isPrimary) Color.White else MaterialTheme.colorScheme.onSurface
 
     Surface(
         shape = RoundedCornerShape(12.dp),
         color = bgColor,
-        border = if (isPrimary) null else BorderStroke(1.dp, Color.White.copy(alpha = 0.14f)),
+        border = if (isPrimary) null else BorderStroke(1.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = 0.16f)),
         modifier = modifier
             .height(36.dp)
             .tvFocusable(
@@ -1168,8 +1319,9 @@ private fun MineCardActionButton(
     ) {
         Row(
             modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 8.dp),
+                .fillMaxHeight()
+                .then(if (wrapContent) Modifier else Modifier.fillMaxWidth())
+                .padding(horizontal = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center
         ) {
@@ -1186,7 +1338,8 @@ private fun MineCardActionButton(
                 fontWeight = FontWeight.Bold,
                 color = contentColor,
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+                softWrap = false,
+                overflow = TextOverflow.Clip
             )
         }
     }

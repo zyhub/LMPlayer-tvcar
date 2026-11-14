@@ -48,6 +48,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import com.lm.player.core.designsystem.theme.AppleRed
+import com.lm.player.core.designsystem.polish.tvFocusGlow
 import com.lm.player.core.designsystem.theme.LocalAppDimensions
 import com.lm.player.core.model.PlatformMode
 import com.lm.player.core.model.UnifiedSong
@@ -288,6 +289,8 @@ fun Modifier.tvFocusable(
                 else -> false
             }
         }
+        // 界面美化：获焦时在外侧淡入柔和光晕（Antigravity 设计，纯绘制、无模糊）；流畅模式下不加
+        .then(tvFocusGlowIfEnabled(isFocused && focusEnabled, shape, focusedBorderColor, borderWidth))
         .drawWithContent {
             drawContent()
             if (isFocused && focusEnabled) {
@@ -342,6 +345,18 @@ fun Modifier.tvFocusable(
  * - 在组件最顶层绘制双层高对比度焦点边框（纯白衬边 + 亮金/苹果红光标环）与微缩放动效，
  *   彻底解决红色底色按钮（如“添加新服务器”、“播放全部”）及普通按钮获焦时光标无法凸现的问题
  */
+/**
+ * 界面美化：统一焦点光晕（[com.lm.player.core.designsystem.polish.tvFocusGlow]），颜色 / 线宽沿用调用方的焦点边框。
+ * 流畅模式下不加（省掉每个焦点项的一个淡入动画）。
+ */
+private fun tvFocusGlowIfEnabled(focused: Boolean, shape: Shape, color: Color, borderWidth: Dp): Modifier =
+    if (com.lm.player.core.designsystem.theme.SmoothMode.isActive) Modifier
+    else Modifier.tvFocusGlow(
+        focused = focused,
+        shape = shape,
+        spec = com.lm.player.core.designsystem.polish.TvFocusStyleSpec(borderWidth = borderWidth, borderColor = color)
+    )
+
 fun Modifier.tvButtonFocusable(
     shape: Shape = RoundedCornerShape(12.dp),
     focusedScale: Float = 1.04f,
@@ -399,6 +414,7 @@ fun Modifier.tvButtonFocusable(
                 onFocusChange(focused)
             }
         }
+        .then(tvFocusGlowIfEnabled(isFocused && focusEnabled, shape, focusedBorderColor, borderWidth))
         .drawWithContent {
             drawContent()
             if (isFocused && focusEnabled) {

@@ -6,7 +6,9 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -277,5 +279,14 @@ fun TvPodcastPlayerHost(
         )
     }
 
-    TvPodcastPlayerScreen(ui = ui, positionMs = positionMs, actions = actions, modifier = Modifier.fillMaxSize())
+    // 画面延伸到状态栏下面（全局沉浸，见 SystemBarsStyler）：底色铺满，内容让开状态栏
+    TvPodcastPlayerScreen(
+        ui = ui,
+        positionMs = positionMs,
+        actions = actions,
+        modifier = Modifier
+            .fillMaxSize()
+            .background(androidx.compose.material3.MaterialTheme.colorScheme.background)
+            .statusBarsPadding()
+    )
 }

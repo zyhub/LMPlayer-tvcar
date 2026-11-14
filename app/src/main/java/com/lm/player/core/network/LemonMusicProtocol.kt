@@ -233,7 +233,7 @@ class LemonMusicProtocol(
             if (now - lastSessionExpiredNoticeAt < SESSION_EXPIRED_NOTICE_INTERVAL_MS) return
             lastSessionExpiredNoticeAt = now
             android.os.Handler(android.os.Looper.getMainLooper()).post {
-                android.widget.Toast.makeText(
+                com.lm.player.core.designsystem.component.AppToast.makeText(
                     appCtx,
                     "柠檬服务器登录已过期，请在「设置」中重新输入服务器密码",
                     android.widget.Toast.LENGTH_LONG
@@ -4185,8 +4185,9 @@ class LemonMusicProtocol(
 
     /**
      * 拉取 active 音源脚本 bundle。
+     * @param onProgress 下载进度 0~1（2026-11-13 状态环显示拉取百分比）：核对列表 5%、整包下载按字节推进到 80%、逐个补取到 100%
      */
-    suspend fun fetchActiveScriptBundle(): Result<SourceScriptBundle> = withContext(Dispatchers.IO) {
+    suspend fun fetchActiveScriptBundle(onProgress: ((Float) -> Unit)? = null): Result<SourceScriptBundle> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticatedOrThrow()
             val snapshot = fetchSourceSnapshot().getOrElse {
@@ -4196,14 +4197,21 @@ class LemonMusicProtocol(
             if (active.isEmpty()) {
                 return@withContext Result.failure(Exception("没有已激活的音源"))
             }
+            onProgress?.invoke(0.05f)
             // 不改服务器的取脚本通道：/api/backup/export 会带出全部音源脚本（只需登录、只读），按已激活 id 过滤。
             // 优先级：backup/export → /:id/raw → homepage（服务端无 active-bundle 接口，不再请求）。
-            val fromBackup = runCatching { fetchScriptsFromBackupExport(active.map { it.id }.toSet()) }
+            val fromBackup = runCatching {
+                fetchScriptsFromBackupExport(active.map { it.id }.toSet()) { read, total ->
+                    if (total > 0L) onProgress?.invoke(0.05f + 0.75f * (read.toFloat() / total).coerceIn(0f, 1f))
+                }
+            }
                 .onFailure { Log.w(TAG, "backup/export script fetch failed", it) }
                 .getOrNull()
                 .orEmpty()
+            onProgress?.invoke(0.80f)
             val entries = ArrayList<SourceScriptEntry>()
-            for (source in active) {
+            for ((index, source) in active.withIndex()) {
+                onProgress?.invoke(0.80f + 0.20f * index / active.size)
                 val backupEntry = fromBackup[source.id]
                 var script = backupEntry?.first.orEmpty()
                 if (!looksLikeSourceScript(script)) script = fetchRawScript(source.id).orEmpty()
@@ -4226,6 +4234,7 @@ class LemonMusicProtocol(
                     )
                 )
             }
+            onProgress?.invoke(1f)
             if (entries.isEmpty()) {
                 Result.failure(Exception("服务端脚本接口不可用，且 homepage 未返回有效脚本"))
             } else {
@@ -4243,12 +4252,30 @@ class LemonMusicProtocol(
      * 只需登录（不要求管理员）、只读无副作用，返回的 data.sources[] 含全部音源的完整脚本与平台声明。
      * 只取 [wantedIds]（当前用户已激活）对应条目。返回 id → (script, sourcesJson)。
      */
-    private fun fetchScriptsFromBackupExport(wantedIds: Set<String>): Map<String, Pair<String, String>> {
+    private fun fetchScriptsFromBackupExport(
+        wantedIds: Set<String>,
+        onBytes: ((read: Long, total: Long) -> Unit)? = null
+    ): Map<String, Pair<String, String>> {
         if (wantedIds.isEmpty()) return emptyMap()
         val req = newAuthRequest("$cleanBase/api/backup/export").get().build()
         client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) return emptyMap()
-            val root = JSONObject(resp.body?.string().orEmpty())
+            val body = resp.body ?: return emptyMap()
+            val text = if (onBytes == null) body.string() else {
+                // 逐块读取并回报已收到的字节数（服务器没给总大小时 total = -1，调用方不推进百分比）
+                val total = body.contentLength()
+                val source = body.source()
+                val buffer = okio.Buffer()
+                var read = 0L
+                while (true) {
+                    val n = source.read(buffer, 16 * 1024L)
+                    if (n == -1L) break
+                    read += n
+                    onBytes(read, total)
+                }
+                buffer.readString(body.contentType()?.charset(Charsets.UTF_8) ?: Charsets.UTF_8)
+            }
+            val root = JSONObject(text)
             val arr = (root.optJSONObject("data") ?: root).optJSONArray("sources") ?: return emptyMap()
             val out = HashMap<String, Pair<String, String>>()
             for (i in 0 until arr.length()) {
@@ -4899,6 +4926,245 @@ class LemonMusicProtocol(
                 val saveArr = JSONArray()
                 existingPlaylists.forEach { saveArr.put(it) }
                 saveCustomPlaylists(saveArr)
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                Result.failure(e)
+            }
+        }
+    }
+
+    /** 服务器歌单里一条曲目的识别信息（与 [getPlaylistSongs] 同一规则还原出界面上的歌曲 ID） */
+    private class PlaylistEntryInfo(
+        val raw: Any?,
+        val key: String,
+        val id: String,
+        val path: String,
+        val title: String,
+        val artist: String
+    ) {
+        var remove = false
+    }
+
+    private fun playlistEntryInfos(keysArr: JSONArray, snapshots: JSONObject?): List<PlaylistEntryInfo> =
+        (0 until keysArr.length()).map { j ->
+            val item = keysArr.opt(j)
+            val rawKey = when (item) {
+                is String -> item
+                is JSONObject -> item.optString("key").ifBlank { item.optString("filePath").ifBlank { item.optString("id") } }
+                else -> ""
+            }
+            val snap = snapshots?.optJSONObject(rawKey) ?: (item as? JSONObject)
+            val sLocalPath = snap?.let { it.optString("localPath").ifBlank { it.optString("filePath") } }.orEmpty()
+            val sSongId = snap?.let { it.optString("songId").ifBlank { it.optString("id") } }.orEmpty()
+            val sSource = snap?.let { it.optString("source").ifBlank { it.optString("platform") } }.orEmpty()
+            val sName = snap?.let { SongMatchingResolver.unescapeMusicText(it.optString("name").ifBlank { it.optString("title") }) }.orEmpty()
+            val sSinger = snap?.let { SongMatchingResolver.unescapeMusicText(it.optString("singer").ifBlank { it.optString("artist") }) }.orEmpty()
+            val path = when {
+                sLocalPath.isNotBlank() -> sLocalPath.trim()
+                rawKey.startsWith("local:") -> rawKey.removePrefix("local:").trim()
+                snap == null && rawKey.isNotBlank() && !rawKey.contains(":") -> rawKey.trim()
+                else -> ""
+            }
+            val id = when {
+                path.isNotBlank() -> "lemon_${md5(path)}"
+                sSongId.startsWith("lemon_online_") -> sSongId
+                rawKey.isNotBlank() -> {
+                    val platform = sSource.ifBlank { "kw" }
+                    val safeKey = if (rawKey == "0") "0_${sName.hashCode()}_${sSinger.hashCode()}" else rawKey
+                    "lemon_online_${platform}_$safeKey"
+                }
+                else -> ""
+            }
+            PlaylistEntryInfo(item, rawKey, id, path, sName, sSinger)
+        }
+
+    /** 歌单曲目所在字段（新版 trackKeys，旧数据可能是 paths / tracks）：改完原样写回同一字段 */
+    private fun playlistKeysField(pl: JSONObject): String =
+        listOf("trackKeys", "paths", "tracks").firstOrNull { pl.optJSONArray(it) != null } ?: "trackKeys"
+
+    /**
+     * 批量加入服务器歌单，逐首给出结果（2026-11-14）：已添加 / 已存在（忽略）/ 失败及原因。
+     *
+     * 一次读出整份歌单 → 逐首核对（歌曲 ID / 服务器文件路径 / 歌单键，与移出同一套规则）→ 一次写回。
+     * 读取失败时整体失败、不写入（不会覆盖服务器数据）；写入失败时本该加入的歌全部记为失败并写明原因。
+     * 本机文件（服务器曲库里没有）不能加入服务器歌单：记为失败，提示改加本地歌单。
+     *
+     * @param onProgress 进度 0~1 与当前步骤说明
+     */
+    suspend fun addTracksToCustomPlaylistDetailed(
+        playlistId: String,
+        songs: List<UnifiedSong>,
+        onProgress: (Float, String) -> Unit = { _, _ -> }
+    ): Result<List<PlaylistAddOutcome>> = withContext(Dispatchers.IO) {
+        withUserDataWriteLock {
+            try {
+                ensureAuthenticatedOrThrow()
+                onProgress(0.05f, "读取服务器歌单…")
+                val existingPlaylists = fetchExistingPlaylistsRaw().getOrElse {
+                    return@withUserDataWriteLock Result.failure(it)
+                }
+                val pl = existingPlaylists.firstOrNull { it.optString("id") == playlistId }
+                    ?: return@withUserDataWriteLock Result.failure(Exception("服务器上没有找到这个歌单"))
+                val keysField = playlistKeysField(pl)
+                val keysArr = pl.optJSONArray(keysField) ?: JSONArray()
+                val snapshots = pl.optJSONObject("trackSnapshots") ?: JSONObject()
+                val entries = playlistEntryInfos(keysArr, snapshots)
+                val existingIds = entries.mapNotNullTo(HashSet()) { it.id.takeIf { id -> id.isNotBlank() } }
+                val existingPaths = entries.mapNotNullTo(HashSet()) { it.path.takeIf { p -> p.isNotBlank() } }
+                val existingKeys = entries.mapNotNullTo(HashSet()) { it.key.takeIf { k -> k.isNotBlank() } }
+
+                val outcomes = ArrayList<PlaylistAddOutcome>(songs.size)
+                val toAdd = LinkedHashMap<String, Pair<UnifiedSong, JSONObject>>()
+                songs.forEachIndexed { i, s ->
+                    val (key, snap) = buildTrackKeyAndSnapshot(s)
+                    val path = snap.optString("localPath").ifBlank { snap.optString("filePath") }.removePrefix("local:").trim()
+                    val onServer = key.startsWith("local:") || snap.optString("platform").isNotBlank()
+                    when {
+                        existingIds.contains(s.id) || (path.isNotBlank() && existingPaths.contains(path)) || existingKeys.contains(key) ->
+                            outcomes += PlaylistAddOutcome(s, PlaylistAddStatus.EXISTED, "歌单里已经有这首歌")
+                        toAdd.containsKey(key) ->
+                            outcomes += PlaylistAddOutcome(s, PlaylistAddStatus.EXISTED, "选中的歌里重复了")
+                        !onServer ->
+                            outcomes += PlaylistAddOutcome(
+                                s, PlaylistAddStatus.FAILED,
+                                "这是本机里的歌，服务器曲库里没有，加入服务器歌单后无法播放（可以加入本地歌单）"
+                            )
+                        else -> {
+                            toAdd[key] = s to snap
+                            outcomes += PlaylistAddOutcome(s, PlaylistAddStatus.ADDED)
+                        }
+                    }
+                    onProgress(0.10f + 0.50f * (i + 1) / songs.size, "核对歌单中已有的歌 ${i + 1}/${songs.size}")
+                }
+                if (toAdd.isEmpty()) {
+                    onProgress(1f, "完成")
+                    return@withUserDataWriteLock Result.success(outcomes)
+                }
+
+                toAdd.forEach { (k, pair) ->
+                    keysArr.put(k)
+                    snapshots.put(k, pair.second)
+                }
+                if (pl.optString("coverUrl").isBlank()) {
+                    toAdd.values.firstOrNull { it.first.coverUrl.isNotBlank() }?.let { pl.put("coverUrl", it.first.coverUrl) }
+                }
+                pl.put(keysField, keysArr)
+                pl.put("trackSnapshots", snapshots)
+
+                onProgress(0.70f, "写入服务器…")
+                val saveArr = JSONArray()
+                existingPlaylists.forEach { saveArr.put(it) }
+                val saved = saveCustomPlaylists(saveArr)
+                onProgress(1f, "完成")
+                if (saved.isSuccess) {
+                    Result.success(outcomes)
+                } else {
+                    val reason = "写入服务器失败：${saved.exceptionOrNull()?.message ?: "未知错误"}"
+                    Result.success(outcomes.map {
+                        if (it.status == PlaylistAddStatus.ADDED) it.copy(status = PlaylistAddStatus.FAILED, reason = reason) else it
+                    })
+                }
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                Result.failure(e)
+            }
+        }
+    }
+
+    /**
+     * 把若干首歌从服务器歌单里移出（2026-11-13 TV 车机版）。
+     *
+     * 服务器把全部歌单存成一份数据（trackKeys + trackSnapshots），没有单独的「删一首」接口：
+     * 读出整份 → 删掉匹配的条目 → 整份写回（与加入歌单同一把写锁；读取失败时中止，不会覆盖服务器数据）。
+     * 「我的收藏」（lemon_favorites）移出即取消收藏。
+     *
+     * 匹配顺序（每个条目按 [getPlaylistSongs] 同样的规则还原出界面上的歌曲 ID 来比对）：
+     * 歌曲 ID → 服务器文件路径 → 歌单键 → 都对不上时按「歌名 + 歌手」兜底（只删第一条）。
+     *
+     * @param onProgress 进度 0~1 与当前步骤说明（2026-11-14）
+     * @return 实际移出的条数；一条都没对上时返回失败
+     */
+    suspend fun removeTracksFromCustomPlaylist(
+        playlistId: String,
+        songs: List<UnifiedSong>,
+        onProgress: (Float, String) -> Unit = { _, _ -> }
+    ): Result<Int> = withContext(Dispatchers.IO) {
+        if (songs.isEmpty()) return@withContext Result.success(0)
+        if (playlistId == "lemon_favorites") {
+            var ok = 0
+            songs.forEachIndexed { i, s ->
+                if (toggleFavoriteSongOnServer(s, false).isSuccess) ok++
+                onProgress((i + 1).toFloat() / songs.size, "取消收藏 ${i + 1}/${songs.size}")
+            }
+            return@withContext if (ok > 0) Result.success(ok) else Result.failure(Exception("取消收藏失败"))
+        }
+        withUserDataWriteLock {
+            try {
+                ensureAuthenticatedOrThrow()
+                onProgress(0.05f, "读取服务器歌单…")
+                val existingPlaylists = fetchExistingPlaylistsRaw().getOrElse {
+                    return@withUserDataWriteLock Result.failure(it)
+                }
+                val pl = existingPlaylists.firstOrNull { it.optString("id") == playlistId }
+                    ?: return@withUserDataWriteLock Result.failure(Exception("服务器上没有找到这个歌单"))
+
+                class Target(val song: UnifiedSong, val key: String, val path: String) {
+                    var matched = false
+                }
+                val targets = songs.map { s ->
+                    val (key, snap) = buildTrackKeyAndSnapshot(s)
+                    val path = snap.optString("localPath").ifBlank { snap.optString("filePath") }.removePrefix("local:").trim()
+                    Target(s, key, path)
+                }
+
+                val keysField = playlistKeysField(pl)
+                val keysArr = pl.optJSONArray(keysField) ?: JSONArray()
+                val snapshots = pl.optJSONObject("trackSnapshots")
+                val entries = playlistEntryInfos(keysArr, snapshots)
+
+                // 第一轮：歌曲 ID / 文件路径 / 歌单键 精确匹配
+                targets.forEachIndexed { i, t ->
+                    for (e in entries) {
+                        val hit = (e.id.isNotBlank() && e.id == t.song.id) ||
+                            (t.path.isNotBlank() && e.path.isNotBlank() && e.path == t.path) ||
+                            (e.key.isNotBlank() && e.key == t.key)
+                        if (hit) {
+                            e.remove = true
+                            t.matched = true
+                        }
+                    }
+                    onProgress(0.10f + 0.50f * (i + 1) / targets.size, "核对要移出的歌 ${i + 1}/${targets.size}")
+                }
+                // 第二轮：还没对上的按「歌名 + 歌手」兜底，只删第一条
+                for (t in targets.filter { !it.matched }) {
+                    val title = t.song.title.trim()
+                    val artist = t.song.artist.trim()
+                    if (title.isBlank()) continue
+                    entries.firstOrNull { !it.remove && it.title.trim().equals(title, true) && (artist.isBlank() || it.artist.trim().equals(artist, true)) }
+                        ?.let { it.remove = true; t.matched = true }
+                }
+
+                val removedCount = entries.count { it.remove }
+                if (removedCount == 0) {
+                    return@withUserDataWriteLock Result.failure(Exception("服务器歌单里没有找到这首歌（可能已被移出）"))
+                }
+                val keptKeys = JSONArray()
+                entries.forEach { e ->
+                    if (e.remove) {
+                        if (e.key.isNotBlank()) snapshots?.remove(e.key)
+                    } else {
+                        keptKeys.put(e.raw ?: JSONObject.NULL)
+                    }
+                }
+                pl.put(keysField, keptKeys)
+                if (snapshots != null) pl.put("trackSnapshots", snapshots)
+
+                onProgress(0.70f, "写入服务器…")
+                val saveArr = JSONArray()
+                existingPlaylists.forEach { saveArr.put(it) }
+                val result = saveCustomPlaylists(saveArr).map { removedCount }
+                onProgress(1f, "完成")
+                result
             } catch (e: Exception) {
                 if (e is kotlinx.coroutines.CancellationException) throw e
                 Result.failure(e)

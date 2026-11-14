@@ -96,12 +96,23 @@ fun LemonDiscoverHomeScreen(
     val goldColor = Color(0xFFFFC947)
     val coroutineScope = rememberCoroutineScope()
 
-    var recommendPlaylists by remember { mutableStateOf<List<UnifiedPlaylist>>(emptyList()) }
-    var toplists by remember { mutableStateOf<List<LemonToplist>>(emptyList()) }
-    var newSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
-    var newAlbums by remember { mutableStateOf<List<UnifiedAlbum>>(emptyList()) }
-    var isLoading by remember { mutableStateOf(true) }
+    // 切页提速：发现页数据先从进程级缓存取（离开发现页再回来直接显示，不再转圈重拉），见 DiscoverHomeCache
+    val discoverCacheKey = DiscoverHomeCache.keyOf(serverName, currentSource)
+    val cachedDiscover = remember { DiscoverHomeCache.snapshot(discoverCacheKey) }
+    var recommendPlaylists by remember { mutableStateOf(cachedDiscover?.playlists ?: emptyList()) }
+    var toplists by remember { mutableStateOf(cachedDiscover?.toplists ?: emptyList()) }
+    var newSongs by remember { mutableStateOf(cachedDiscover?.newSongs ?: emptyList()) }
+    var newAlbums by remember { mutableStateOf(cachedDiscover?.newAlbums ?: emptyList()) }
+    var isLoading by remember { mutableStateOf(cachedDiscover == null) }
     var reloadTrigger by remember { mutableStateOf(0) }
+    // 切页保留页面后本页不随切页重建：切回来时若缓存已过期（30 分钟），和原来重建时一样重新拉取一次
+    val pageReentry = com.lm.player.ui.rememberPageReentryCount()
+    var staleRefreshEpoch by remember { mutableStateOf(0) }
+    LaunchedEffect(pageReentry) {
+        if (pageReentry > 0 && DiscoverHomeCache.snapshot(DiscoverHomeCache.keyOf(serverName, currentSource)) == null) {
+            staleRefreshEpoch++
+        }
+    }
 
     // 缓存下载音质与目标选择弹窗 & 批量下载多选状态
     var songForDownloadChoice by remember { mutableStateOf<UnifiedSong?>(null) }
@@ -154,14 +165,40 @@ fun LemonDiscoverHomeScreen(
     // 任务增删或状态变化(如下载完成)时键值变化 → 该重算的立刻重算。
     val activeTaskMatchKey = DownloadEngine.structuralMatchKey(activeDownloadTasks())
 
-    val resolvedNewSongs = remember(newSongs, allCachedSongs, activeTaskMatchKey) {
+    // 切页提速：与本地曲库的匹配要给整个曲库建索引，原先在主线程的 remember 里做，每次进发现页都卡一下。
+    // 改到后台线程计算；歌曲列表本身换了（换音源 / 进新歌单）时先显示未匹配的列表，避免闪出上一份内容。
+    // 匹配结果按输入实例缓存在 DiscoverHomeCache，切回发现页直接复用。
+    val newSongsInputRef = remember { arrayOfNulls<Any>(1) }
+    val resolvedNewSongs by produceState(
+        initialValue = DiscoverHomeCache.peekResolved(newSongs, allCachedSongs, activeTaskMatchKey) ?: newSongs,
+        newSongs, allCachedSongs, activeTaskMatchKey
+    ) {
+        DiscoverHomeCache.peekResolved(newSongs, allCachedSongs, activeTaskMatchKey)?.let {
+            newSongsInputRef[0] = newSongs
+            value = it
+            return@produceState
+        }
+        if (newSongsInputRef[0] !== newSongs) {
+            newSongsInputRef[0] = newSongs
+            value = newSongs
+        }
+        if (allCachedSongs.isEmpty()) {
+            value = newSongs
+            return@produceState
+        }
         val tasks = activeDownloadTasks()
-        if (allCachedSongs.isEmpty()) newSongs
-        else SongMatchingResolver.resolveSongList(newSongs, allCachedSongs, tasks, downloadDir = null)
+        val resolved = withContext(Dispatchers.Default) {
+            SongMatchingResolver.resolveSongList(newSongs, allCachedSongs, tasks, downloadDir = null)
+        }
+        DiscoverHomeCache.storeResolved(newSongs, allCachedSongs, activeTaskMatchKey, resolved)
+        value = resolved
     }
 
-    val resolvedCollectionSongs = remember(activeCollectionSongs, allCachedSongs, activeTaskMatchKey, activeCollectionCover) {
-        val tasks = activeDownloadTasks()
+    val collectionInputRef = remember { arrayOfNulls<Any>(1) }
+    val resolvedCollectionSongs by produceState(
+        initialValue = activeCollectionSongs,
+        activeCollectionSongs, allCachedSongs, activeTaskMatchKey, activeCollectionCover
+    ) {
         val songsWithCover = activeCollectionSongs.map { s ->
             if (s.coverUrl.isNullOrBlank() && !activeCollectionCover.isNullOrBlank()) {
                 s.copy(coverUrl = activeCollectionCover)
@@ -169,8 +206,18 @@ fun LemonDiscoverHomeScreen(
                 s
             }
         }
-        if (allCachedSongs.isEmpty()) songsWithCover
-        else SongMatchingResolver.resolveSongList(songsWithCover, allCachedSongs, tasks, downloadDir = null)
+        if (collectionInputRef[0] !== activeCollectionSongs) {
+            collectionInputRef[0] = activeCollectionSongs
+            value = songsWithCover
+        }
+        if (allCachedSongs.isEmpty()) {
+            value = songsWithCover
+            return@produceState
+        }
+        val tasks = activeDownloadTasks()
+        value = withContext(Dispatchers.Default) {
+            SongMatchingResolver.resolveSongList(songsWithCover, allCachedSongs, tasks, downloadDir = null)
+        }
     }
 
     // 集合详情（歌单 / 排行榜 / 新歌首发 / 专辑）的**进入侧锚点令牌**。
@@ -195,15 +242,30 @@ fun LemonDiscoverHomeScreen(
         }
     }
 
-    LaunchedEffect(currentSource, reloadTrigger) {
+    LaunchedEffect(currentSource, reloadTrigger, staleRefreshEpoch) {
+        val cacheKey = DiscoverHomeCache.keyOf(serverName, currentSource)
+        // 切页提速：缓存仍新鲜（30 分钟内）且不是手动刷新 → 直接用缓存，不再请求
+        if (reloadTrigger == 0) {
+            DiscoverHomeCache.snapshot(cacheKey)?.let { cached ->
+                recommendPlaylists = cached.playlists
+                toplists = cached.toplists
+                newSongs = cached.newSongs
+                newAlbums = cached.newAlbums
+                isLoading = false
+                return@LaunchedEffect
+            }
+        }
         if (recommendPlaylists.isEmpty() && toplists.isEmpty() && newSongs.isEmpty() && newAlbums.isEmpty()) {
             isLoading = true
         }
+        // 启动提速：冷启动时发现页数据等首帧与续播完成（启动闸门放行）后再拉取
+        com.lm.player.core.startup.StartupGate.await()
         coroutineScope {
             launch(Dispatchers.IO) {
                 val pl = runCatching { onFetchDiscoverPlaylists(currentSource) }.getOrDefault(emptyList())
                 if (pl.isNotEmpty()) {
                     val finalPl = if (reloadTrigger > 0) pl.shuffled() else pl
+                    DiscoverHomeCache.put(cacheKey) { it.copy(playlists = finalPl) }
                     withContext(Dispatchers.Main) {
                         recommendPlaylists = finalPl
                         isLoading = false
@@ -214,6 +276,7 @@ fun LemonDiscoverHomeScreen(
                 val tl = runCatching { onFetchDiscoverToplists(currentSource) }.getOrDefault(emptyList())
                 if (tl.isNotEmpty()) {
                     val finalTl = if (reloadTrigger > 0) tl.shuffled() else tl
+                    DiscoverHomeCache.put(cacheKey) { it.copy(toplists = finalTl) }
                     withContext(Dispatchers.Main) {
                         toplists = finalTl
                         isLoading = false
@@ -224,6 +287,7 @@ fun LemonDiscoverHomeScreen(
                 val ns = runCatching { onFetchDiscoverNewSongs(currentSource) }.getOrDefault(emptyList())
                 if (ns.isNotEmpty()) {
                     val finalNs = if (reloadTrigger > 0) ns.shuffled() else ns
+                    DiscoverHomeCache.put(cacheKey) { it.copy(newSongs = finalNs) }
                     withContext(Dispatchers.Main) {
                         newSongs = finalNs
                         isLoading = false
@@ -235,6 +299,7 @@ fun LemonDiscoverHomeScreen(
                     val na = runCatching { onFetchDiscoverNewAlbums(currentSource) }.getOrDefault(emptyList())
                     if (na.isNotEmpty()) {
                         val finalNa = if (reloadTrigger > 0) na.shuffled() else na
+                        DiscoverHomeCache.put(cacheKey) { it.copy(newAlbums = finalNa) }
                         withContext(Dispatchers.Main) {
                             newAlbums = finalNa
                             isLoading = false
@@ -326,7 +391,7 @@ fun LemonDiscoverHomeScreen(
                                         newSongs = newSongs.shuffled()
                                     }
                                     reloadTrigger++
-                                    android.widget.Toast.makeText(context, "已为您换一批推荐内容", android.widget.Toast.LENGTH_SHORT).show()
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已为您换一批推荐内容", android.widget.Toast.LENGTH_SHORT).show()
                                 }
                             )
                         ) {
@@ -741,21 +806,34 @@ fun LemonDiscoverHomeScreen(
 
                 if (isLoading) {
                     item(key = "discover_loading") {
-                        Box(
+                        // 界面美化：首次加载用骨架占位代替转圈（版面与真实卡片 / 歌曲行对齐，数据到达时不跳动）；
+                        // 流畅模式下不播放微光动画
+                        val shimmer = !com.lm.player.core.designsystem.theme.SmoothMode.isActive
+                        Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(vertical = 44.dp),
-                            contentAlignment = Alignment.Center
+                                .padding(vertical = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(18.dp)
                         ) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                CircularProgressIndicator(modifier = Modifier.size(34.dp), color = goldColor)
-                                Spacer(modifier = Modifier.height(12.dp))
-                                Text(
-                                    text = "正在同步 ${currentSource.displayName} 推荐歌单与榜单...",
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    fontSize = dimensions.bodySize
+                            com.lm.player.core.designsystem.polish.SkeletonPlaceholder(
+                                spec = com.lm.player.core.designsystem.polish.SkeletonSpec(
+                                    kind = com.lm.player.core.designsystem.polish.SkeletonKind.CARD_ROW,
+                                    itemCount = 6,
+                                    shimmer = shimmer
                                 )
-                            }
+                            )
+                            com.lm.player.core.designsystem.polish.SkeletonPlaceholder(
+                                spec = com.lm.player.core.designsystem.polish.SkeletonSpec(
+                                    kind = com.lm.player.core.designsystem.polish.SkeletonKind.SONG_LIST,
+                                    itemCount = 4,
+                                    shimmer = shimmer
+                                )
+                            )
+                            Text(
+                                text = "正在同步 ${currentSource.displayName} 推荐歌单与榜单...",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontSize = dimensions.captionSize
+                            )
                         }
                     }
                 } else {
@@ -774,7 +852,7 @@ fun LemonDiscoverHomeScreen(
                                 ) {
                                     itemsIndexed(
                                         items = recommendPlaylists,
-                                        key = { index, item -> "rec_pl_${index}_${item.id}" },
+                                        key = { index, _ -> com.lm.player.core.designsystem.component.StableListKeys.keyAt(recommendPlaylists, index, "rec_pl_") { it.id } },
                                         contentType = { _, _ -> "discover_playlist" }
                                     ) { _, playlist ->
                                         DiscoverPlaylistCard(
@@ -818,7 +896,7 @@ fun LemonDiscoverHomeScreen(
                                 ) {
                                     itemsIndexed(
                                         items = toplists,
-                                        key = { index, item -> "toplist_${index}_${item.id}" },
+                                        key = { index, _ -> com.lm.player.core.designsystem.component.StableListKeys.keyAt(toplists, index, "toplist_") { it.id } },
                                         contentType = { _, _ -> "discover_toplist" }
                                     ) { _, toplist ->
                                         DiscoverToplistCard(
@@ -883,6 +961,12 @@ fun LemonDiscoverHomeScreen(
                                             selectedNewSongIds.addAll(displayNewSongs.map { it.id })
                                         }
                                     },
+                                    onBatchAddToPlaylist = {
+                                        com.lm.player.core.designsystem.component.PlaylistBatchOps.startAdd(context, displayNewSongs.filter { it.id in selectedNewSongIds }) {
+                                            isNewSongsMultiSelect = false
+                                            selectedNewSongIds.clear()
+                                        }
+                                    },
                                     onBatchDownloadClick = {
                                         val selected = displayNewSongs.filter { it.id in selectedNewSongIds }
                                         if (selected.isNotEmpty()) {
@@ -895,7 +979,7 @@ fun LemonDiscoverHomeScreen(
 
                         itemsIndexed(
                             items = displayNewSongs,
-                            key = { index, item -> "new_song_${index}_${item.id}" },
+                            key = { index, _ -> com.lm.player.core.designsystem.component.StableListKeys.keyAt(displayNewSongs, index, "new_song_") { it.id } },
                             contentType = { _, _ -> "new_song_row" }
                         ) { _, song ->
                             val isSelected = song.id in selectedNewSongIds
@@ -1065,6 +1149,12 @@ fun LemonDiscoverHomeScreen(
                                     selectedCollectionSongIds.addAll(resolvedCollectionSongs.map { it.id })
                                 }
                             },
+                            onBatchAddToPlaylist = {
+                                com.lm.player.core.designsystem.component.PlaylistBatchOps.startAdd(context, resolvedCollectionSongs.filter { it.id in selectedCollectionSongIds }) {
+                                    isCollectionMultiSelect = false
+                                    selectedCollectionSongIds.clear()
+                                }
+                            },
                             onBatchDownloadClick = {
                                 val selected = resolvedCollectionSongs.filter { it.id in selectedCollectionSongIds }
                                 if (selected.isNotEmpty()) {
@@ -1076,17 +1166,20 @@ fun LemonDiscoverHomeScreen(
                 }
 
                 if (isLoadingCollection) {
+                    // 界面美化：歌单曲目加载中用歌曲行骨架占位
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .padding(top = 80.dp),
+                            .padding(top = 16.dp),
                         contentAlignment = Alignment.TopCenter
                     ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            CircularProgressIndicator(modifier = Modifier.size(34.dp), color = goldColor)
-                            Spacer(modifier = Modifier.height(12.dp))
-                            Text("正在加载歌单曲目...", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = dimensions.bodySize)
-                        }
+                        com.lm.player.core.designsystem.polish.SkeletonPlaceholder(
+                            spec = com.lm.player.core.designsystem.polish.SkeletonSpec(
+                                kind = com.lm.player.core.designsystem.polish.SkeletonKind.SONG_LIST,
+                                itemCount = 7,
+                                shimmer = !com.lm.player.core.designsystem.theme.SmoothMode.isActive
+                            )
+                        )
                     }
                 } else if (resolvedCollectionSongs.isEmpty()) {
                     Box(
@@ -1108,7 +1201,7 @@ fun LemonDiscoverHomeScreen(
                     ) {
                         itemsIndexed(
                             items = resolvedCollectionSongs,
-                            key = { index, item -> "col_song_${index}_${item.id}" },
+                            key = { index, _ -> com.lm.player.core.designsystem.component.StableListKeys.keyAt(resolvedCollectionSongs, index, "col_song_") { it.id } },
                             contentType = { _, _ -> "collection_song_row" }
                         ) { index, song ->
                             val isSelected = song.id in selectedCollectionSongIds
@@ -1235,7 +1328,8 @@ private fun DiscoverPlaylistCard(
                 model = playlist.coverUrl,
                 seedId = playlist.id,
                 modifier = Modifier.fillMaxSize(),
-                cornerRadius = 16.dp
+                cornerRadius = 16.dp,
+                highQuality = true // 铺满卡片的大封面：按卡片实际大小、32 位色解码
             )
             // 右下角播放圆钮角标
             Surface(
@@ -1278,6 +1372,7 @@ private fun DiscoverToplistCard(
     focusKey: String? = null
 ) {
     val dimensions = LocalAppDimensions.current
+    var cardFocused by remember { mutableStateOf(false) }
     Column(
         modifier = Modifier
             .width(dimensions.scale(152.dp))
@@ -1286,6 +1381,7 @@ private fun DiscoverToplistCard(
                 focusedScale = 1.05f,
                 focusedBorderColor = Color(0xFFFFC947),
                 focusKey = focusKey,
+                onFocusChange = { cardFocused = it },
                 onClick = onClick
             )
             .padding(4.dp)
@@ -1295,7 +1391,8 @@ private fun DiscoverToplistCard(
                 model = toplist.coverUrl,
                 seedId = toplist.id,
                 modifier = Modifier.fillMaxSize(),
-                cornerRadius = 16.dp
+                cornerRadius = 16.dp,
+                highQuality = true
             )
             if (toplist.updateFrequency.isNotBlank()) {
                 Surface(
@@ -1331,10 +1428,10 @@ private fun DiscoverToplistCard(
             }
         }
         Spacer(modifier = Modifier.height(7.dp))
-        Text(
+        // 界面美化：获焦且榜单名放不下时横向滚动
+        com.lm.player.core.designsystem.polish.TvMarqueeText(
             text = toplist.name,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
+            focused = cardFocused,
             style = TextStyle(
                 fontSize = dimensions.bodySize,
                 fontWeight = FontWeight.SemiBold,

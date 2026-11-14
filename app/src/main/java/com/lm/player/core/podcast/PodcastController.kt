@@ -16,6 +16,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -144,10 +145,14 @@ object PodcastController {
                             lastEp = ep; lastPos = pos; lastDur = dur
                         }
                     }
+                    delay(if (wasPlaying) 5_000L else 2_000L)
                 } else {
                     wasPlaying = false
+                    // 当前不是播客（平时听歌的绝大多数时间）：不再每 2 秒空转一次，
+                    // 挂起到当前歌曲变化为止，换成播客时立即恢复跟踪
+                    val idleSongId = lastSongId
+                    PlaybackQueueManager.currentSongFlow.first { it?.id != idleSongId }
                 }
-                delay(if (wasPlaying) 5_000L else 2_000L)
             }
         }
     }
@@ -919,6 +924,6 @@ object PodcastController {
 
     private fun toast(msg: String) {
         val c = ctx() ?: return
-        scope.launch { Toast.makeText(c, msg, Toast.LENGTH_SHORT).show() }
+        scope.launch { com.lm.player.core.designsystem.component.AppToast.makeText(c, msg, Toast.LENGTH_SHORT).show() }
     }
 }

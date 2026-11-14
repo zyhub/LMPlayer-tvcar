@@ -128,7 +128,7 @@ fun CrashReportDialog(
                         onClick = {
                             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                             clipboard.setPrimaryClip(ClipData.newPlainText("LMPlayer Crash Log", sanitizedReport))
-                            Toast.makeText(context, "崩溃日志已复制", Toast.LENGTH_SHORT).show()
+                            com.lm.player.core.designsystem.component.AppToast.makeText(context, "崩溃日志已复制", Toast.LENGTH_SHORT).show()
                         },
                         shape = RoundedCornerShape(14.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = AppleRed),

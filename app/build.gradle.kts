@@ -43,9 +43,9 @@ android {
         minSdk = 23
         targetSdk = 34
         // 版本号唯一来源：代码中通过 BuildConfig.VERSION_NAME / VERSION_CODE 读取，禁止再在 Kotlin 里硬编码
-        // 【版本号已锁定】按维护者要求固定为 1.10.32 (79)，编译出包时不要自动递增；如需变更请先征得维护者同意
-        versionCode = 79
-        versionName = "1.10.32"
+        // 【版本号已锁定】按维护者要求固定为 1.10.33 (80)（2026-11-08 由 1.10.32 升级），编译出包时不要自动递增；如需变更请先征得维护者同意
+        versionCode = 80
+        versionName = "1.10.33"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -82,7 +82,9 @@ android {
             // findByName 鑰岄潪 getByName锛氭病鏈夋湰鍦板瘑閽ユ椂杩斿洖 null锛屼骇鍑烘湭绛惧悕 APK 鑰屼笉鏄鏋勫缓澶辫触
             signingConfig = signingConfigs.findByName("release")
             proguardFiles(
-                getDefaultProguardFile("proguard-android.txt"),
+                // 启动提速：必须用 -optimize 版本。proguard-android.txt 自带 -dontoptimize，
+                // 只删 proguard-rules.pro 里那行仍然关着 R8 优化（AGP 8.3.2 生成的默认规则第 16 行）。
+                getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
         }
@@ -104,7 +106,12 @@ android {
             "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api",
             "-opt-in=androidx.compose.ui.ExperimentalComposeUiApi",
             "-opt-in=androidx.media3.common.util.UnstableApi",
-            "-opt-in=kotlinx.coroutines.FlowPreview"
+            "-opt-in=kotlinx.coroutines.FlowPreview",
+            // 界面优化：Compose 强跳过模式。参数没变的组件直接跳过重组，回调 lambda 自动记忆。
+            // gradle.properties 里那行 strongSkipping 是 Kotlin 2.0 Compose 插件的写法，对当前
+            // Kotlin 1.9.23 + Compose 编译器 1.5.11 不起作用，必须用这个编译器参数开启。
+            "-P",
+            "plugin:androidx.compose.compiler.plugins.kotlin:experimentalStrongSkipping=true"
         )
     }
 

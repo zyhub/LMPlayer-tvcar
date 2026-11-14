@@ -73,6 +73,7 @@ import com.lm.player.core.media.BootCompletedReceiver
 import com.lm.player.core.media.DownloadEngine
 import com.lm.player.core.media.DownloadRequestPlanner
 import com.lm.player.core.util.CrashLogger
+import com.lm.player.core.startup.StableClock
 import com.lm.player.core.util.StoragePermissionHelper
 import com.lm.player.feature.settings.StoragePermissionDialog
 import com.lm.player.feature.settings.StorageDirSourceChooserDialog
@@ -92,7 +93,6 @@ import com.lm.player.feature.download.DownloadManagerScreen
 import com.lm.player.feature.home.LemonDiscoverHomeScreen
 import com.lm.player.feature.home.LocalMusicHomeScreen
 import com.lm.player.feature.library.LocalLibraryScreen
-import com.lm.player.feature.player.FullscreenPlayerSheet
 import com.lm.player.feature.search.LibrarySearchDialog
 import com.lm.player.feature.settings.AppUpdateDialog
 import com.lm.player.feature.settings.LocalFolderPickerDialog
@@ -112,6 +112,7 @@ import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.first
 
 @OptIn(UnstableApi::class)
 class MainActivity : ComponentActivity() {
@@ -138,6 +139,12 @@ class MainActivity : ComponentActivity() {
 
     /** 收藏切换去抖表：同一首歌 600ms 内只处理一次，避免并发写 Room 与远端整表同步互相覆盖 */
     private val favoriteToggleGuard = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** 启动提速：续播快速通道的结果（true = 已直接按保存的信息续播，组合里的曲库匹配续播据此跳过） */
+    private val fastResumeResult = kotlinx.coroutines.CompletableDeferred<Boolean>()
+
+    /** 启动提速：首帧已绘制（用于决定何时放行启动闸门） */
+    private val firstFrameDrawn = kotlinx.coroutines.CompletableDeferred<Unit>()
 
     /**
      * 运行平台模式的 Activity 级可观察状态（null = 尚未选择）。
@@ -180,7 +187,7 @@ class MainActivity : ComponentActivity() {
             }
             if (permanentlyDenied) append("（系统已不再弹窗，需前往系统设置手动开启）")
         }
-        android.widget.Toast.makeText(this, tip, android.widget.Toast.LENGTH_LONG).show()
+        com.lm.player.core.designsystem.component.AppToast.makeText(this, tip, android.widget.Toast.LENGTH_LONG).show()
     }
 
     private var onChooseDownloadFolderResult: ((android.net.Uri) -> Unit)? = null
@@ -288,7 +295,7 @@ class MainActivity : ComponentActivity() {
                 return
             } catch (_: Exception) {}
         }
-        Toast.makeText(
+        com.lm.player.core.designsystem.component.AppToast.makeText(
             this,
             "本机没有应用权限设置页面。请在车机 系统设置 → 应用管理 → LMPlayer → 权限 中开启存储权限",
             Toast.LENGTH_LONG
@@ -307,15 +314,115 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** 启动页面（设置 → 播放与外观 → 启动页面）：默认「我的」，只读本地资料库，启动最轻 */
+    private fun resolveStartScreen(): Screen = when (com.lm.player.core.designsystem.theme.AppUiPrefs.startPage) {
+        com.lm.player.core.designsystem.theme.StartPage.MINE -> Screen.MINE
+        com.lm.player.core.designsystem.theme.StartPage.HOME -> Screen.HOME
+        com.lm.player.core.designsystem.theme.StartPage.LAST ->
+            com.lm.player.core.designsystem.theme.AppUiPrefs.lastPage(this)
+                ?.let { name -> runCatching { Screen.valueOf(name) }.getOrNull() }
+                ?.takeIf { it == Screen.MINE || it == Screen.HOME || it == Screen.PODCASTS || it == Screen.SETTINGS }
+                ?: Screen.MINE
+    }
+
+    /**
+     * 启动提速：续播快速通道。
+     *
+     * 上次播放的歌曲、播放队列与进度本来就单独保存在配置里（PlaybackQueueManager.savePlaybackState），
+     * 歌曲是本地文件且文件仍在时，无需等整个曲库从数据库读完、映射、匹配之后再续播，
+     * 这里直接按保存的信息续播，进程一起来就出声。
+     * 不满足条件（不是本地文件 / 文件已不在 / 关闭了启动续播 / 首次运行正在选平台模式 / Activity 重建）时
+     * 结果记为 false，交回组合里原有的「曲库加载后匹配续播」流程，行为与以前一致。
+     */
+    private fun startFastResume(savedInstanceState: Bundle?) {
+        if (fastResumeResult.isCompleted) return
+        val player = exoPlayer
+        if (player != null && player.currentMediaItem != null && player.playWhenReady) {
+            // 小组件 / 开机自启已经在播：视为已续播，不再打断
+            fastResumeResult.complete(true)
+            return
+        }
+        val autoPlay = getSharedPreferences("zds_auto_play_prefs", Context.MODE_PRIVATE)
+            .getBoolean("auto_play_on_startup", true)
+        if (savedInstanceState != null || !autoPlay || platformModeState.value == null) {
+            fastResumeResult.complete(false)
+            return
+        }
+        lifecycleScope.launch {
+            val prepared = withContext(Dispatchers.IO) {
+                runCatching {
+                    val saved = PlaybackQueueManager.getSavedLastSong(this@MainActivity) ?: return@runCatching null
+                    if (com.lm.player.core.podcast.PodcastSongs.isPodcast(saved)) return@runCatching null
+                    val path = saved.localFilePath?.trim().orEmpty()
+                    val fileOk = path.isNotEmpty() &&
+                        (path.startsWith("content://") || File(path).let { it.isFile && it.length() > 0L })
+                    if (!fileOk) return@runCatching null
+                    val savedPos = PlaybackQueueManager.getSavedPositionMs(this@MainActivity)
+                    // 与原续播逻辑一致：上次已播到结尾 2 秒内则从头播
+                    val resumePos = if (saved.durationMs > 0L && savedPos >= saved.durationMs - 2000L) 0L
+                    else savedPos.coerceAtLeast(0L)
+                    val song = saved.copy(
+                        localFilePath = path,
+                        streamUrl = path,
+                        downloadStatus = DownloadStatus.DOWNLOADED
+                    )
+                    val savedQueue = PlaybackQueueManager.getSavedQueue(this@MainActivity)
+                        .map { if (it.id == song.id) song else it }
+                    val queue = if (savedQueue.none { it.id == song.id }) listOf(song) + savedQueue else savedQueue
+                    Triple(song, queue, resumePos)
+                }.getOrNull()
+            }
+            if (prepared == null) {
+                fastResumeResult.complete(false)
+                return@launch
+            }
+            val (song, queue, resumePos) = prepared
+            PlaybackQueueManager.playSong(
+                targetSong = song,
+                context = this@MainActivity,
+                newPlaylist = queue,
+                startPositionMs = resumePos
+            )
+            fastResumeResult.complete(true)
+        }
+    }
+
+    /**
+     * 启动提速：首帧已绘制、续播已出声（或判定无需续播）后再静置 1.2 秒，放行启动闸门，
+     * 之后才开始音源引擎、服务器登录与同步、遗留数据清理等后台工作（见 StartupGate）。
+     */
+    private fun scheduleStartupGateRelease(savedInstanceState: Bundle?) {
+        if (com.lm.player.core.startup.StartupGate.isReleased) return
+        lifecycleScope.launch {
+            launch {
+                PlaybackQueueManager.isPlayingFlow.first { it }
+                com.lm.player.core.startup.StartupTrace.mark(com.lm.player.core.startup.StartupTrace.PLAYBACK_STARTED)
+            }
+            firstFrameDrawn.await()
+            if (fastResumeResult.await()) {
+                kotlinx.coroutines.withTimeoutOrNull(4_000L) { PlaybackQueueManager.isPlayingFlow.first { it } }
+            }
+            delay(1_200L)
+            com.lm.player.core.startup.StartupGate.release(
+                if (savedInstanceState == null) "first_frame_and_resume" else "activity_recreated"
+            )
+        }
+    }
+
     @kotlin.OptIn(ExperimentalMaterial3WindowSizeClassApi::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        com.lm.player.core.startup.StartupTrace.mark(com.lm.player.core.startup.StartupTrace.ACTIVITY_CREATE)
 
         // 系统底层接管：将实体按键音量控制通道绑定为媒体音量 (解决应用内音量键无效问题)
         volumeControlStream = android.media.AudioManager.STREAM_MUSIC
 
-        // 热启动兜底：进程未被回收时本地音源会话可能已停止，这里补一次缓存恢复（幂等）
-        com.lm.player.core.source.SourceAccelerationController.ensureRestored(this)
+        // 热启动兜底：进程未被回收时本地音源会话可能已停止，这里补一次缓存恢复（幂等）。
+        // 启动提速：等启动闸门放行（首帧 + 续播完成）后再恢复，不和首帧、续播抢 CPU
+        lifecycleScope.launch {
+            com.lm.player.core.startup.StartupGate.await()
+            com.lm.player.core.source.SourceAccelerationController.ensureRestored(this@MainActivity)
+        }
 
         // 桌面搜索小部件带来的请求（搜索关键词 / 打开资料库），界面就绪后由 Compose 层执行
         if (savedInstanceState == null) com.lm.player.core.widget.WidgetLaunch.consume(intent)
@@ -329,6 +436,8 @@ class MainActivity : ComponentActivity() {
         playbackRouter = PlaybackRouter(database.downloadDao(), this)
         downloadEngine = DownloadEngine(this, database.downloadDao(), database.songDao(), lifecycleScope)
         lifecycleScope.launch(Dispatchers.IO) {
+            // 启动提速：全表扫描去重不是续播必需，等启动闸门放行后再做
+            com.lm.player.core.startup.StartupGate.await()
             LocalMediaScanner.cleanupDuplicateLocalSongs(database)
         }
 
@@ -367,7 +476,28 @@ class MainActivity : ComponentActivity() {
             platformModeState.value = PlatformMode.fromKey(settingsPrefs.getString(PLATFORM_MODE_PREF_KEY, null))
         }
 
+        // 语音点歌：应用是被「播放某某」的意图拉起来的 —— 直接播点的歌，
+        // 并把续播标记为已完成，避免启动续播把刚点的歌顶掉
+        if (savedInstanceState == null && platformModeState.value != null &&
+            com.lm.player.core.voice.VoicePlayRouter.consumeIntent(this, intent)
+        ) {
+            fastResumeResult.complete(true)
+        }
+
+        // 启动提速：上次的歌是本地文件时，不等曲库加载，直接续播
+        startFastResume(savedInstanceState)
+        scheduleStartupGateRelease(savedInstanceState)
+
+        // 界面流畅度统计（性能优化第 0 项）：逐帧耗时回调，跑在独立后台线程
+        com.lm.player.core.startup.FrameStats.attach(this)
         setContent {
+            // 启动提速：首帧已出 → 打点，并参与启动闸门的放行判断
+            LaunchedEffect(Unit) {
+                androidx.compose.runtime.withFrameNanos { }
+                com.lm.player.core.startup.StartupTrace.mark(com.lm.player.core.startup.StartupTrace.FIRST_FRAME)
+                firstFrameDrawn.complete(Unit)
+            }
+
             // 注意：calculateWindowSizeClass() 内部**没有** remember (已用 javap 核实过字节码：
             // 每次组合都会重走 WindowMetricsCalculator.computeCurrentWindowMetrics)，
             // 但它本身是 @Composable，无法放进 remember { }。它的等价手写版本需要
@@ -439,7 +569,9 @@ class MainActivity : ComponentActivity() {
 
             // 启动 10 秒后自动后台检查版本更新 (支持稍后、永不与立即更新)
             LaunchedEffect(Unit) {
-                delay(10000L)
+                // 启动提速：更新检查等启动闸门放行后再计时
+                com.lm.player.core.startup.StartupGate.await()
+                delay(8000L)
                 launch(Dispatchers.IO) {
                     try {
                         val res = AppUpdateManager.checkForUpdates(this@MainActivity)
@@ -465,29 +597,48 @@ class MainActivity : ComponentActivity() {
             // 进程被系统回收后重建时要回到用户原来所在的页面，而不是永远弹回首页。
             // Screen 是枚举，用 Saver 把它当作字符串存取，读写都是同一个状态对象，
             // 因此 `currentScreen = xxx` 这类赋值点无需改动。
+            // 启动页面（设置 → 播放与外观 → 启动页面，默认「我的」）。
+            // 它同时是返回键意义上的「首页」：在它上面按返回提示退出，其它页面返回到它（原先固定是「发现」）。
+            val rootScreen = remember { resolveStartScreen() }
             var currentScreen by rememberSaveable(
                 stateSaver = androidx.compose.runtime.saveable.Saver(
                     save = { it.name },
-                    restore = { name -> try { Screen.valueOf(name) } catch (_: Exception) { Screen.HOME } }
+                    restore = { name -> try { Screen.valueOf(name) } catch (_: Exception) { rootScreen } }
                 )
-            ) { mutableStateOf(Screen.HOME) }
+            ) { mutableStateOf(rootScreen) }
             val screenHistoryStack = remember { mutableStateListOf<Screen>() }
-            var isChildSubViewActive by remember { mutableStateOf(false) }
+            // 各顶部页面是否处于下钻子视图。切页保留页面后「我的」「发现」会同时留在组合里，
+            // 必须按页面分开记：只有**当前页面**的下钻状态才决定返回键交给谁
+            val subViewActiveByPage = remember { mutableStateMapOf<String, Boolean>() }
+            val isChildSubViewActive = subViewActiveByPage[
+                if (currentScreen == Screen.MINE || currentScreen == Screen.LIBRARY) "mine" else currentScreen.name
+            ] == true
             var favoritesRefreshTrigger by remember { mutableStateOf(0) }
             val refreshServerFavorites: () -> Unit = { favoritesRefreshTrigger++ }
 
+            // 「上次离开的页面」：记录最后停留的顶部页面（资料库 / 下载归到「我的」）
+            LaunchedEffect(currentScreen) {
+                val top = when (currentScreen) {
+                    Screen.LIBRARY, Screen.DOWNLOADS -> Screen.MINE
+                    Screen.SEARCH -> null
+                    else -> currentScreen
+                }
+                if (top != null) com.lm.player.core.designsystem.theme.AppUiPrefs.recordLastPage(this@MainActivity, top.name)
+            }
+
             val navigateToScreen: (Screen) -> Unit = { target ->
+                // 启动提速：用户已开始切页操作，延后的后台任务不再等待
+                if (target != rootScreen) com.lm.player.core.startup.StartupGate.release("user_navigation")
                 if (target == Screen.MINE || target == Screen.LIBRARY) {
                     favoritesRefreshTrigger++
                 }
                 if (target != currentScreen) {
-                    if (target == Screen.HOME) {
+                    if (target == rootScreen) {
                         screenHistoryStack.clear()
                     } else {
                         screenHistoryStack.remove(target)
                         screenHistoryStack.add(currentScreen)
                     }
-                    isChildSubViewActive = false
                     currentScreen = target
                 }
             }
@@ -496,7 +647,7 @@ class MainActivity : ComponentActivity() {
                 if (screenHistoryStack.isNotEmpty()) {
                     currentScreen = screenHistoryStack.removeAt(screenHistoryStack.lastIndex)
                 } else {
-                    currentScreen = Screen.HOME
+                    currentScreen = rootScreen
                 }
             }
 
@@ -558,7 +709,11 @@ class MainActivity : ComponentActivity() {
             // 「在别的设备/网页端收藏、本机没同步过」的曲目，所以收藏列表一律以服务器为准。
             var serverFavoriteSongs by remember { mutableStateOf<List<UnifiedSong>>(emptyList()) }
             // 每次访问「我的」/「资料库」或触发 favoritesRefreshTrigger 时及时向服务器拉取「我喜欢的音乐」
-            LaunchedEffect(serversList, favoritesRefreshTrigger, currentScreen == Screen.MINE || currentScreen == Screen.LIBRARY) {
+            val onMinePage = currentScreen == Screen.MINE || currentScreen == Screen.LIBRARY
+            LaunchedEffect(serversList, favoritesRefreshTrigger, onMinePage) {
+                // 启动提速：服务器收藏只给「我的」页用 —— 不在「我的」页不拉；在的话也等续播出声（启动闸门放行）后再拉
+                if (!onMinePage) return@LaunchedEffect
+                com.lm.player.core.startup.StartupGate.await()
                 val srv = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
                     ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
                     ?: return@LaunchedEffect
@@ -695,6 +850,12 @@ class MainActivity : ComponentActivity() {
             var currentLyrics by remember { mutableStateOf(LyricResult()) }
             var isFullPlayerVisible by rememberSaveable { mutableStateOf(false) }
 
+            // 全屏播放页隐藏系统顶部状态栏（设置「播放页隐藏状态栏」，默认开启）；离开播放页恢复显示
+            val hidePlayerStatusBar = com.lm.player.core.designsystem.theme.AppUiPrefs.hidePlayerStatusBar
+            LaunchedEffect(isFullPlayerVisible, hidePlayerStatusBar) {
+                applyPlayerStatusBar(isFullPlayerVisible && hidePlayerStatusBar)
+            }
+
             // 桌面搜索小部件：带关键词进入搜索页 / 打开资料库（离开搜索页后清掉关键词，免得下次手动进入还带着）
             var widgetSearchQuery by remember { mutableStateOf("") }
             val widgetLaunchRequest by com.lm.player.core.widget.WidgetLaunch.pending.collectAsState()
@@ -735,27 +896,42 @@ class MainActivity : ComponentActivity() {
                     )
                 )
             }
+            // 界面流畅度统计：按当前在看的界面分开记（设置 → 运行诊断 → 界面流畅度）
+            LaunchedEffect(currentScreen, isFullPlayerVisible, playerThemeStyle, isSearchDialogOpen) {
+                com.lm.player.core.startup.FrameStats.scope = when {
+                    isFullPlayerVisible -> "播放页·" + playerThemeStyle.displayName
+                    isSearchDialogOpen -> "搜索"
+                    else -> when (currentScreen) {
+                        Screen.MINE, Screen.LIBRARY -> "我的"
+                        Screen.HOME -> "发现"
+                        Screen.SEARCH -> "搜索"
+                        Screen.PODCASTS -> "播客"
+                        Screen.DOWNLOADS -> "下载管理"
+                        Screen.SETTINGS -> "设置"
+                    }
+                }
+            }
 
             // 双击返回退出程序并彻底停止播放
             var lastBackPressTime by remember { mutableStateOf(0L) }
 
-            BackHandler(enabled = isFullPlayerVisible || isSearchDialogOpen || (!isChildSubViewActive && currentScreen != Screen.HOME)) {
+            BackHandler(enabled = isFullPlayerVisible || isSearchDialogOpen || (!isChildSubViewActive && currentScreen != rootScreen)) {
                 if (isFullPlayerVisible) {
                     isFullPlayerVisible = false
                 } else if (isSearchDialogOpen) {
                     isSearchDialogOpen = false
-                } else if (currentScreen != Screen.HOME) {
+                } else if (currentScreen != rootScreen) {
                     popScreenOrHome()
                 }
             }
 
-            BackHandler(enabled = !isFullPlayerVisible && !isSearchDialogOpen && !isChildSubViewActive && currentScreen == Screen.HOME) {
+            BackHandler(enabled = !isFullPlayerVisible && !isSearchDialogOpen && !isChildSubViewActive && currentScreen == rootScreen) {
                 val now = System.currentTimeMillis()
                 if (now - lastBackPressTime < 2000) {
                     exitAppCompletely()
                 } else {
                     lastBackPressTime = now
-                    Toast.makeText(this@MainActivity, "再按一次彻底退出程序并停止播放", Toast.LENGTH_SHORT).show()
+                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "再按一次彻底退出程序并停止播放", Toast.LENGTH_SHORT).show()
                 }
             }
 
@@ -1134,15 +1310,18 @@ class MainActivity : ComponentActivity() {
                             database.playlistDao().insertPlaylists(plEntities)
                         }
 
+                        // 服务器歌曲加速第 2 期：曲库同步完成后在后台预匹配（每天上限、让路播放，见 ServerTrackPrematcher）
+                        com.lm.player.core.source.ServerTrackPrematcher.kick("library_synced")
+
                         if (showToast) {
                             withContext(Dispatchers.Main) {
                                 val msg = if (skipFullSongSync) "已成功同步：曲库已是最新 (免扫盘增量比对命中)" else "已成功从柠檬服务器同步全量媒体数据与歌单"
-                                Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
+                                com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
                             }
                         }
                     } else if (showToast) {
                         withContext(Dispatchers.Main) {
-                            Toast.makeText(this@MainActivity, "同步失败: ${authRes.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                            com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "同步失败: ${authRes.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
                         }
                     }
                 }
@@ -1188,6 +1367,8 @@ class MainActivity : ComponentActivity() {
 
             // 启动时自动深度清理遗留残留数据、孤立记录与物理文件核对
             LaunchedEffect(Unit) {
+                // 启动提速：遗留数据清理不是续播必需，等启动闸门放行后再做
+                com.lm.player.core.startup.StartupGate.await()
                 withContext(Dispatchers.IO) {
                     try {
                         val validServers = database.serverDao().getAllServers().map { it.id }.toList()
@@ -1224,12 +1405,16 @@ class MainActivity : ComponentActivity() {
                         // 在后台异步检测服务器在线与认证状态，连接就绪后直接无缝切换至服务器首页并触发全量同步
                         if (!hasAutoCheckedServerOnStartup) {
                             hasAutoCheckedServerOnStartup = true
-                            // 先绑定服务器并开始探活（不依赖本地是否缓存了音源脚本），链路判定与目录网关立即生效
-                            if (active.type == ServerType.LEMON_MUSIC) {
-                                com.lm.player.core.source.SourceAccelerationController.observeServer(this@MainActivity, active)
-                            }
                             lifecycleScope.launch(Dispatchers.IO) {
-                                delay(1200L)
+                                // 启动提速：服务器链路绑定、登录与曲库/歌单同步都等启动闸门放行
+                                // （首帧 + 续播完成）后再做；在此之前资料库按本地模式显示，与原先登录完成前一致
+                                com.lm.player.core.startup.StartupGate.await()
+                                // 先绑定服务器并开始探活（不依赖本地是否缓存了音源脚本），链路判定与目录网关立即生效
+                                if (active.type == ServerType.LEMON_MUSIC) {
+                                    withContext(Dispatchers.Main) {
+                                        com.lm.player.core.source.SourceAccelerationController.observeServer(this@MainActivity, active)
+                                    }
+                                }
                                 try {
                                     val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
                                     val protocol = LemonMusicProtocol(client, active.serverUrl, active.username, active.tokenOrApiKey)
@@ -1326,7 +1511,9 @@ class MainActivity : ComponentActivity() {
                             val resolvedTimestamp = when {
                                 entity.addedTimestamp > 0 -> entity.addedTimestamp
                                 dlRecord != null && dlRecord.completedTimestamp > 0 -> dlRecord.completedTimestamp
-                                entity.downloadStatus == DownloadStatus.DOWNLOADED -> System.currentTimeMillis()
+                                // 用进程内固定的时刻而不是每次重载都取「现在」：否则每次曲库重载都会产生
+                                // 内容不同的列表，资料库各项统计因此每次都要整库重算（排序语义不变：仍排在最前）
+                                entity.downloadStatus == DownloadStatus.DOWNLOADED -> StableClock.processStartMs
                                 else -> 0L
                             }
                             val effectiveLocalPath = entity.localFilePath?.takeIf { it.isNotBlank() }
@@ -1370,6 +1557,9 @@ class MainActivity : ComponentActivity() {
                         Pair(mapped, rec)
                     }
                     songList = mappedSongs
+                    com.lm.player.core.startup.StartupTrace.mark(com.lm.player.core.startup.StartupTrace.LIBRARY_READY)
+                    // 下载状态即时刷新：数据库镜像更新后，清掉已被数据库追上的即时事件
+                    com.lm.player.core.media.SongStatusStore.updateLibrary(mappedSongs)
                     PlaybackQueueManager.updateMetadata(mappedSongs)
                     recentlyAddedSongs = recAdded
                     // 注意：此处不再用「曲库前 10 首」冒充最近播放，
@@ -1665,7 +1855,7 @@ class MainActivity : ComponentActivity() {
                 // 1. 服务端缓存调度 (SERVER 或 BOTH)
                 if (target == DownloadTarget.SERVER || target == DownloadTarget.BOTH) {
                     if (activeServer == null) {
-                        Toast.makeText(this@MainActivity, "未配置柠檬音乐服务端，无法推送至服务器曲库", Toast.LENGTH_SHORT).show()
+                        com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "未配置柠檬音乐服务端，无法推送至服务器曲库", Toast.LENGTH_SHORT).show()
                     } else {
                         lifecycleScope.launch(Dispatchers.IO) {
                             try {
@@ -1681,9 +1871,9 @@ class MainActivity : ComponentActivity() {
                                 val res = protocol.addServerDownloadTasks(listOf(serverTask))
                                 withContext(Dispatchers.Main) {
                                     if (res.isSuccess) {
-                                        Toast.makeText(this@MainActivity, "已提交缓存至服务器 [${quality.badge}]: ${songToDownload.title}", Toast.LENGTH_SHORT).show()
+                                        com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "已提交缓存至服务器 [${quality.badge}]: ${songToDownload.title}", Toast.LENGTH_SHORT).show()
                                     } else {
-                                        Toast.makeText(this@MainActivity, "缓存至服务器失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                                        com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "缓存至服务器失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
                                     }
                                 }
                                 if (res.isSuccess) {
@@ -1733,7 +1923,7 @@ class MainActivity : ComponentActivity() {
                                 }
                             } catch (e: Exception) {
                                 withContext(Dispatchers.Main) {
-                                    Toast.makeText(this@MainActivity, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
                                 }
                             }
                         }
@@ -1754,11 +1944,14 @@ class MainActivity : ComponentActivity() {
                             song = preparedSong,
                             urlResolver = { resolveDownloadUrlFor(this@MainActivity, activeServer, songToDownload, quality) }
                         )
-                        Toast.makeText(this@MainActivity, "已加入下载队列 [${quality.badge}]: ${songToDownload.title}", Toast.LENGTH_SHORT).show()
+                        com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "已加入下载队列 [${quality.badge}]: ${songToDownload.title}", Toast.LENGTH_SHORT).show()
+                    } else if (com.lm.player.core.media.LocalUpgradeRequests.take(songToDownload.id) != null) {
+                        // 本地升级必须能按新音质重新取文件；没有服务端来源时取消，不能拿旧文件「升级」自己
+                        com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "没有可用的服务器音源，无法升级音质：${songToDownload.title}", Toast.LENGTH_SHORT).show()
                     } else {
                         // 纯本地文件：没有可换音质的来源，沿用本地直链下载
                         downloadEngine.startDownload(preparedSong)
-                        Toast.makeText(this@MainActivity, "已加入本地下载: ${songToDownload.title}", Toast.LENGTH_SHORT).show()
+                        com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "已加入本地下载: ${songToDownload.title}", Toast.LENGTH_SHORT).show()
                     }
                 }
             }
@@ -1777,9 +1970,9 @@ class MainActivity : ComponentActivity() {
                     // 1. 服务端批量缓存调度 (SERVER 或 BOTH)
                     if (target == DownloadTarget.SERVER || target == DownloadTarget.BOTH) {
                         if (activeServer == null) {
-                            Toast.makeText(this@MainActivity, "未配置柠檬音乐服务端，无法推送至服务器曲库", Toast.LENGTH_SHORT).show()
+                            com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "未配置柠檬音乐服务端，无法推送至服务器曲库", Toast.LENGTH_SHORT).show()
                         } else if (songsNeedingServerPush.isEmpty()) {
-                            Toast.makeText(this@MainActivity, "所选 $serverAlreadyCount 首歌曲均已在服务器曲库，无需重复下载", Toast.LENGTH_SHORT).show()
+                            com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "所选 $serverAlreadyCount 首歌曲均已在服务器曲库，无需重复下载", Toast.LENGTH_SHORT).show()
                         } else {
                             lifecycleScope.launch(Dispatchers.IO) {
                                 try {
@@ -1804,13 +1997,13 @@ class MainActivity : ComponentActivity() {
                                     withContext(Dispatchers.Main) {
                                         if (successChunks > 0) {
                                             val skipTip = if (serverAlreadyCount > 0) "，跳过 $serverAlreadyCount 首（已在服务器）" else ""
-                                            Toast.makeText(
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(
                                                 this@MainActivity,
                                                 "已提交 ${songsNeedingServerPush.size} 首至服务器缓存 [${quality.badge}]$skipTip",
                                                 Toast.LENGTH_SHORT
                                             ).show()
                                         } else {
-                                            Toast.makeText(this@MainActivity, "批量提交服务器缓存失败", Toast.LENGTH_LONG).show()
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "批量提交服务器缓存失败", Toast.LENGTH_LONG).show()
                                         }
                                     }
 
@@ -1852,7 +2045,7 @@ class MainActivity : ComponentActivity() {
                                     }
                                 } catch (e: Exception) {
                                     withContext(Dispatchers.Main) {
-                                        Toast.makeText(this@MainActivity, "批量缓存网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
+                                        com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "批量缓存网络错误: ${e.message}", Toast.LENGTH_SHORT).show()
                                     }
                                 }
                             }
@@ -1893,7 +2086,7 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         val skipTip = if (skippedCount > 0) "，跳过 $skippedCount 首（已存在该音质）" else ""
-                        Toast.makeText(
+                        com.lm.player.core.designsystem.component.AppToast.makeText(
                             this@MainActivity,
                             if (enqueuedCount > 0) {
                                 "已将 $enqueuedCount 首歌曲加入本地下载队列 [${quality.badge}]$skipTip"
@@ -1957,7 +2150,7 @@ class MainActivity : ComponentActivity() {
                 if (PlaybackQueueManager.currentSongFlow.value?.id == songToFav.id) {
                     PlaybackQueueManager.updateCurrentSong(updatedSong)
                 }
-                Toast.makeText(
+                com.lm.player.core.designsystem.component.AppToast.makeText(
                     this@MainActivity,
                     if (newFav) "已加入「我喜欢的音乐」" else "已从「我喜欢的音乐」移除",
                     Toast.LENGTH_SHORT
@@ -2019,7 +2212,7 @@ class MainActivity : ComponentActivity() {
                                 // 服务器同步失败（含「读取服务器收藏失败、为防覆盖已取消」）时明确告知，不再静默吞掉
                                 val reason = favSync.exceptionOrNull()?.message.orEmpty()
                                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                                    android.widget.Toast.makeText(
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(
                                         this@MainActivity,
                                         "收藏未同步到服务器，请稍后重试${if (reason.isNotBlank()) "：$reason" else ""}",
                                         android.widget.Toast.LENGTH_SHORT
@@ -2052,7 +2245,7 @@ class MainActivity : ComponentActivity() {
                                     val cacheRes = protocol.addServerDownloadTasks(listOf(serverTask))
                                     withContext(Dispatchers.Main) {
                                         if (cacheRes.isSuccess) {
-                                            Toast.makeText(this@MainActivity, "已同步提交服务器缓存 [${targetQuality.badge}]", Toast.LENGTH_SHORT).show()
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "已同步提交服务器缓存 [${targetQuality.badge}]", Toast.LENGTH_SHORT).show()
                                         }
                                     }
                                 } catch (e: Exception) {
@@ -2068,6 +2261,8 @@ class MainActivity : ComponentActivity() {
             }
 
             val handleAddToPlaylist: (UnifiedPlaylist, UnifiedSong) -> Unit = { targetPlaylist, songToAdd ->
+                // 立即登记：再打开「加入歌单」时这个歌单马上显示「已加入」（2026-11-13 从手机端移植）
+                com.lm.player.core.designsystem.component.PlaylistMembership.add(targetPlaylist.id, songToAdd)
                 lifecycleScope.launch(Dispatchers.IO) {
                     try {
                         val active = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
@@ -2135,6 +2330,16 @@ class MainActivity : ComponentActivity() {
                             )
                         )
                         database.playlistDao().updateSongCount(targetPlaylist.id)
+                        // 补齐歌单封面（最多拼 4 张，与手机端一致）
+                        if (songToAdd.coverUrl.isNotBlank()) {
+                            database.playlistDao().getPlaylistById(targetPlaylist.id)?.let { plEntity ->
+                                val existingCovers = plEntity.coverUrl.split("|").map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
+                                if (!existingCovers.contains(songToAdd.coverUrl) && existingCovers.size < 4) {
+                                    existingCovers.add(songToAdd.coverUrl)
+                                    database.playlistDao().insertPlaylist(plEntity.copy(coverUrl = existingCovers.joinToString("|")))
+                                }
+                            }
+                        }
 
                         // 3. 若配置了服务端，同步至服务器 customPlaylists / favorites
                         if (active != null && (targetPlaylist.isOnline || targetPlaylist.serverId == active.id || targetPlaylist.serverId == "lemon_music" || isFavPlaylist)) {
@@ -2163,7 +2368,7 @@ class MainActivity : ComponentActivity() {
                         }
 
                         withContext(Dispatchers.Main) {
-                            Toast.makeText(
+                            com.lm.player.core.designsystem.component.AppToast.makeText(
                                 this@MainActivity,
                                 "已将《${songToAdd.title}》加入「${targetPlaylist.name}」",
                                 Toast.LENGTH_SHORT
@@ -2172,7 +2377,7 @@ class MainActivity : ComponentActivity() {
                     } catch (e: Exception) {
                         Log.e("MainActivity", "handleAddToPlaylist error", e)
                         withContext(Dispatchers.Main) {
-                            Toast.makeText(this@MainActivity, "加入歌单失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                            com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "加入歌单失败: ${e.message}", Toast.LENGTH_SHORT).show()
                         }
                     }
                 }
@@ -2194,7 +2399,7 @@ class MainActivity : ComponentActivity() {
                                     active.username,
                                     active.tokenOrApiKey
                                 )
-                                val res = protocol.createCustomPlaylist(playlistName)
+                                val res = protocol.createCustomPlaylist(playlistName, coverUrl = songToAdd.coverUrl)
                                 if (res.isSuccess) {
                                     res.getOrNull()?.let {
                                         newPlId = it.id
@@ -2235,6 +2440,180 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            // ==================== 多选「加入歌单」（2026-11-14） ====================
+            // 所有带多选的列表共用：PlaylistBatchOps 负责选歌单 / 进度 / 结果窗口，这里负责真正写入。
+            // 服务器歌单：一次读出整份 → 逐首核对已存在 → 一次写回（LemonMusicProtocol.addTracksToCustomPlaylistDetailed）；
+            // 本地歌单：查本机关联表判断已存在。加入成功的歌再写进本机曲库与歌单关联（与单首加入同一份数据）。
+            val batchAddSongsToPlaylist: suspend (UnifiedPlaylist, List<UnifiedSong>, (Float, String) -> Unit) -> List<com.lm.player.core.model.PlaylistAddOutcome> =
+                { target, songs, onProgress ->
+                    withContext(Dispatchers.IO) {
+                        val active = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
+                            ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
+                        val isServerPl = target.isOnline
+                        var outcomes: List<com.lm.player.core.model.PlaylistAddOutcome> = if (isServerPl) {
+                            if (active == null) {
+                                songs.map {
+                                    com.lm.player.core.model.PlaylistAddOutcome(it, com.lm.player.core.model.PlaylistAddStatus.FAILED, "没有连接服务器，不能加入服务器歌单")
+                                }
+                            } else {
+                                val protocol = LemonMusicProtocol(
+                                    NetworkClientFactory.createOkHttpClient(this@MainActivity),
+                                    active.serverUrl,
+                                    active.username,
+                                    active.tokenOrApiKey
+                                )
+                                protocol.addTracksToCustomPlaylistDetailed(target.id, songs) { f, step -> onProgress(f * 0.8f, step) }
+                                    .getOrElse { e ->
+                                        songs.map {
+                                            com.lm.player.core.model.PlaylistAddOutcome(
+                                                it, com.lm.player.core.model.PlaylistAddStatus.FAILED, e.message ?: "读取服务器歌单失败"
+                                            )
+                                        }
+                                    }
+                            }
+                        } else {
+                            onProgress(0.05f, "核对歌单中已有的歌…")
+                            val existingIds = runCatching { database.playlistDao().getSongsForPlaylist(target.id).map { it.id }.toHashSet() }
+                                .getOrDefault(HashSet())
+                            val seen = HashSet<String>()
+                            songs.map { s ->
+                                when {
+                                    s.id in existingIds -> com.lm.player.core.model.PlaylistAddOutcome(s, com.lm.player.core.model.PlaylistAddStatus.EXISTED, "歌单里已经有这首歌")
+                                    !seen.add(s.id) -> com.lm.player.core.model.PlaylistAddOutcome(s, com.lm.player.core.model.PlaylistAddStatus.EXISTED, "选中的歌里重复了")
+                                    else -> com.lm.player.core.model.PlaylistAddOutcome(s, com.lm.player.core.model.PlaylistAddStatus.ADDED)
+                                }
+                            }
+                        }
+
+                        // 加入成功的歌：写进本机曲库与歌单关联
+                        val saveStart = if (isServerPl) 0.8f else 0.1f
+                        val toSave = outcomes.filter { it.status == com.lm.player.core.model.PlaylistAddStatus.ADDED }
+                        val localFailures = HashMap<String, String>()
+                        toSave.forEachIndexed { i, o ->
+                            val s = o.song
+                            try {
+                                val existing = database.songDao().getSongById(s.id)
+                                val effectiveServerId = when {
+                                    existing != null && existing.serverId.isNotBlank() && existing.serverId != "lemon_online" -> existing.serverId
+                                    s.serverId.isNotBlank() && s.serverId != "lemon_online" -> s.serverId
+                                    active != null -> active.id
+                                    else -> "local_storage"
+                                }
+                                database.songDao().insertSongs(
+                                    listOf(
+                                        SongEntity(
+                                            id = s.id,
+                                            title = s.title.ifBlank { "未知曲目" },
+                                            artist = s.artist.ifBlank { "未知歌手" },
+                                            artistId = s.artistId.ifBlank { "artist_${s.artist.hashCode()}" },
+                                            album = s.album.ifBlank { "单曲精选" },
+                                            albumId = s.albumId.ifBlank { "album_${s.album.hashCode()}" },
+                                            durationMs = s.durationMs,
+                                            coverUrl = s.coverUrl.ifBlank { existing?.coverUrl.orEmpty() },
+                                            streamUrl = s.streamUrl.ifBlank { existing?.streamUrl.orEmpty() },
+                                            serverId = effectiveServerId,
+                                            localFilePath = existing?.localFilePath ?: s.localFilePath,
+                                            downloadStatus = existing?.downloadStatus ?: s.downloadStatus,
+                                            bitRate = s.bitRate,
+                                            format = s.format,
+                                            isFavorite = existing?.isFavorite == true || s.isFavorite,
+                                            relativeFolderPath = s.rawMetaJson ?: existing?.relativeFolderPath ?: s.relativeFolderPath,
+                                            addedTimestamp = existing?.addedTimestamp?.takeIf { it > 0L } ?: System.currentTimeMillis()
+                                        )
+                                    )
+                                )
+                                database.playlistDao().addSongToPlaylist(
+                                    com.lm.player.core.database.entity.PlaylistSongEntity(playlistId = target.id, songId = s.id)
+                                )
+                            } catch (e: Exception) {
+                                Log.w("MainActivity", "batch add: save locally failed for ${s.title}", e)
+                                // 本地歌单只存在本机：存不进去就是失败；服务器歌单已经写进服务器，本机记录缺了不影响
+                                if (!isServerPl) localFailures[s.id] = "保存到本机失败：${e.message ?: "未知错误"}"
+                            }
+                            onProgress(saveStart + (1f - saveStart) * (i + 1) / toSave.size, "保存到本机 ${i + 1}/${toSave.size}")
+                        }
+                        if (localFailures.isNotEmpty()) {
+                            outcomes = outcomes.map { o ->
+                                localFailures[o.song.id]?.let { o.copy(status = com.lm.player.core.model.PlaylistAddStatus.FAILED, reason = it) } ?: o
+                            }
+                        }
+                        outcomes.forEach { o ->
+                            if (o.status != com.lm.player.core.model.PlaylistAddStatus.FAILED) {
+                                com.lm.player.core.designsystem.component.PlaylistMembership.add(target.id, o.song)
+                            }
+                        }
+                        if (toSave.isNotEmpty()) {
+                            if (isServerPl) {
+                                active?.let { syncServerPlaylists(it) }
+                            } else {
+                                runCatching {
+                                    database.playlistDao().updateSongCount(target.id)
+                                    database.playlistDao().getPlaylistById(target.id)?.let { plEntity ->
+                                        val covers = plEntity.coverUrl.split("|").map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
+                                        toSave.map { it.song.coverUrl }.filter { it.isNotBlank() }.forEach { c ->
+                                            if (covers.size < 4 && !covers.contains(c)) covers.add(c)
+                                        }
+                                        if (covers.joinToString("|") != plEntity.coverUrl) {
+                                            database.playlistDao().insertPlaylist(plEntity.copy(coverUrl = covers.joinToString("|")))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        onProgress(1f, "完成")
+                        outcomes
+                    }
+                }
+
+            // 多选「加入歌单」里的「新建歌单」：有服务器且不是本地模式时建在服务器上，否则建在本机
+            val createPlaylistForBatch: suspend (String) -> UnifiedPlaylist? = { playlistName ->
+                withContext(Dispatchers.IO) {
+                    val isCurrentLocalMode = activeServerName.contains("本地") || activeServerName.contains("已下载")
+                    val active = if (isCurrentLocalMode) null else (serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
+                        ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC })
+                    var newPlId = "pl_${System.currentTimeMillis()}"
+                    var isOnlinePl = false
+                    if (active != null && !com.lm.player.core.source.ServerLinkState.isLost) {
+                        runCatching {
+                            val protocol = LemonMusicProtocol(
+                                NetworkClientFactory.createOkHttpClient(this@MainActivity),
+                                active.serverUrl,
+                                active.username,
+                                active.tokenOrApiKey
+                            )
+                            protocol.createCustomPlaylist(playlistName).getOrNull()?.let {
+                                newPlId = it.id
+                                isOnlinePl = true
+                            }
+                        }
+                    }
+                    val serverIdForPl = if (isOnlinePl && active != null) active.id else "local_storage"
+                    runCatching {
+                        database.playlistDao().insertPlaylist(
+                            com.lm.player.core.database.entity.PlaylistEntity(
+                                id = newPlId,
+                                name = playlistName,
+                                serverId = serverIdForPl,
+                                isOnline = isOnlinePl,
+                                songCount = 0
+                            )
+                        )
+                        UnifiedPlaylist(id = newPlId, name = playlistName, isOnline = isOnlinePl, serverId = serverIdForPl, songCount = 0)
+                    }.getOrNull()
+                }
+            }
+            LaunchedEffect(Unit) {
+                com.lm.player.core.designsystem.component.PlaylistBatchOps.addHandler = batchAddSongsToPlaylist
+                com.lm.player.core.designsystem.component.PlaylistBatchOps.createHandler = createPlaylistForBatch
+            }
+            LaunchedEffect(playlistsList, serversList) {
+                com.lm.player.core.designsystem.component.PlaylistBatchOps.playlists.value = playlistsList.filter {
+                    !it.isDiscover && !it.id.startsWith("discover_") && !it.id.startsWith("lemon_rec_")
+                }
+                com.lm.player.core.designsystem.component.PlaylistBatchOps.serverConfigured.value =
+                    serversList.any { it.type == ServerType.LEMON_MUSIC }
+            }
+
             val playNext: () -> Unit = {
                 PlaybackQueueManager.playNext(this@MainActivity)
             }
@@ -2259,6 +2638,11 @@ class MainActivity : ComponentActivity() {
                 // 首次启动的平台向导尚未完成时不自动播放：向导是模态的，此间不应擅自出声
                 if (platformMode == null) return@LaunchedEffect
                 if (!autoPlayOnStartup || hasAutoPlayedOnStartup) return@LaunchedEffect
+                // 启动提速：快速通道已直接续播（本地文件），不再按曲库匹配重复续播
+                if (fastResumeResult.await()) {
+                    hasAutoPlayedOnStartup = true
+                    return@LaunchedEffect
+                }
                 if (exoPlayer?.isPlaying == true && currentSong != null) {
                     hasAutoPlayedOnStartup = true
                     return@LaunchedEffect
@@ -2308,6 +2692,8 @@ class MainActivity : ComponentActivity() {
             // 本地模式下不请求服务器足迹，避免把本地歌单外的在线曲目混进「最近播放」。
             LaunchedEffect(serversList, activeServerName) {
                 if (activeServerName.contains("本地") || activeServerName.contains("已下载")) return@LaunchedEffect
+                // 启动提速：服务器最近播放同步等启动闸门放行后再做
+                com.lm.player.core.startup.StartupGate.await()
                 val active = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
                     ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
                     ?: return@LaunchedEffect
@@ -2374,7 +2760,7 @@ class MainActivity : ComponentActivity() {
                                 }
                                 if (matchedLocalSong != null && matchedLocalSong.localFilePath != targetSong.localFilePath) {
                                     withContext(Dispatchers.Main) {
-                                        Toast.makeText(this@MainActivity, "在线音频缓冲受阻，已无缝切换至本地离线版本", Toast.LENGTH_SHORT).show()
+                                        com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "在线音频缓冲受阻，已无缝切换至本地离线版本", Toast.LENGTH_SHORT).show()
                                         val localSong = targetSong.copy(
                                             localFilePath = matchedLocalSong.localFilePath,
                                             streamUrl = matchedLocalSong.localFilePath ?: "",
@@ -2420,7 +2806,7 @@ class MainActivity : ComponentActivity() {
                                     val nextQualityKey = fallbackQualities[nextQualityIdx]
                                     val nextQualityLabel = AudioQuality.fromKey(nextQualityKey).label
                                     Log.i("MainActivity", "Auto-downgrading quality for ${targetSong.title} to $nextQualityKey ($nextQualityLabel) at ${resumePos}ms")
-                                    Toast.makeText(this@MainActivity, "当前音质无法缓冲，已自动为您换源降至【$nextQualityLabel】播放", Toast.LENGTH_SHORT).show()
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "当前音质无法缓冲，已自动为您换源降至【$nextQualityLabel】播放", Toast.LENGTH_SHORT).show()
                                     PlaybackQueueManager.playSong(
                                         targetSong = targetSong,
                                         context = this@MainActivity,
@@ -2446,7 +2832,7 @@ class MainActivity : ComponentActivity() {
                                 }
                                 if (matchedServerSong != null) {
                                     withContext(Dispatchers.Main) {
-                                        Toast.makeText(this@MainActivity, "在线音源缓冲受阻，已自动切换至服务器资料库同名版本", Toast.LENGTH_SHORT).show()
+                                        com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "在线音源缓冲受阻，已自动切换至服务器资料库同名版本", Toast.LENGTH_SHORT).show()
                                         PlaybackQueueManager.playSong(
                                             targetSong = matchedServerSong,
                                             context = this@MainActivity,
@@ -2458,7 +2844,7 @@ class MainActivity : ComponentActivity() {
                             }
 
                             withContext(Dispatchers.Main) {
-                                Toast.makeText(this@MainActivity, "当前歌曲《${targetSong.title.ifBlank { "未知" }}》音频无法缓冲，请检查网络或服务端连接", Toast.LENGTH_SHORT).show()
+                                com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "当前歌曲《${targetSong.title.ifBlank { "未知" }}》音频无法缓冲，请检查网络或服务端连接", Toast.LENGTH_SHORT).show()
                             }
                         }
                     }
@@ -2696,12 +3082,12 @@ class MainActivity : ComponentActivity() {
                         onSyncNow = {
                             val active = serversList.firstOrNull { it.isCurrentActive }
                             if (active != null) {
-                                Toast.makeText(this@MainActivity, "正在从柠檬音乐同步全量曲库...", Toast.LENGTH_SHORT).show()
+                                com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "正在从柠檬音乐同步全量曲库...", Toast.LENGTH_SHORT).show()
                                 syncServerPlaylists(active)
                                 syncServerSongs(active)
                                 refreshServerFavorites()
                             } else {
-                                Toast.makeText(this@MainActivity, "当前为本地模式，可前往设置扫描本地文件", Toast.LENGTH_SHORT).show()
+                                com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "当前为本地模式，可前往设置扫描本地文件", Toast.LENGTH_SHORT).show()
                             }
                         },
                         onToggleFavorite = {
@@ -2714,30 +3100,35 @@ class MainActivity : ComponentActivity() {
                                 !isShuffle && !isRepeat -> {
                                     PlaybackQueueManager.setShuffle(true)
                                     PlaybackQueueManager.setRepeat(false)
-                                    Toast.makeText(this@MainActivity, "已切换为：随机播放", Toast.LENGTH_SHORT).show()
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "已切换为：随机播放", Toast.LENGTH_SHORT).show()
                                 }
                                 isShuffle -> {
                                     PlaybackQueueManager.setShuffle(false)
                                     PlaybackQueueManager.setRepeat(true)
-                                    Toast.makeText(this@MainActivity, "已切换为：单曲循环", Toast.LENGTH_SHORT).show()
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "已切换为：单曲循环", Toast.LENGTH_SHORT).show()
                                 }
                                 else -> {
                                     PlaybackQueueManager.setShuffle(false)
                                     PlaybackQueueManager.setRepeat(false)
-                                    Toast.makeText(this@MainActivity, "已切换为：列表循环", Toast.LENGTH_SHORT).show()
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "已切换为：列表循环", Toast.LENGTH_SHORT).show()
                                 }
                             }
                         }
                     ) { innerPadding ->
                         Box(modifier = Modifier.fillMaxSize()) {
                             if (!isSearchDialogOpen) {
-                                AnimatedContent(
-                                targetState = currentScreen,
-                                transitionSpec = {
-                                    fadeIn(animationSpec = tween(150, easing = FastOutSlowInEasing)) togetherWith
-                                            fadeOut(animationSpec = tween(120, easing = FastOutSlowInEasing))
+                                // 切页提速：「我的」「发现」进入过一次后保留在组合里，再切回来不用重建（见 KeepAlivePageHost）；
+                                // 其余页面与原先一样淡入淡出、离开即销毁。设置 → 播放与外观 →「切页保留页面」可关
+                                com.lm.player.ui.KeepAlivePageHost(
+                                current = currentScreen,
+                                keepAliveKeyOf = { screen ->
+                                    when (screen) {
+                                        Screen.MINE, Screen.LIBRARY -> "mine"
+                                        Screen.HOME -> "home"
+                                        else -> null
+                                    }
                                 },
-                                label = "screen_transition"
+                                enabled = com.lm.player.core.designsystem.theme.AppUiPrefs.keepPagesAlive
                             ) { targetScreen ->
                                 when (targetScreen) {
                                 // Screen.MINE 与 Screen.LIBRARY 已融合为统一的「我的 (含在线曲库与本地缓存)」页面
@@ -2747,7 +3138,9 @@ class MainActivity : ComponentActivity() {
                                         ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
                                     // page/limit 透传给服务端，由服务端做翻页；一页拉满即认为还有下一页。
                                     // 搜索：本地音源可用时本地优先（不经服务器），本地无结果且服务器未离线时服务器兜底；都不可用时不提供在线搜索
+                                    // TV 按需启动：本机缓存了音源脚本即可本地搜索（目录不需要 JS 引擎；收集状态以便缓存变化时重组）
                                     val localSearchReady = com.lm.player.core.source.SourceAccelerationSession.status.collectAsState().value.isReady ||
+                                        com.lm.player.core.source.SourceAccelerationController.scriptsCached.collectAsState().value ||
                                         com.lm.player.core.source.catalog.OfflineCatalogService.isAvailable()
                                     val onlineSearchCallback: (suspend (String, OnlineMusicSource, Int, Int) -> List<UnifiedSong>)? = remember(activeServer, localSearchReady) {
                                         val srv = activeServer
@@ -2803,7 +3196,7 @@ class MainActivity : ComponentActivity() {
                                         isServerConnected = (activeServer != null || com.lm.player.core.source.catalog.OfflineCatalogService.isAvailable()),
                                         contentPadding = innerPadding,
                                         initialQuery = widgetSearchQuery,
-                                        onDismiss = { navigateToScreen(Screen.HOME) }
+                                        onDismiss = { navigateToScreen(rootScreen) }
                                     )
                                 }
 
@@ -2815,7 +3208,10 @@ class MainActivity : ComponentActivity() {
                                     // 首页规则（用户 2026-11-07 确认）：本地音源可用时，不论服务器在线、离线还是已删除，都显示和在线一样的
                                     // 发现页（数据来自本地音源）；本地音源不可用时，服务器在线显示在线首页，否则显示纯本地首页。
                                     val detachedLocalSource by com.lm.player.core.source.SourceAccelerationController.detached.collectAsState()
-                                    val localSourceReady = com.lm.player.core.source.SourceAccelerationSession.status.collectAsState().value.isReady
+                                    // TV 按需启动：本机缓存了音源脚本就直接显示发现页（目录走本地 Kotlin 目录服务，不需要先加载 JS 引擎），
+                                    // 不再先显示本地首页、等引擎加载好再整页切换
+                                    val localScriptsCached by com.lm.player.core.source.SourceAccelerationController.scriptsCached.collectAsState()
+                                    val localSourceReady = com.lm.player.core.source.SourceAccelerationSession.status.collectAsState().value.isReady || localScriptsCached
                                     if (activeServer != null || localSourceReady || detachedLocalSource) {
                                         LemonDiscoverHomeScreen(
                                             serverName = if (activeServer == null) "本地音源模式" else activeServerName,
@@ -2825,7 +3221,7 @@ class MainActivity : ComponentActivity() {
                                                 currentOnlineSource = newSrc
                                                 onlinePrefs.edit().putString("selected_source", newSrc.name).apply()
                                             },
-                                                                allCachedSongs = remember(songList) { deduplicateLocalSongs(songList) },
+                                                                allCachedSongs = remember(songList) { LocalSongsDedupeCache.get(songList) },
                                             activeDownloadTasks = activeDownloadTasksProvider,
                                             activeDownloadCount = activeDownloadCount,
                                             currentPlayingSong = currentSong,
@@ -2855,11 +3251,11 @@ class MainActivity : ComponentActivity() {
                                             onSyncNow = {
                                                 val srv = activeServer
                                                 if (srv != null) {
-                                                    Toast.makeText(this@MainActivity, "正在从柠檬音乐同步全量曲库...", Toast.LENGTH_SHORT).show()
+                                                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "正在从柠檬音乐同步全量曲库...", Toast.LENGTH_SHORT).show()
                                                     syncServerSongs(srv)
                                                     refreshServerFavorites()
                                                 } else {
-                                                    Toast.makeText(this@MainActivity, "当前为本地音源模式（服务器离线或已删除）", Toast.LENGTH_SHORT).show()
+                                                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "当前为本地音源模式（服务器离线或已删除）", Toast.LENGTH_SHORT).show()
                                                 }
                                             },
                                             onOpenDownloads = { navigateToScreen(Screen.DOWNLOADS) },
@@ -2920,13 +3316,13 @@ class MainActivity : ComponentActivity() {
                                                     proto?.getPlaylistSongs(collectionId)?.getOrNull().orEmpty()
                                                 }
                                             },
-                                            onSubViewActiveChange = { isChildSubViewActive = it },
+                                            onSubViewActiveChange = { subViewActiveByPage[Screen.HOME.name] = it },
                                             contentPadding = innerPadding
                                         )
                                     } else {
                                         LocalMusicHomeScreen(
                                             serverName = activeServerName,
-                                            recentSongs = remember(songList) { deduplicateLocalSongs(songList) },
+                                            recentSongs = remember(songList) { LocalSongsDedupeCache.get(songList) },
                                             configuredServers = serversList,
                                                                 recentlyAddedSongs = recentlyAddedSongs,
                                             recentlyPlayedSongs = recentlyPlayedSongs,
@@ -2959,11 +3355,11 @@ class MainActivity : ComponentActivity() {
                                             onSyncNow = {
                                                 val active = serversList.firstOrNull { it.isCurrentActive }
                                                 if (active != null) {
-                                                    Toast.makeText(this@MainActivity, "正在从柠檬音乐同步曲库与收藏...", Toast.LENGTH_SHORT).show()
+                                                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "正在从柠檬音乐同步曲库与收藏...", Toast.LENGTH_SHORT).show()
                                                     syncServerSongs(active)
                                                     refreshServerFavorites()
                                                 } else {
-                                                    Toast.makeText(this@MainActivity, "当前为本地模式，可前往设置扫描本地文件", Toast.LENGTH_SHORT).show()
+                                                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "当前为本地模式，可前往设置扫描本地文件", Toast.LENGTH_SHORT).show()
                                                 }
                                             },
                                             onOpenDownloads = {
@@ -2978,7 +3374,7 @@ class MainActivity : ComponentActivity() {
                                             onScanLocalMedia = {
                                                 navigateToScreen(Screen.SETTINGS)
                                             },
-                                            onSubViewActiveChange = { isChildSubViewActive = it },
+                                            onSubViewActiveChange = { subViewActiveByPage[Screen.HOME.name] = it },
                                             contentPadding = innerPadding
                                         )
                                     }
@@ -2990,7 +3386,10 @@ class MainActivity : ComponentActivity() {
                                     val libraryServerLost = com.lm.player.core.source.ServerPresence.mode.collectAsState().value == com.lm.player.core.source.ServerPresence.Mode.OFFLINE
                                     val isLocalMode = activeServerName.contains("本地") || activeServerName.contains("已下载") || libraryServerLost
                                     val activeConfig = if (isLocalMode) null else (serversList.firstOrNull { it.isCurrentActive } ?: serversList.firstOrNull())
-                                    val librarySongs = remember(songList, completedDownloadedSongs, activeConfig, isLocalMode) {
+                                    // 切页提速：这一整段（全库过滤 + 按路径 / 歌名歌手去重）原先每次进「我的」都在主线程重算，
+                                    // 而且每次都产出新列表，导致资料库页的歌手 / 专辑 / 文件夹统计也跟着整库重算。
+                                    // 现在按输入实例缓存：曲库与下载列表没变化时，切回「我的」直接复用同一份结果。
+                                    val librarySongs = remember(songList, completedDownloadedSongs, activeConfig, isLocalMode) { LibrarySongsCache.get(songList, completedDownloadedSongs, activeConfig, isLocalMode) {
                                         if (isLocalMode || activeConfig == null) {
                                             val rawLocal = songList.filter {
                                                 it.downloadStatus == DownloadStatus.DOWNLOADED ||
@@ -3112,7 +3511,7 @@ class MainActivity : ComponentActivity() {
                                             }
                                             byTitleArtist.values.flatten().distinctBy { it.id }
                                         }
-                                    }
+                                    } } // LibrarySongsCache
                                     // 「我喜欢的音乐」的数据口径：
                                     //   在线模式 —— 直接以柠檬服务器收藏为准，能对上库内曲目的用库内数据，其余沿用服务器记录；
                                     //   本地/已下载 —— 从服务器收藏中枚举出"已下载"的曲目，没下载的不显示。
@@ -3183,12 +3582,12 @@ class MainActivity : ComponentActivity() {
                                         onSyncNow = {
                                             val active = serversList.firstOrNull { it.isCurrentActive } ?: serversList.firstOrNull()
                                             if (active != null) {
-                                                Toast.makeText(this@MainActivity, "正在从柠檬音乐同步曲库与收藏...", Toast.LENGTH_SHORT).show()
+                                                com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "正在从柠檬音乐同步曲库与收藏...", Toast.LENGTH_SHORT).show()
                                                 syncServerPlaylists(active)
                                                 syncServerSongs(active)
                                                 refreshServerFavorites()
                                             } else {
-                                                Toast.makeText(this@MainActivity, "当前为本地模式，可前往设置扫描本地文件", Toast.LENGTH_SHORT).show()
+                                                com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "当前为本地模式，可前往设置扫描本地文件", Toast.LENGTH_SHORT).show()
                                             }
                                         },
                                         onGoToSettings = { navigateToScreen(Screen.SETTINGS) },
@@ -3209,7 +3608,7 @@ class MainActivity : ComponentActivity() {
                                             if (activeConfig != null) {
                                                 syncServerPlaylists(activeConfig)
                                             } else {
-                                                Toast.makeText(this@MainActivity, "当前处于本地模式，暂无在线歌单", Toast.LENGTH_SHORT).show()
+                                                com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "当前处于本地模式，暂无在线歌单", Toast.LENGTH_SHORT).show()
                                             }
                                         },
                                         onCreatePlaylist = { name, isOnline ->
@@ -3274,6 +3673,58 @@ class MainActivity : ComponentActivity() {
                                                 }
                                             }
                                         },
+                                        // 2026-11-13：把歌曲移出歌单。服务器歌单先改服务器（失败就整体失败、界面不动），
+                                        // 再删本机的关联记录（否则下次打开歌单时本机记录又把它合并回来）
+                                        onRemoveSongsFromPlaylist = { playlistId, isOnline, songsToRemove, onProgress ->
+                                            if (playlistId == "lemon_favorites") {
+                                                // 「我的收藏」移出 = 取消收藏：走收藏按钮同一条全链路（本机 + 服务器）
+                                                withContext(Dispatchers.Main) {
+                                                    songsToRemove.forEach { handleToggleFavorite(it.copy(isFavorite = true)) }
+                                                }
+                                                onProgress(1f, "完成")
+                                                Result.success(songsToRemove.size)
+                                            } else withContext(Dispatchers.IO) {
+                                                try {
+                                                    val serverConfig = activeConfig
+                                                        ?: serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
+                                                        ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
+                                                    if (isOnline) {
+                                                        if (serverConfig == null) {
+                                                            return@withContext Result.failure(Exception("没有连接服务器，不能修改服务器歌单"))
+                                                        }
+                                                        val protocol = LemonMusicProtocol(
+                                                            NetworkClientFactory.createOkHttpClient(this@MainActivity),
+                                                            serverConfig.serverUrl,
+                                                            serverConfig.username,
+                                                            serverConfig.tokenOrApiKey
+                                                        )
+                                                        val res = protocol.removeTracksFromCustomPlaylist(playlistId, songsToRemove) { f, step ->
+                                                            onProgress(f * 0.85f, step)
+                                                        }
+                                                        if (res.isFailure) {
+                                                            return@withContext Result.failure(res.exceptionOrNull() ?: Exception("移出失败"))
+                                                        }
+                                                    }
+                                                    val localStart = if (isOnline) 0.85f else 0.05f
+                                                    songsToRemove.forEachIndexed { i, s ->
+                                                        database.playlistDao().removeSongFromPlaylist(playlistId, s.id)
+                                                        onProgress(localStart + (1f - localStart) * (i + 1) / songsToRemove.size, "更新本机记录 ${i + 1}/${songsToRemove.size}")
+                                                    }
+                                                    if (isOnline) {
+                                                        // 歌曲数 / 封面以服务器为准：重新同步歌单列表
+                                                        serverConfig?.let { syncServerPlaylists(it) }
+                                                    } else {
+                                                        database.playlistDao().updateSongCount(playlistId)
+                                                    }
+                                                    Result.success(songsToRemove.size)
+                                                } catch (e: kotlinx.coroutines.CancellationException) {
+                                                    throw e
+                                                } catch (e: Exception) {
+                                                    Log.w("MainActivity", "remove songs from playlist failed", e)
+                                                    Result.failure(e)
+                                                }
+                                            }
+                                        },
                                         onFetchPlaylistSongs = { playlistId, isOnline ->
                                             withContext(Dispatchers.IO) {
                                                 val localMapped = database.playlistDao().getSongsForPlaylist(playlistId).map { entity ->
@@ -3330,6 +3781,8 @@ class MainActivity : ComponentActivity() {
                                                     activeTasks = activeDownloadTasksState.value,
                                                     downloadDir = downloadEngine.getDownloadDir()
                                                 )
+                                                // 登记这个歌单里有哪些歌：从它播放的歌在「加入歌单」里显示已加入（服务器歌单不进本地表）
+                                                com.lm.player.core.designsystem.component.PlaylistMembership.record(playlistId, rawList + resolved)
                                                 if (isLocalMode) {
                                                     resolved.filter { s ->
                                                         s.downloadStatus == DownloadStatus.DOWNLOADED ||
@@ -3396,7 +3849,7 @@ class MainActivity : ComponentActivity() {
                                                 syncServerSongs(activeConfig)
                                             }
                                         },
-                                        onSubViewActiveChange = { isChildSubViewActive = it },
+                                        onSubViewActiveChange = { subViewActiveByPage["mine"] = it },
                                         contentPadding = innerPadding
                                     )
                                 }
@@ -3428,18 +3881,18 @@ class MainActivity : ComponentActivity() {
                                             lifecycleScope.launch(Dispatchers.IO) {
                                                 val ok = downloadEngine.reEmbedSongMetadata(songToFix)
                                                 withContext(Dispatchers.Main) {
-                                                    Toast.makeText(this@MainActivity, if (ok) "已成功为《${songToFix.title}》重新嵌入封面与歌词" else "重新嵌入失败，文件未找到", Toast.LENGTH_SHORT).show()
+                                                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, if (ok) "已成功为《${songToFix.title}》重新嵌入封面与歌词" else "重新嵌入失败，文件未找到", Toast.LENGTH_SHORT).show()
                                                 }
                                             }
                                         },
                                         onReEmbedAll = {
                                             lifecycleScope.launch(Dispatchers.IO) {
                                                 withContext(Dispatchers.Main) {
-                                                    Toast.makeText(this@MainActivity, "正在批量为所有已下载歌曲补全封面与歌词标签...", Toast.LENGTH_SHORT).show()
+                                                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "正在批量为所有已下载歌曲补全封面与歌词标签...", Toast.LENGTH_SHORT).show()
                                                 }
                                                 val (success, fail) = downloadEngine.reEmbedAllDownloadedSongs()
                                                 withContext(Dispatchers.Main) {
-                                                    Toast.makeText(this@MainActivity, "标签补全完成：成功 $success 首，失败 $fail 首", Toast.LENGTH_LONG).show()
+                                                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "标签补全完成：成功 $success 首，失败 $fail 首", Toast.LENGTH_LONG).show()
                                                 }
                                             }
                                         },
@@ -3474,14 +3927,14 @@ class MainActivity : ComponentActivity() {
                                             if (pathChanged) {
                                                 lifecycleScope.launch(Dispatchers.IO) {
                                                     withContext(Dispatchers.Main) {
-                                                        Toast.makeText(this@MainActivity, "正在扫描离线目录并与线上曲库比对同步...", Toast.LENGTH_SHORT).show()
+                                                        com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "正在扫描离线目录并与线上曲库比对同步...", Toast.LENGTH_SHORT).show()
                                                     }
                                                     // 1. 递归扫描该离线目录中的所有音频文件
                                                     val scanned = LocalMediaScanner.scanCustomDirectory(this@MainActivity, newSettings.customDownloadPath, database)
                                                     // 2. 与线上曲库进行物理文件真实性对比与同步
                                                     val updated = LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, java.io.File(newSettings.customDownloadPath))
                                                     withContext(Dispatchers.Main) {
-                                                        Toast.makeText(this@MainActivity, "离线目录同步完成：扫描 $scanned 首，匹配同步 $updated 首", Toast.LENGTH_LONG).show()
+                                                        com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "离线目录同步完成：扫描 $scanned 首，匹配同步 $updated 首", Toast.LENGTH_LONG).show()
                                                     }
                                                 }
                                             }
@@ -3524,7 +3977,7 @@ class MainActivity : ComponentActivity() {
                                             // 只写凭据保护的 prefs 会让开机早期读回默认 false
                                             BootCompletedReceiver.setAutoLaunchOnBootEnabled(this@MainActivity, isEnabled)
                                             if (isEnabled) {
-                                                Toast.makeText(
+                                                com.lm.player.core.designsystem.component.AppToast.makeText(
                                                     this@MainActivity,
                                                     "已开启开机自启动，若盒子上不生效请在系统安全中心放行本应用的自启动",
                                                     Toast.LENGTH_LONG
@@ -3551,7 +4004,7 @@ class MainActivity : ComponentActivity() {
                                                 activeSong.downloadStatus != DownloadStatus.DOWNLOADED
                                             ) {
                                                 val resumePos = (exoPlayer?.currentPosition ?: 0L).coerceAtLeast(0L)
-                                                Toast.makeText(this@MainActivity, "试听音质已更新，正在按新音质无缝重载当前歌曲...", Toast.LENGTH_SHORT).show()
+                                                com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "试听音质已更新，正在按新音质无缝重载当前歌曲...", Toast.LENGTH_SHORT).show()
                                                 PlaybackQueueManager.playSong(
                                                     targetSong = activeSong,
                                                     context = this@MainActivity,
@@ -3617,6 +4070,8 @@ class MainActivity : ComponentActivity() {
                                                 database.songDao().migrateDownloadedSongsToLocal(serverIdToDelete)
                                                 database.songDao().deleteSongsByServer(serverIdToDelete)
                                                 database.playlistDao().deletePlaylistsByServer(serverIdToDelete)
+                                                // 服务器歌曲加速表：这台服务器的平台对应、歌词、平台封面一并删掉
+                                                com.lm.player.core.source.ServerTrackAccelStore.deleteForServer(serverIdToDelete)
                                             }
                                             if (activeServerId == serverIdToDelete) {
                                                 activeServerName = "本地 · 已下载"
@@ -3644,20 +4099,20 @@ class MainActivity : ComponentActivity() {
                                                         customDownloadTreeUri = treeUriStr
                                                     )
                                                     downloadEngine.updateSettings(updated)
-                                                    Toast.makeText(this@MainActivity, "已成功设定并验证下载存储目录：$resolvedPath", Toast.LENGTH_SHORT).show()
+                                                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "已成功设定并验证下载存储目录：$resolvedPath", Toast.LENGTH_SHORT).show()
                                                     if (resolvedPath.isNotBlank()) {
                                                         lifecycleScope.launch(Dispatchers.IO) {
                                                             val scanned = LocalMediaScanner.scanCustomDirectory(this@MainActivity, resolvedPath, database)
                                                             val matched = LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, java.io.File(resolvedPath))
                                                             if (scanned > 0 || matched > 0) {
                                                                 withContext(Dispatchers.Main) {
-                                                                    Toast.makeText(this@MainActivity, "离线目录同步完成：扫描 $scanned 首，匹配 $matched 首", Toast.LENGTH_LONG).show()
+                                                                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "离线目录同步完成：扫描 $scanned 首，匹配 $matched 首", Toast.LENGTH_LONG).show()
                                                                 }
                                                             }
                                                         }
                                                     }
                                                 } else {
-                                                    Toast.makeText(
+                                                    com.lm.player.core.designsystem.component.AppToast.makeText(
                                                         this@MainActivity,
                                                         StoragePermissionHelper.explainWriteFailure(this@MainActivity, resolvedPath),
                                                         Toast.LENGTH_LONG
@@ -3702,7 +4157,7 @@ class MainActivity : ComponentActivity() {
                                                     val matched = LocalMediaScanner.verifyAndSyncAllServerSongDownloadStatus(database, dlDir)
                                                     LocalMediaScanner.matchAndMergeLocalWithServer(database)
                                                     withContext(Dispatchers.Main) {
-                                                        Toast.makeText(this@MainActivity, "扫描完成！成功导入 $count 首本地歌曲，比对匹配 $matched 首服务器歌曲已标为本地已下载", Toast.LENGTH_LONG).show()
+                                                        com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "扫描完成！成功导入 $count 首本地歌曲，比对匹配 $matched 首服务器歌曲已标为本地已下载", Toast.LENGTH_LONG).show()
                                                     }
                                                 }
                                             }
@@ -3715,7 +4170,7 @@ class MainActivity : ComponentActivity() {
                                                         false
                                                     }
                                                 if (!launched) {
-                                                    Toast.makeText(this@MainActivity, "本机没有系统文件夹选择器，已改用内置选择器", Toast.LENGTH_SHORT).show()
+                                                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "本机没有系统文件夹选择器，已改用内置选择器", Toast.LENGTH_SHORT).show()
                                                     showCustomFolderPickerForImport = true
                                                 }
                                             }
@@ -3738,6 +4193,7 @@ class MainActivity : ComponentActivity() {
                             // page/limit 透传给服务端，由服务端做翻页；一页拉满即认为还有下一页。
                             // 搜索：本地音源可用时本地优先（不经服务器），本地无结果且服务器未离线时服务器兜底；都不可用时不提供在线搜索
                             val localSearchReady = com.lm.player.core.source.SourceAccelerationSession.status.collectAsState().value.isReady ||
+                                com.lm.player.core.source.SourceAccelerationController.scriptsCached.collectAsState().value ||
                                 com.lm.player.core.source.catalog.OfflineCatalogService.isAvailable()
                             val onlineSearchCallback: (suspend (String, OnlineMusicSource, Int, Int) -> List<UnifiedSong>)? = remember(activeServer, localSearchReady) {
                                 val srv = activeServer
@@ -3807,7 +4263,7 @@ class MainActivity : ComponentActivity() {
                                         false
                                     }
                                     if (!launched) {
-                                        Toast.makeText(this@MainActivity, "系统文件夹选择器无法打开，已改用内置选择器", Toast.LENGTH_SHORT).show()
+                                        com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "系统文件夹选择器无法打开，已改用内置选择器", Toast.LENGTH_SHORT).show()
                                         openAllFilesAccessSettingsIfNeeded()
                                         showCustomFolderPickerForDownload = true
                                     }
@@ -3852,9 +4308,9 @@ class MainActivity : ComponentActivity() {
                                                 customDownloadTreeUri = ""
                                             )
                                             downloadEngine.updateSettings(updated)
-                                            Toast.makeText(this@MainActivity, "已成功设定并保存下载存储目录：$selectedPath", Toast.LENGTH_SHORT).show()
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "已成功设定并保存下载存储目录：$selectedPath", Toast.LENGTH_SHORT).show()
                                         } else {
-                                            Toast.makeText(
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(
                                                 this@MainActivity,
                                                 StoragePermissionHelper.explainWriteFailure(this@MainActivity, selectedPath),
                                                 Toast.LENGTH_LONG
@@ -3863,7 +4319,7 @@ class MainActivity : ComponentActivity() {
                                     } else {
                                         val updated = downloadEngine.downloadSettings.value.copy(customDownloadPath = "", customDownloadTreeUri = "")
                                         downloadEngine.updateSettings(updated)
-                                        Toast.makeText(this@MainActivity, "已恢复为默认应用私有下载目录", Toast.LENGTH_SHORT).show()
+                                        com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "已恢复为默认应用私有下载目录", Toast.LENGTH_SHORT).show()
                                     }
                                 }
                             )
@@ -3887,7 +4343,7 @@ class MainActivity : ComponentActivity() {
                                             val dlDir = downloadEngine.getDownloadDir()
                                             withContext(Dispatchers.Main) {
                                                 if (com.lm.player.core.media.LocalScanEngine.start(this@MainActivity, listOf(selectedPath), includeMediaStore = false, downloadDir = dlDir)) {
-                                                    Toast.makeText(this@MainActivity, "已添加扫描目录，正在后台扫描，进度见「本地音乐路径」", Toast.LENGTH_SHORT).show()
+                                                    com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "已添加扫描目录，正在后台扫描，进度见「本地音乐路径」", Toast.LENGTH_SHORT).show()
                                                 }
                                             }
                                         }
@@ -3985,16 +4441,16 @@ class MainActivity : ComponentActivity() {
                                 mutableStateOf(uiPrefs.getFloat("playback_speed", 1.0f).coerceIn(0.5f, 2.0f))
                             }
 
-                            FullscreenPlayerSheet(
+                            // 2026-11-12 播放页重做：三个主题（黑胶唱片 / 大字歌词 / 全屏封面 + 歌词）+ 共用控制胶囊，
+                            // 歌词改用手机端移植的歌词引擎（见 feature/player/tv）
+                            com.lm.player.feature.player.tv.TvPlayerScreen(
                                 song = song,
                                 playlist = currentQueue.ifEmpty { songList },
                                 isPlaying = isPlaying,
-                                // 同样以取数函数传入：值在这里被读取会让整个 Activity 组合树
-                                // 每 0.4~0.8 秒重组一次 (含底层脚手架)，即使全屏播放页就在最上层
+                                // 以取数函数传入：值在这里被读取会让整个 Activity 组合树每 0.4~0.8 秒重组一次
                                 progressMsProvider = { localProgressMs },
                                 totalDurationMs = localTotalDurationMs,
                                 lyrics = currentLyrics,
-                                isLyricsMode = isLyricsMode,
                                 isShuffle = isShuffle,
                                 isRepeat = isRepeat,
                                 allPlaylists = playlistsList,
@@ -4009,22 +4465,25 @@ class MainActivity : ComponentActivity() {
                                 onSelectSongFromQueue = { queueSong ->
                                     playSongWithQueue(queueSong, currentQueue.ifEmpty { songList })
                                 },
-                                onToggleLyricsMode = { isLyricsMode = it },
                                 onToggleFavorite = {
                                     handleToggleFavorite(song)
                                 },
-                                onToggleShuffle = { PlaybackQueueManager.setShuffle(!isShuffle) },
-                                onToggleRepeat = { PlaybackQueueManager.setRepeat(!isRepeat) },
-                                onDownloadSong = handleDownloadSong,
                                 onDownloadSongWithOptions = handleDownloadWithOptions,
                                 onAddToPlaylist = handleAddToPlaylist,
                                 onCreatePlaylistAndAddSong = handleCreatePlaylistAndAddSong,
                                 onPlayerThemeStyleChange = { playerThemeStyle = it },
                                 onCoversBackgroundChanged = { fullPlayerSheetCovering = it },
-                                onDismiss = { isFullPlayerVisible = false }
+                                onDismiss = { isFullPlayerVisible = false },
+                                downloadTasks = downloadEngine.activeTasksFlow
                             )
                         }
                     }
+
+                    // 全软件统一的系统提示气泡（顶部居中，盖在全屏播放页之上；见 AppToast）
+                    com.lm.player.core.designsystem.component.AppToastHost()
+
+                    // 多选「加入歌单」的选择 / 进度 / 结果窗口（2026-11-14，所有列表共用）
+                    com.lm.player.core.designsystem.component.PlaylistBatchOpsHost()
 
                     // 启动 Logo 过渡动画图层 (开屏丝滑淡出)
                     SplashScreenView(
@@ -4036,6 +4495,8 @@ class MainActivity : ComponentActivity() {
                     var lastCrashReport by remember { mutableStateOf<String?>(null) }
                     LaunchedEffect(Unit) {
                         // 读崩溃日志是磁盘 I/O，放到 IO 线程避免首帧期间阻塞 UI
+                        // 先等启动时的「上次异常退出」检查做完（最多 1.5 秒）：没有 Java 崩溃日志的闪退也能弹出来
+                        com.lm.player.core.util.ExitDiagnostics.awaitStartupCheck()
                         lastCrashReport = withContext(Dispatchers.IO) {
                             CrashLogger.pendingReport(this@MainActivity)
                         }
@@ -4062,7 +4523,7 @@ class MainActivity : ComponentActivity() {
                             onDismiss = { showStartupUpdateDialog = false },
                             onNeverUpdate = {
                                 AppUpdateManager.setSkipVersion(this@MainActivity, info.latestVersion)
-                                Toast.makeText(this@MainActivity, "已记录，不再提示 v${info.latestVersion} 更新", Toast.LENGTH_SHORT).show()
+                                com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "已记录，不再提示 v${info.latestVersion} 更新", Toast.LENGTH_SHORT).show()
                                 showStartupUpdateDialog = false
                             },
                             onStartDownload = {
@@ -4082,11 +4543,11 @@ class MainActivity : ComponentActivity() {
                                             isDownloadingStartupApk = false
                                             downloadedStartupApkFile = apkFile
                                             isStartupApkReady = apkFile.exists() && apkFile.length() > 0L
-                                            Toast.makeText(this@MainActivity, "安装包下载完成，正在调起安装...", Toast.LENGTH_SHORT).show()
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "安装包下载完成，正在调起安装...", Toast.LENGTH_SHORT).show()
                                             AppUpdateManager.installApk(this@MainActivity, apkFile)
                                         }.onFailure { error ->
                                             isDownloadingStartupApk = false
-                                            Toast.makeText(this@MainActivity, "下载更新失败: ${error.message}", Toast.LENGTH_LONG).show()
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(this@MainActivity, "下载更新失败: ${error.message}", Toast.LENGTH_LONG).show()
                                         }
                                     }
                                 }
@@ -4173,7 +4634,7 @@ class MainActivity : ComponentActivity() {
         try {
             settingsPrefs.edit().putString(PLATFORM_MODE_PREF_KEY, PlatformMode.TV.key).apply()
             platformModeState.value = PlatformMode.TV
-            Toast.makeText(this, "已通过长按返回键切回「电视 / 机顶盒」模式，遥控器已恢复", Toast.LENGTH_LONG).show()
+            com.lm.player.core.designsystem.component.AppToast.makeText(this, "已通过长按返回键切回「电视 / 机顶盒」模式，遥控器已恢复", Toast.LENGTH_LONG).show()
         } catch (e: Throwable) {
             e.printStackTrace()
         }
@@ -4273,6 +4734,7 @@ class MainActivity : ComponentActivity() {
             KeyEvent.KEYCODE_CHANNEL_UP,
             KeyEvent.KEYCODE_NAVIGATE_NEXT,
             KeyEvent.KEYCODE_PAGE_DOWN -> {
+                com.lm.player.core.media.SkipLatencyStats.noteSource("方向盘 / 媒体按键")
                 PlaybackQueueManager.playNext(this@MainActivity)
                 return true
             }
@@ -4284,6 +4746,7 @@ class MainActivity : ComponentActivity() {
             KeyEvent.KEYCODE_CHANNEL_DOWN,
             KeyEvent.KEYCODE_NAVIGATE_PREVIOUS,
             KeyEvent.KEYCODE_PAGE_UP -> {
+                com.lm.player.core.media.SkipLatencyStats.noteSource("方向盘 / 媒体按键")
                 PlaybackQueueManager.playPrevious(this@MainActivity)
                 return true
             }
@@ -4362,11 +4825,39 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         com.lm.player.core.widget.WidgetLaunch.consume(intent)
+        // 语音点歌：应用已在运行时收到「播放某某」的意图
+        com.lm.player.core.voice.VoicePlayRouter.consumeIntent(this, intent)
+    }
+
+    /** 播放页是否要求隐藏状态栏（窗口重新获得焦点时据此补一次，部分系统会在弹窗 / 下拉通知后把状态栏放回来） */
+    private var playerStatusBarHidden = false
+
+    private fun applyPlayerStatusBar(hide: Boolean) {
+        playerStatusBarHidden = hide
+        runCatching {
+            val controller = androidx.core.view.WindowCompat.getInsetsController(window, window.decorView)
+            if (hide) {
+                // 从屏幕顶部下滑可临时呼出，过一会儿自动收起
+                controller.systemBarsBehavior =
+                    androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                controller.hide(androidx.core.view.WindowInsetsCompat.Type.statusBars())
+            } else {
+                controller.show(androidx.core.view.WindowInsetsCompat.Type.statusBars())
+            }
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && playerStatusBarHidden) applyPlayerStatusBar(true)
     }
 
     override fun onResume() {
         super.onResume()
         volumeControlStream = android.media.AudioManager.STREAM_MUSIC
+        // 闪退诊断：记下「界面在前台」，下次启动时据此判断上次是不是在前台时突然没了
+        com.lm.player.core.util.ExitDiagnostics.markForeground(this, true)
+        com.lm.player.core.media.SkipLatencyStats.appInForeground = true
     }
 
     /**
@@ -4388,6 +4879,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         persistPlaybackStateSync()
+        com.lm.player.core.util.ExitDiagnostics.markForeground(this, false)
+        com.lm.player.core.media.SkipLatencyStats.appInForeground = false
         super.onStop()
     }
 
@@ -4451,6 +4944,17 @@ class MainActivity : ComponentActivity() {
         return try {
             super.dispatchKeyEvent(event)
         } catch (e: IllegalStateException) {
+            // Compose 1.6 焦点树失配兜底（2026-11-13，小米 Android 15 实测崩溃）：
+            // 焦点树里根节点记着「有子节点持有焦点」(ActiveParent)，却找不到真正持焦点的节点，
+            // 此后**任何**按键（方向键、确定、音量）进到 Compose 都会抛
+            // "Event can't be processed because we do not have an active focus target."。
+            // Compose 1.7 起改为直接记录持焦节点，不再有这种状态；1.6 只能在这里修复：
+            // 让持焦的 ComposeView 先失焦再取回焦点，根节点被重置成「自己持有焦点」，
+            // 然后把这次按键重新派发一次（方向键因此照常把光标移进界面，不用多按一下）。
+            if (e.message?.contains("active focus target", ignoreCase = true) == true) {
+                android.util.Log.w("MainActivity", "Recovering Compose focus tree with no active target (key=${event.keyCode})")
+                return recoverComposeFocusAndRedispatch(event)
+            }
             // Compose 焦点系统缺陷兜底：在歌曲列表等 LazyColumn 快速移动或到达顶部边界时，
             // Compose 内部 2D 焦点查找算法访问了正在 detached 的 LayoutCoordinates 节点，
             // 会抛出 "LayoutCoordinate operations are only valid when isAttached is true"。
@@ -4470,6 +4974,25 @@ class MainActivity : ComponentActivity() {
             } else {
                 throw e
             }
+        }
+    }
+
+    /** 见 [safeSuperDispatchKeyEvent]：重置 Compose 焦点根节点后重发一次按键；仍失败就吞掉这一次，绝不让进程崩溃 */
+    private fun recoverComposeFocusAndRedispatch(event: KeyEvent): Boolean {
+        val focused = window?.decorView?.findFocus()
+        if (focused != null) {
+            runCatching {
+                // 失焦：Compose releaseFocus 强制清空整棵焦点树（失配的 ActiveParent 也能清掉）；
+                // 取回：takeFocus 让根节点自己持有焦点 —— 与 focusManager.clearFocus() 之后的状态相同
+                focused.clearFocus()
+                if (!focused.isFocused) focused.requestFocus()
+            }
+        }
+        return try {
+            super.dispatchKeyEvent(event)
+        } catch (e: RuntimeException) {
+            android.util.Log.w("MainActivity", "Compose focus recovery failed, key swallowed: ${e.message}")
+            true
         }
     }
 
@@ -4527,6 +5050,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        com.lm.player.core.startup.FrameStats.detach(this)
         // 必须先摘掉换绑回调：Media3Factory 的监听列表是进程级静态的，
         // 不移除会让旧 Activity 一直被持有
         try { Media3Factory.removePlayerSwapListener(playerSwapListener) } catch (_: Exception) {}
@@ -4569,6 +5093,55 @@ private suspend fun resolveDownloadUrlFor(
     } catch (e: Exception) {
         Log.w("MainActivity", "Resolve download stream failed for ${song.title}", e)
         null
+    }
+}
+
+/**
+ * 切页提速：去重结果按曲库列表实例缓存。曲库只在数据库变化时才换新列表，
+ * 每次切回首页 / 资料库不再整库重新去重（原先每次进页都在主线程重算一遍）。
+ */
+private object LocalSongsDedupeCache {
+    private var input: List<UnifiedSong>? = null
+    private var output: List<UnifiedSong> = emptyList()
+
+    @Synchronized
+    fun get(list: List<UnifiedSong>): List<UnifiedSong> {
+        if (list === input) return output
+        val result = deduplicateLocalSongs(list)
+        input = list
+        output = result
+        return result
+    }
+}
+
+/**
+ * 切页提速：「我的」页曲库列表按输入实例缓存（曲库列表、已下载列表按实例比较，服务器配置与模式按值比较）。
+ */
+private object LibrarySongsCache {
+    private var songsRef: List<UnifiedSong>? = null
+    private var downloadsRef: List<UnifiedSong>? = null
+    private var configKey: ServerConfig? = null
+    private var localModeKey: Boolean? = null
+    private var output: List<UnifiedSong> = emptyList()
+
+    @Synchronized
+    fun get(
+        songs: List<UnifiedSong>,
+        downloads: List<UnifiedSong>,
+        config: ServerConfig?,
+        localMode: Boolean,
+        compute: () -> List<UnifiedSong>
+    ): List<UnifiedSong> {
+        if (songs === songsRef && downloads === downloadsRef && config == configKey && localMode == localModeKey) {
+            return output
+        }
+        val result = compute()
+        songsRef = songs
+        downloadsRef = downloads
+        configKey = config
+        localModeKey = localMode
+        output = result
+        return result
     }
 }
 

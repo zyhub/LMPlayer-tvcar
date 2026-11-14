@@ -17,6 +17,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -501,7 +502,7 @@ fun DownloadManagerScreen(
                         ) {
                             itemsIndexed(
                                 items = activeTasks,
-                                key = { index, task -> "active_dl_${index}_${task.song.id}" },
+                                key = { index, _ -> com.lm.player.core.designsystem.component.StableListKeys.keyAt(activeTasks, index, "active_dl_") { it.song.id } },
                                 contentType = { _, _ -> "active_download_task" }
                             ) { _, task ->
                                 val isSelected = task.song.id in selectedActiveTaskIds
@@ -712,7 +713,7 @@ fun DownloadManagerScreen(
 
                         itemsIndexed(
                             items = completedSongs,
-                            key = { index, song -> "done_dl_${index}_${song.id}" },
+                            key = { index, _ -> com.lm.player.core.designsystem.component.StableListKeys.keyAt(completedSongs, index, "done_dl_") { it.id } },
                             contentType = { _, _ -> "completed_download_song" }
                         ) { _, song ->
                             val isSelected = song.id in selectedSongIds
@@ -879,6 +880,31 @@ fun DownloadManagerScreen(
                     }
 
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        // 多选「加入歌单」（2026-11-14，与其它列表一致）
+                        OutlinedButton(
+                            onClick = {
+                                com.lm.player.core.designsystem.component.PlaylistBatchOps.startAdd(context, selectedSongs) {
+                                    selectedSongIds.clear()
+                                    isMultiSelectMode = false
+                                }
+                            },
+                            enabled = selectedSongIds.isNotEmpty(),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, borderColor),
+                            modifier = Modifier.tvButtonFocusable(
+                                shape = RoundedCornerShape(12.dp),
+                                focusedBorderColor = Color(0xFFFFD60A)
+                            )
+                        ) {
+                            Icon(
+                                androidx.compose.material.icons.Icons.AutoMirrored.Filled.PlaylistAdd,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                                tint = MaterialTheme.colorScheme.onSurface
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("加入歌单 (${selectedSongIds.size})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                        }
                         Button(
                             onClick = { showBatchDeleteConfirmDialog = true },
                             enabled = selectedSongIds.isNotEmpty(),
@@ -986,11 +1012,11 @@ fun DownloadManagerScreen(
             coroutineScope.launch {
                 block()
                     .onSuccess {
-                        Toast.makeText(context, successMsg, Toast.LENGTH_SHORT).show()
+                        com.lm.player.core.designsystem.component.AppToast.makeText(context, successMsg, Toast.LENGTH_SHORT).show()
                         refreshServerDownloads()
                     }
                     .onFailure {
-                        Toast.makeText(context, "处理失败: ${it.message}", Toast.LENGTH_SHORT).show()
+                        com.lm.player.core.designsystem.component.AppToast.makeText(context, "处理失败: ${it.message}", Toast.LENGTH_SHORT).show()
                         refreshServerDownloads()
                     }
             }
@@ -1358,7 +1384,7 @@ fun DownloadManagerScreen(
                                 if (p.isNotBlank()) {
                                     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                                     cm.setPrimaryClip(ClipData.newPlainText("FilePath", p))
-                                    Toast.makeText(context, "已复制完整路径到剪贴板", Toast.LENGTH_SHORT).show()
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已复制完整路径到剪贴板", Toast.LENGTH_SHORT).show()
                                 }
                             },
                             shape = RoundedCornerShape(12.dp),
@@ -1591,9 +1617,8 @@ private fun CompletedDownloadSongRow(
     onDelete: () -> Unit,
     onShowDetails: () -> Unit
 ) {
-    val (realExt, realBitRate, realSize) = remember(song.id, song.localFilePath, song.format, song.bitRate, song.durationMs) {
-        com.lm.player.feature.home.resolveRealLocalFormatAndSize(song)
-    }
+    // 性能优化第 5 项：读文件属性 / 文件头放到 IO 线程，先显示内存里的上次结果或估算
+    val (realExt, realBitRate, realSize) = com.lm.player.feature.home.rememberRealLocalSpecs(song)
     Surface(
         shape = RoundedCornerShape(14.dp),
         color = if (isSelected) AppleRed.copy(alpha = 0.08f) else MaterialTheme.colorScheme.surface,

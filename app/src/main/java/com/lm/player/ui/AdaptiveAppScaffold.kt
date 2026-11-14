@@ -22,6 +22,8 @@ import androidx.compose.foundation.focusable
 import com.lm.player.core.designsystem.component.TvFocusScope
 import com.lm.player.core.designsystem.component.RecomposeIsolation
 import androidx.compose.runtime.*
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -65,7 +67,6 @@ import com.lm.player.core.model.Screen
 import com.lm.player.core.model.ServerConfig
 import com.lm.player.core.model.UnifiedSong
 import com.lm.player.core.network.LemonMusicProtocol
-import com.lm.player.feature.player.LyricsScrollingView
 import kotlinx.coroutines.isActive
 import java.util.Locale
 
@@ -122,14 +123,30 @@ fun AdaptiveAppScaffold(
     content: @Composable (PaddingValues) -> Unit
 ) {
     val dimensions = LocalAppDimensions.current
+    val mineTabFocusRequester = remember { FocusRequester() }
+    val searchTabFocusRequester = remember { FocusRequester() }
     val discoverTabFocusRequester = remember { FocusRequester() }
+    val podcastTabFocusRequester = remember { FocusRequester() }
+    val settingsTabFocusRequester = remember { FocusRequester() }
     val vinylCardFocusRequester = remember { FocusRequester() }
     var wasFullPlayerVisible by remember { mutableStateOf(false) }
 
-    // 首次启动默认将遥控器焦点定位于顶部「发现」Tab
+    // 顶部标签是「焦点移到即切换」：焦点只能落在**当前页**对应的标签上。
+    // 原先固定落在「发现」，启动页设为「我的」时一启动就被焦点切到发现页（启动页设置失效、发现页数据提前加载）
+    val currentTabFocusRequester: () -> FocusRequester = {
+        when (if (isSearchOpen) Screen.SEARCH else currentScreen) {
+            Screen.SEARCH -> searchTabFocusRequester
+            Screen.HOME -> discoverTabFocusRequester
+            Screen.PODCASTS -> podcastTabFocusRequester
+            Screen.SETTINGS -> settingsTabFocusRequester
+            else -> mineTabFocusRequester
+        }
+    }
+
+    // 首次启动将遥控器焦点定位于当前页（启动页面）对应的顶部标签
     LaunchedEffect(Unit) {
         try {
-            discoverTabFocusRequester.requestFocus()
+            currentTabFocusRequester().requestFocus()
         } catch (_: Exception) {}
     }
 
@@ -145,7 +162,7 @@ fun AdaptiveAppScaffold(
                 if (currentPlayingSong != null) {
                     vinylCardFocusRequester.requestFocus()
                 } else {
-                    discoverTabFocusRequester.requestFocus()
+                    currentTabFocusRequester().requestFocus()
                 }
             } catch (_: Exception) {}
         }
@@ -178,6 +195,8 @@ fun AdaptiveAppScaffold(
         modifier = Modifier
             .fillMaxSize()
             .background(bgBrush)
+            // 全局沉浸（与手机端一致）：底色延伸到状态栏下面，内容让开状态栏
+            .statusBarsPadding()
             .padding(horizontal = 22.dp, vertical = 14.dp)
     ) {
         // ==================== 1. 顶部全局导航栏 ====================
@@ -232,11 +251,13 @@ fun AdaptiveAppScaffold(
                 KuwoTopTabButton(
                     label = "我的",
                     isSelected = effectiveScreen == Screen.MINE || effectiveScreen == Screen.LIBRARY || effectiveScreen == Screen.DOWNLOADS,
+                    modifier = Modifier.focusRequester(mineTabFocusRequester),
                     onClick = { onNavigate(Screen.MINE) }
                 )
                 KuwoTopTabButton(
                     label = "搜索",
                     isSelected = effectiveScreen == Screen.SEARCH,
+                    modifier = Modifier.focusRequester(searchTabFocusRequester),
                     onClick = { onNavigate(Screen.SEARCH) }
                 )
                 KuwoTopTabButton(
@@ -248,11 +269,13 @@ fun AdaptiveAppScaffold(
                 KuwoTopTabButton(
                     label = "播客",
                     isSelected = effectiveScreen == Screen.PODCASTS,
+                    modifier = Modifier.focusRequester(podcastTabFocusRequester),
                     onClick = { onNavigate(Screen.PODCASTS) }
                 )
                 KuwoTopTabButton(
                     label = "设置",
                     isSelected = effectiveScreen == Screen.SETTINGS,
+                    modifier = Modifier.focusRequester(settingsTabFocusRequester),
                     onClick = { onNavigate(Screen.SETTINGS) }
                 )
             }
@@ -424,77 +447,30 @@ private fun TvPersistentVinylPlayerCard(
     val context = LocalContext.current
     val dimensions = LocalAppDimensions.current
     val isDark = MaterialTheme.colorScheme.background.red < 0.5f
-    // remember 住 Brush：播控卡处于逐帧动画作用域内，每次重组都新建 shader 代价可观
-    val cardBg = remember(isDark) {
-        if (isDark) {
-            Brush.verticalGradient(
-                colors = listOf(
-                    Color(0xFF232734).copy(alpha = 0.92f),
-                    Color(0xFF171A24).copy(alpha = 0.95f)
-                )
-            )
-        } else {
-            Brush.verticalGradient(
-                colors = listOf(
-                    Color(0xFFFFFFFF).copy(alpha = 0.94f),
-                    Color(0xFFF2F4F8).copy(alpha = 0.96f)
-                )
-            )
-        }
-    }
+    // 卡片底色改由 CoverTintLayer（跟随封面取色）绘制，原固定渐变 cardBg 已移除
 
     // 黑胶唱片旋转角度与全屏播放页共享同一全局角度，两处转速与相位始终一致。
     // 返回只读 State：在 graphicsLayer 内延迟读取，逐帧只失效那一层，不触发整卡/整页重组。
-    val vinylRotation = rememberVinylRotation(isPlaying && animateVinyl)
+    // 界面优化：设置「主界面黑胶旋转」关闭时，左侧黑胶卡静止（翻列表时不再每秒重画 30 次），全屏播放页不受影响
+    val vinylRotation = rememberVinylRotation(
+        isPlaying && animateVinyl && com.lm.player.core.designsystem.theme.AppUiPrefs.mainVinylRotation
+    )
 
     // 性能优化 A3：进度不再在卡片顶层读取 (否则每 0.5 秒整张卡片重算一次)，
     // 只在进度条、时间文字 (RecomposeIsolation 内) 与歌词组件内部读取。
 
     val streamQualityVer by LemonMusicProtocol.streamQualityConfigVersion.collectAsState()
-    val (qualityBadge, bitrateBadge, sizeBadge) = remember(
-        song?.id,
-        song?.localFilePath,
-        song?.downloadStatus,
-        song?.format,
-        song?.bitRate,
-        song?.durationMs,
-        song?.serverId,
-        song?.streamUrl,
-        streamQualityVer
+    // 2026-11-13 规格标签第三版（用户选「带图标的描边小标签」）：三枚同样式的细描边小标签，各带一个小图标
+    // （音波 / 速度 / 存储卡）；只有音质那一枚的图标和字用档次颜色（Hi-Res 金 / 无损 红 / 高品质 蓝 / 标准 灰）
+    // 性能优化第 6 项：读文件属性 / 文件头放到 IO 线程；切歌时先按「不读盘」显示（上次结果或估算），核实后刷新
+    val homeSpecState = androidx.compose.runtime.produceState(
+        initialValue = computeHomeSpec(song, context, readDisk = false),
+        song?.id, song?.localFilePath, song?.downloadStatus, song?.format, song?.bitRate,
+        song?.durationMs, song?.serverId, song?.streamUrl, streamQualityVer
     ) {
-        if (song == null) {
-            Triple("Hi-Fi", "", "")
-        } else {
-            val hasLocalFile = !song.localFilePath.isNullOrBlank() &&
-                (song.localFilePath.startsWith("content://") || java.io.File(song.localFilePath).exists())
-            if (hasLocalFile) {
-                val (realExt, realBitRate, realSizeStr) = com.lm.player.feature.home.resolveRealLocalFormatAndSize(song)
-                val isLossless = realExt in listOf("FLAC", "WAV", "APE", "ALAC", "DSD", "DSF") || realBitRate >= 800
-                val qLabel = when {
-                    isLossless && realBitRate >= 1200 -> "Hi-Res"
-                    isLossless -> "无损 $realExt"
-                    realBitRate >= 256 -> "高品质 $realExt"
-                    else -> "标准 $realExt"
-                }
-                val bLabel = "${realBitRate.coerceAtLeast(128)} kbps"
-                val sLabel = realSizeStr.ifBlank {
-                    AudioQuality.fromKey(if (isLossless) "flac" else "320k").estimateSizeText(song)
-                }
-                Triple(qLabel, bLabel, sLabel)
-            } else {
-                val q = AudioQuality.fromKey(LemonMusicProtocol.getPreferredStreamQuality(context))
-                val qLabel = when (q) {
-                    AudioQuality.Q_HIRES -> "Hi-Res"
-                    AudioQuality.Q_FLAC -> "无损 FLAC"
-                    AudioQuality.Q_320K -> "高品质 320K"
-                    AudioQuality.Q_128K -> "标准 128K"
-                }
-                val bLabel = "${q.bitrate} kbps"
-                val sLabel = q.estimateSizeText(song)
-                Triple(qLabel, bLabel, sLabel)
-            }
-        }
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { computeHomeSpec(song, context, readDisk = true) }
     }
+    val homeSpec = homeSpecState.value
 
     val effectiveDuration = if (totalDurationMs > 0L) totalDurationMs else (song?.durationMs ?: 0L)
     // 进度条支持点击/拖动跳转：拖动期间由手势比例接管显示，松手才真正 seek，避免被外部进度弹回
@@ -517,10 +493,13 @@ private fun TvPersistentVinylPlayerCard(
         ),
         modifier = modifier
     ) {
+        // 界面美化：卡片底色跟随当前封面取色（Antigravity 设计的 CoverTintBackground；
+        // 没封面 / 还没算出时与原来的固定渐变底色一致）。原 .background(cardBg) 由这一层取代。
+        // 2026-11-13：卡片底色用歌曲封面的颜色，从顶部中间向下辐射填满整张卡片
+        com.lm.player.core.designsystem.polish.CoverRadialTintLayer(song?.coverUrl)
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .background(cardBg)
                 .padding(horizontal = 16.dp, vertical = 14.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.SpaceBetween
@@ -537,6 +516,8 @@ private fun TvPersistentVinylPlayerCard(
                     modifier = Modifier
                         .padding(top = 4.dp)
                         .size(dimensions.scale(164.dp))
+                        // 联动：记下小黑胶在屏幕上的位置，播放页的唱片从这里飞进去、关闭时飞回来
+                        .onGloballyPositioned { com.lm.player.feature.player.tv.VinylHandoff.sourceRect = it.boundsInRoot() }
                         .focusRequester(cardFocusRequester)
                         .tvFocusable(
                             shape = CircleShape,
@@ -545,6 +526,7 @@ private fun TvPersistentVinylPlayerCard(
                             onClick = {
                                 if (song != null) {
                                     try {
+                                        com.lm.player.feature.player.tv.VinylHandoff.arm()
                                         onOpenFullPlayer()
                                     } catch (_: Exception) {}
                                 }
@@ -594,7 +576,8 @@ private fun TvPersistentVinylPlayerCard(
                                 model = song?.coverUrl,
                                 seedId = song?.id ?: "tv_vinyl_idle",
                                 modifier = Modifier.fillMaxSize(),
-                                cornerRadius = 54.dp
+                                cornerRadius = 54.dp,
+                                highQuality = true // 左侧黑胶卡封面：32 位色、切歌淡入
                             )
                         }
 
@@ -619,16 +602,18 @@ private fun TvPersistentVinylPlayerCard(
                     contentAlignment = Alignment.Center
                 ) {
                     if (song != null) {
-                        LyricsScrollingView(
-                            lyrics = currentLyrics.lines,
-                            currentPositionMsProvider = progressMsProvider,
-                            animationsActive = animateVinyl,
-                            onSeekToLyric = onSeekTo,
+                        // 2026-11-12：改用手机端移植的歌词引擎（与全屏播放页同一套流光 / 逐字效果）
+                        com.lm.player.feature.player.tv.TvCardLyrics(
+                            lyrics = currentLyrics,
+                            positionMsProvider = progressMsProvider,
+                            isPlaying = isPlaying,
                             fontSizeSp = dimensions.cardHeaderSize.value,
-                            showAdjustButton = false,
-                            visibleLineCount = 5,
-                            textAlign = TextAlign.Center,
-                            horizontalPaddingDp = 2,
+                            activeColor = MaterialTheme.colorScheme.onSurface,
+                            animationsActive = animateVinyl,
+                            // 2026-11-13：「主界面黑胶旋转」关掉时卡片歌词也不逐字流光（只整行高亮），
+                            // 否则流光仍按 30 次/秒驱动整个主界面重画，关掉旋转等于没关
+                            karaokeAllowed = com.lm.player.core.designsystem.theme.AppUiPrefs.mainVinylRotation,
+                            onSeekTo = onSeekTo,
                             modifier = Modifier.fillMaxSize()
                         )
                     } else {
@@ -717,7 +702,7 @@ private fun TvPersistentVinylPlayerCard(
                                     else -> Icons.Default.Repeat
                                 }
                                 val modeTint = if (isShuffle || isRepeat) {
-                                    Color(0xFFFFC947)
+                                    AppleRed // 2026-11-13 用户要求：随机 / 单曲循环开启时用红色
                                 } else {
                                     MaterialTheme.colorScheme.onSurfaceVariant
                                 }
@@ -742,56 +727,13 @@ private fun TvPersistentVinylPlayerCard(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
-                    // 三档规格标签统一配色：音质淡黄 / 码率淡绿 / 大小淡红
-                    Surface(
-                        shape = RoundedCornerShape(5.dp),
-                        color = specBadgeContainer(SpecBadgeQualityColor),
-                        border = BorderStroke(0.8.dp, specBadgeBorder(SpecBadgeQualityColor))
-                    ) {
-                        Text(
-                            text = qualityBadge,
-                            fontSize = dimensions.badgeSize,
-                            fontWeight = FontWeight.Bold,
-                            color = SpecBadgeQualityColor,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.5.dp)
-                        )
-                    }
-                    if (bitrateBadge.isNotBlank()) {
-                        Surface(
-                            shape = RoundedCornerShape(5.dp),
-                            color = specBadgeContainer(SpecBadgeBitrateColor),
-                            border = BorderStroke(0.8.dp, specBadgeBorder(SpecBadgeBitrateColor))
-                        ) {
-                            Text(
-                                text = bitrateBadge,
-                                fontSize = dimensions.badgeSize,
-                                fontWeight = FontWeight.Bold,
-                                color = SpecBadgeBitrateColor,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.5.dp)
-                            )
-                        }
-                    }
-                    if (sizeBadge.isNotBlank()) {
-                        Surface(
-                            shape = RoundedCornerShape(5.dp),
-                            color = specBadgeContainer(SpecBadgeSizeColor),
-                            border = BorderStroke(0.8.dp, specBadgeBorder(SpecBadgeSizeColor))
-                        ) {
-                            Text(
-                                text = sizeBadge,
-                                fontSize = dimensions.badgeSize,
-                                fontWeight = FontWeight.Bold,
-                                color = SpecBadgeSizeColor,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.5.dp)
-                            )
-                        }
-                    }
+                    // 三枚细描边小标签：音质（档次色）/ 码率 / 大小
+                    val tierColor = com.lm.player.feature.player.tv.tvQualityColor(homeSpec.tier, isDark = MaterialTheme.colorScheme.background.red < 0.5f)
+                    val neutral = MaterialTheme.colorScheme.onSurfaceVariant
+                    HomeSpecChip(Icons.Default.GraphicEq, homeSpec.quality, tierColor, Modifier.weight(1f, fill = false))
+                    // 码率、大小各用一种颜色的框与图标（文字保持中性色），与音质那枚区分开
+                    if (homeSpec.bitrate.isNotBlank()) HomeSpecChip(Icons.Default.Speed, homeSpec.bitrate, Color(0xFF30C48D), Modifier.weight(1f, fill = false), textColor = neutral)
+                    if (homeSpec.size.isNotBlank()) HomeSpecChip(Icons.Default.SdStorage, roundSizeLabel(homeSpec.size), Color(0xFFAF7BF2), Modifier.weight(1f, fill = false), textColor = neutral)
                 }
 
                 Spacer(modifier = Modifier.height(4.dp))
@@ -948,4 +890,71 @@ private fun formatVinylTime(ms: Long): String {
     val minutes = totalSeconds / 60
     val seconds = totalSeconds % 60
     return String.format(Locale.US, "%02d:%02d", minutes, seconds)
+}
+
+/** 首页播放卡片的规格：音质文字 + 档次（3 Hi-Res / 2 无损 / 1 高品质 / 0 标准，配色同播放页）、码率、大小 */
+@androidx.compose.runtime.Immutable
+private data class HomeSpec(val quality: String, val tier: Int, val bitrate: String, val size: String)
+
+/** 规格小标签：细描边圆角 + 小图标 + 文字（图标与文字同色） */
+@Composable
+private fun HomeSpecChip(icon: androidx.compose.ui.graphics.vector.ImageVector, text: String, tint: Color, modifier: Modifier = Modifier, textColor: Color = tint) {
+    val dims = LocalAppDimensions.current
+    Row(
+        modifier = modifier
+            .border(BorderStroke(1.dp, tint.copy(alpha = 0.45f)), RoundedCornerShape(50))
+            .padding(horizontal = 7.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size((dims.badgeSize.value + 1f).dp))
+        Spacer(Modifier.width(3.dp))
+        Text(
+            text = text,
+            fontSize = dims.badgeSize,
+            fontWeight = FontWeight.Bold,
+            color = textColor,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+/** 文件大小取整数：「32.1 MB」→「32 MB」，「约 7.6 MB」→「约 8 MB」 */
+private fun roundSizeLabel(s: String): String =
+    Regex("""(\d+(?:\.\d+)?)\s*(GB|MB|KB)""", RegexOption.IGNORE_CASE).replace(s) { m ->
+        val v = m.groupValues[1].toDoubleOrNull() ?: return@replace m.value
+        "${kotlin.math.round(v).toLong().coerceAtLeast(1L)} ${m.groupValues[2].uppercase()}"
+    }
+
+/** 首页播放卡片的规格；readDisk = false 时完全不读磁盘（本地路径不为空就按本地文件、规格取上次结果或估算） */
+private fun computeHomeSpec(song: UnifiedSong?, context: android.content.Context, readDisk: Boolean): HomeSpec {
+    if (song == null) return HomeSpec("Hi-Fi", 0, "", "")
+    val path = song.localFilePath
+    val hasLocalFile = !path.isNullOrBlank() &&
+        (path.startsWith("content://") || !readDisk || java.io.File(path).exists())
+    return if (hasLocalFile) {
+        val (realExt, realBitRate, realSizeStr) = if (readDisk) com.lm.player.feature.home.resolveRealLocalFormatAndSize(song)
+            else com.lm.player.feature.home.peekRealLocalFormatAndSize(song)
+                ?: com.lm.player.feature.home.estimateLocalSpecsWithoutDisk(song)
+        val isLossless = realExt in listOf("FLAC", "WAV", "APE", "ALAC", "DSD", "DSF") || realBitRate >= 800
+        val badge = when {
+            isLossless && realBitRate >= 1200 -> "Hi-Res" to 3
+            isLossless -> "无损" to 2
+            realBitRate >= 256 -> "高品质" to 1
+            else -> "标准" to 0
+        }
+        val sLabel = realSizeStr.ifBlank {
+            AudioQuality.fromKey(if (isLossless) "flac" else "320k").estimateSizeText(song)
+        }
+        HomeSpec("${badge.first} $realExt", badge.second, "${realBitRate.coerceAtLeast(128)} kbps", sLabel)
+    } else {
+        val q = AudioQuality.fromKey(LemonMusicProtocol.getPreferredStreamQuality(context))
+        val badge = when (q) {
+            AudioQuality.Q_HIRES -> "Hi-Res" to 3
+            AudioQuality.Q_FLAC -> "无损" to 2
+            AudioQuality.Q_320K -> "高品质" to 1
+            AudioQuality.Q_128K -> "标准" to 0
+        }
+        HomeSpec("${badge.first} ${q.format}", badge.second, "${q.bitrate} kbps", q.estimateSizeText(song))
+    }
 }

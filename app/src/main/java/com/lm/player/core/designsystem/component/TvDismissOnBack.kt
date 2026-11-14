@@ -1,5 +1,6 @@
 package com.lm.player.core.designsystem.component
 
+import androidx.compose.ui.focus.onFocusChanged
 import android.os.Build
 import android.view.View
 import android.window.OnBackInvokedCallback
@@ -65,7 +66,7 @@ fun TvDialog(
     content: @Composable () -> Unit
 ) {
     androidx.compose.ui.window.Dialog(onDismissRequest = onDismissRequest, properties = properties) {
-        Box(Modifier.tvDismissOnBack(enabled = properties.dismissOnBackPress, onDismiss = onDismissRequest)) {
+        Box(Modifier.tvDismissOnBack(enabled = properties.dismissOnBackPress, onDismiss = onDismissRequest).focusFirstItemOnOpen()) {
             content()
         }
     }
@@ -121,7 +122,7 @@ fun TvDropdownMenu(
     androidx.compose.material3.DropdownMenu(
         expanded = expanded,
         onDismissRequest = onDismissRequest,
-        modifier = modifier.tvDismissOnBack(enabled = properties.dismissOnBackPress, onDismiss = onDismissRequest),
+        modifier = modifier.tvDismissOnBack(enabled = properties.dismissOnBackPress, onDismiss = onDismissRequest).focusFirstItemOnOpen(),
         offset = offset,
         scrollState = scrollState,
         properties = properties
@@ -161,4 +162,24 @@ private object Api33BackCallback {
         dispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback)
         return { runCatching { dispatcher.unregisterOnBackInvokedCallback(callback) } }
     }
+}
+
+/**
+ * TV 遥控器：弹窗 / 下拉列表打开后，光标自动落到列表第一项（2026-11-13 用户要求「凡是光标点开的列表都定位到第一个」）。
+ *
+ * 只在里面还没有任何焦点时才动作：有些菜单自己会把焦点放到指定项（例如当前选中的那一项），不去覆盖它。
+ * 列表项可能晚几帧才组合出来，所以隔 60ms 重试，最多约半秒。车机模式（纯触屏）不处理。
+ */
+fun Modifier.focusFirstItemOnOpen(): Modifier = composed {
+    if (LocalPlatformMode.current == com.lm.player.core.model.PlatformMode.CAR) return@composed this
+    val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
+    val hasFocus = remember { booleanArrayOf(false) }
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        repeat(8) {
+            kotlinx.coroutines.delay(60L)
+            if (hasFocus[0]) return@LaunchedEffect
+            runCatching { focusManager.moveFocus(androidx.compose.ui.focus.FocusDirection.Next) }
+        }
+    }
+    this.then(Modifier.onFocusChanged { hasFocus[0] = it.hasFocus })
 }

@@ -358,10 +358,12 @@ object MusicWidgetController {
                 PlaybackQueueManager.togglePlay(appCtx)
             }
             ACTION_WIDGET_NEXT -> {
+                com.lm.player.core.media.SkipLatencyStats.noteSource("桌面小组件")
                 PlaybackService.startPlaybackService(appCtx)
                 PlaybackQueueManager.playNext(appCtx)
             }
             ACTION_WIDGET_PREV -> {
+                com.lm.player.core.media.SkipLatencyStats.noteSource("桌面小组件")
                 PlaybackService.startPlaybackService(appCtx)
                 PlaybackQueueManager.playPrevious(appCtx)
             }
@@ -542,6 +544,9 @@ object MusicWidgetController {
         val intent = Intent(action).apply {
             setPackage(context.packageName)
             setClass(context, MusicWidgetActionReceiver::class.java)
+            // 2026-11-13 修复「软件在后台时用桌面小组件切歌慢 1～2 秒」：不带这个标记的广播进系统的
+            // 后台广播队列，和车机系统大量的后台广播一起排队；标成前台广播后由前台队列立即派发
+            addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
         }
         return PendingIntent.getBroadcast(
             context, requestCode, intent,

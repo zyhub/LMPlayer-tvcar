@@ -438,6 +438,8 @@ class DownloadEngine(
     }
 
     private suspend fun saveOrUpdateSongEntity(song: UnifiedSong, localFilePath: String) {
+        // 下载状态即时刷新：先通知各列表行（不等数据库防抖 + 全表重读）
+        SongStatusStore.markDownloaded(song.id, localFilePath)
         val localFile = File(localFilePath)
         val detectedExt = detectAudioExtension(localFile) ?: localFile.extension.lowercase().ifBlank { song.format.lowercase().ifBlank { "mp3" } }
         val isLosslessExt = detectedExt in listOf("flac", "wav", "ape", "alac")
@@ -508,7 +510,7 @@ class DownloadEngine(
     ) {
         if (jobMap.containsKey(song.id)) {
             coroutineScope.launch(Dispatchers.Main) {
-                Toast.makeText(context, "「${song.title}」正在下载中，请稍候...", Toast.LENGTH_SHORT).show()
+                com.lm.player.core.designsystem.component.AppToast.makeText(context, "「${song.title}」正在下载中，请稍候...", Toast.LENGTH_SHORT).show()
             }
             return
         }
@@ -521,6 +523,8 @@ class DownloadEngine(
         updateTask(DownloadTask(song = song, progress = 0f, status = DownloadStatus.DOWNLOADING))
 
         val job = coroutineScope.launch(Dispatchers.IO) {
+            // 下载窗口里选了「本地升级」：不按「本地已有」拦截，落盘成功后替换掉旧文件（2026-11-13 从手机端移植）
+            val upgradeFromPath = LocalUpgradeRequests.take(song.id)
             val dbRelativePath = if (song.relativeFolderPath.isNullOrBlank()) {
                 try {
                     songDao.getSongById(song.id)?.relativeFolderPath
@@ -563,7 +567,7 @@ class DownloadEngine(
             val isRecordDownloaded = record?.status == DownloadStatus.DOWNLOADED && isExistingFileCompatible(record.localFilePath)
             val isLocalPathValid = isExistingFileCompatible(song.localFilePath)
 
-            if (isDestFileValid || isRecordDownloaded || isLocalPathValid) {
+            if (upgradeFromPath == null && (isDestFileValid || isRecordDownloaded || isLocalPathValid)) {
                 val validPath = when {
                     isDestFileValid -> destFile.absolutePath
                     isRecordDownloaded -> record!!.localFilePath!!
@@ -591,7 +595,7 @@ class DownloadEngine(
                     // 取已有文件自身的扩展名，而不是本次请求的格式
                     val existingExt = File(validPath).extension.lowercase().ifBlank { song.format.lowercase() }
                     val existingQuality = actualQualityLabel(validPath, existingExt, song.bitRate)
-                    Toast.makeText(context, "「${song.title}」已存在 $existingQuality 版本，无需重复下载", Toast.LENGTH_SHORT).show()
+                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "「${song.title}」已存在 $existingQuality 版本，无需重复下载", Toast.LENGTH_SHORT).show()
                 }
                 return@launch
             }
@@ -792,6 +796,19 @@ class DownloadEngine(
                         throw Exception("音频文件落盘失败：目标下载目录无法写入，请在设置中重新指定目录或授予权限")
                     }
 
+                    // 升级音质：新文件已就位，删掉旧的低音质文件（同名时上面已直接覆盖）
+                    if (upgradeFromPath != null) {
+                        runCatching {
+                            val old = File(upgradeFromPath)
+                            if (old.exists() && old.canonicalPath != actualDestFile.canonicalPath) {
+                                old.delete()
+                                downloadDao.deleteDownloadByLocalPath(upgradeFromPath)
+                                android.media.MediaScannerConnection.scanFile(context, arrayOf(upgradeFromPath), null) { _, _ -> }
+                                Log.i(TAG, "Quality upgrade replaced $upgradeFromPath -> ${actualDestFile.absolutePath}")
+                            }
+                        }
+                    }
+
                     // 刷新系统媒体库，让电视/车机文件管理器立刻识别
                     try {
                         android.media.MediaScannerConnection.scanFile(
@@ -826,7 +843,7 @@ class DownloadEngine(
                     //   2) **立刻**写库 + removeTask，让进度条马上消失、状态变「已完成」；
                     //   3) 元数据内嵌（封面下载、歌词拉取、ID3/FLAC 标签写入）放到后台继续，
                     //      用 NonCancellable 保证即使用户此时暂停/取消也不会写出半截标签。
-                    val quickCover = postProcessLocalCoverOnly(actualDestFile)
+                    val quickCover = postProcessLocalCoverOnly(actualDestFile, finalSong.id)
                     val effectiveCover = if (!quickCover.isNullOrBlank() && finalSong.coverUrl.isBlank()) quickCover else finalSong.coverUrl
 
                     // 5. 下载成功完成 - 持久化到 downloads 表与 songs 表
@@ -849,7 +866,7 @@ class DownloadEngine(
                         // 如实告知**实际**拿到的音质：音源缺目标音质时会逐级降级
                         // (flac24bit→flac→320k→128k)，用户选了 320K 实际下到 128K 时必须能看见
                         val actualQuality = actualQualityLabel(effectiveStreamUrl, finalSong.format, finalSong.bitRate)
-                        Toast.makeText(
+                        com.lm.player.core.designsystem.component.AppToast.makeText(
                             context,
                             "「${song.title}」已完成离线下载 [实际音质: $actualQuality]",
                             Toast.LENGTH_SHORT
@@ -862,7 +879,7 @@ class DownloadEngine(
                         val localCoverPath = withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
                             postProcessDownloadedFile(actualDestFile, finalSong)
                         }
-                        // 封面文件（cover.jpg）此时已落盘，列表下次刷新时会自然带上；
+                        // 封面缓存此时已落盘，列表下次刷新时会自然带上；
                         // 不再为此额外写库 —— 下载结果本身已经是 DOWNLOADED 且路径正确，
                         // 多一次写库只会多一次 songs 表失效通知（触发整库重算）。
                         Log.i(TAG, "Song ${song.title} 元数据内嵌完成（封面=${localCoverPath ?: "无"}）")
@@ -896,7 +913,7 @@ class DownloadEngine(
                     removeTask(song.id)
                     urlResolverMap.remove(song.id)
                     withContext(Dispatchers.Main) {
-                        Toast.makeText(context, "「${song.title}」下载失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                        com.lm.player.core.designsystem.component.AppToast.makeText(context, "「${song.title}」下载失败: ${e.message}", Toast.LENGTH_SHORT).show()
                     }
                 }
             }
@@ -1021,7 +1038,7 @@ class DownloadEngine(
      * 1. 根据设置拉取高清封面图片二进制字节；
      * 2. 根据设置拉取高精度同步 LRC 歌词文本；
      * 3. 若开启 download_lrc_file：在音频同级目录输出同名 .lrc 文件；
-     * 4. 在专辑同级目录保存 cover.jpg 方便车载系统与文件管理器显示；
+     * 4. 封面副本存到应用私有缓存（下载目录只放歌曲文件，封面已内嵌）；
      * 5. 若开启 download_embed_cover 或 download_embed_lyric：调用 AudioMetadataEmbedder 写入 ID3v2.3/FLAC/M4A 标签；
      * 6. 返回可能落盘的本地封面路径。
      */
@@ -1031,10 +1048,16 @@ class DownloadEngine(
      * 抽出来的原因见调用点的长注释：真正的元数据内嵌含同步网络请求，
      * 绝不能挡在「写库 + 移除任务」之前，否则进度条会在 100% 停留很久。
      *
-     * @return 本地专辑目录下 cover.jpg 的绝对路径；不存在则 null
+     * @return 应用缓存里的封面（或老版本留在专辑目录的 cover.jpg）的绝对路径；不存在则 null
      */
-    private fun postProcessLocalCoverOnly(file: File): String? = try {
-        val coverJpg = file.parentFile?.let { File(it, "cover.jpg") }
+    /** 下载歌曲封面的应用内缓存（与 LocalMediaScanner 内嵌封面提取的缓存同目录、同命名，扫描时可直接复用） */
+    private fun coverCacheFile(songId: String): File =
+        File(File(context.cacheDir, "album_art"), "${com.lm.player.core.network.LemonMusicProtocol.md5(songId)}.jpg")
+
+    private fun postProcessLocalCoverOnly(file: File, songId: String): String? = try {
+        // 封面不再写进下载目录（下载目录只放歌曲文件），存在应用私有缓存里；兼容老版本留在专辑目录的 cover.jpg
+        val cached = coverCacheFile(songId)
+        val coverJpg = if (cached.exists() && cached.length() > 0L) cached else file.parentFile?.let { File(it, "cover.jpg") }
         if (coverJpg != null && coverJpg.exists() && coverJpg.length() > 0L) coverJpg.absolutePath else null
     } catch (_: Exception) {
         null
@@ -1077,17 +1100,16 @@ class DownloadEngine(
             }
         }
 
-        // 保存 cover.jpg 到歌曲所在专辑目录（若不存在）
+        // 2026-11-13：下载目录只放歌曲文件 —— 封面不再另存 cover.jpg 到专辑目录，
+        // 封面已内嵌进音频文件（默认开启），应用内显示用的副本存在私有缓存（与本地扫描的封面缓存同一位置、同一命名）
         if (coverBytes != null && coverBytes!!.isNotEmpty()) {
             try {
-                val albumDir = file.parentFile
-                if (albumDir != null && albumDir.exists()) {
-                    val coverJpg = File(albumDir, "cover.jpg")
-                    if (!coverJpg.exists()) {
-                        coverJpg.writeBytes(coverBytes!!)
-                    }
-                    localCoverPath = coverJpg.absolutePath
+                val cached = coverCacheFile(song.id)
+                if (!cached.exists() || cached.length() == 0L) {
+                    cached.parentFile?.mkdirs()
+                    cached.writeBytes(coverBytes!!)
                 }
+                localCoverPath = cached.absolutePath
             } catch (_: Exception) {}
         }
 
@@ -1199,7 +1221,7 @@ class DownloadEngine(
     fun cancelDownload(songId: String) {
         cancelTask(songId)
         coroutineScope.launch(Dispatchers.Main) {
-            Toast.makeText(context, "已停止并移除下载任务", Toast.LENGTH_SHORT).show()
+            com.lm.player.core.designsystem.component.AppToast.makeText(context, "已停止并移除下载任务", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -1208,6 +1230,7 @@ class DownloadEngine(
      */
     fun deleteDownloadedSong(song: UnifiedSong) {
         cancelTask(song.id)
+        SongStatusStore.markRemoved(listOf(song.id))
         coroutineScope.launch(Dispatchers.IO) {
             val record = downloadDao.getDownloadRecord(song.id)
             if (record?.localFilePath != null) {
@@ -1234,7 +1257,7 @@ class DownloadEngine(
             PlaybackQueueManager.onSongsDownloadDeleted(setOf(song.id))
 
             withContext(Dispatchers.Main) {
-                Toast.makeText(context, "已删除本地离线歌曲: ${song.title}", Toast.LENGTH_SHORT).show()
+                com.lm.player.core.designsystem.component.AppToast.makeText(context, "已删除本地离线歌曲: ${song.title}", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -1260,6 +1283,7 @@ class DownloadEngine(
     fun deleteDownloadedSongs(songs: List<UnifiedSong>) {
         if (songs.isEmpty()) return
         songs.forEach { cancelTask(it.id) }
+        SongStatusStore.markRemoved(songs.map { it.id })
         coroutineScope.launch(Dispatchers.IO) {
             var freedBytes = 0L
             val downloadDir = getDownloadDir()
@@ -1305,7 +1329,7 @@ class DownloadEngine(
             }
 
             withContext(Dispatchers.Main) {
-                Toast.makeText(context, "已成功删除 ${songs.size} 首本地歌曲，释放了 $freedFormatted 空间", Toast.LENGTH_SHORT).show()
+                com.lm.player.core.designsystem.component.AppToast.makeText(context, "已成功删除 ${songs.size} 首本地歌曲，释放了 $freedFormatted 空间", Toast.LENGTH_SHORT).show()
             }
         }
     }

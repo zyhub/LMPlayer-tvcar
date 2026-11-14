@@ -35,6 +35,10 @@ object PlaybackQueueManager {
 
     private const val TAG = "PlaybackQueueManager"
     private const val AUTO_PLAY_PREFS = "zds_auto_play_prefs"
+    /** 播放中的周期进度单独存的小文件（见 savePositionTick） */
+    private const val POSITION_TICK_PREFS = "lemon_playback_position_tick"
+    private const val KEY_TICK_SONG_ID = "song_id"
+    private const val KEY_TICK_POSITION_MS = "position_ms"
     private const val MAX_PERSISTED_QUEUE_SIZE = 120
 
     /** 本地播放足迹持久化 (离线/未连接服务器时「最近播放」卡片的数据来源) */
@@ -474,9 +478,35 @@ object PlaybackQueueManager {
     fun getSavedPositionMs(context: Context): Long {
         return try {
             val prefs = context.getSharedPreferences(AUTO_PLAY_PREFS, Context.MODE_PRIVATE)
-            prefs.getLong("last_played_position_ms", 0L).coerceAtLeast(0L)
+            // 播放中的周期进度只写在独立的小文件里（见 savePositionTick）：
+            // 小文件记的歌曲与主文件的「上次播放歌曲」是同一首时，以小文件为准；否则退回主文件里的进度
+            val tick = context.getSharedPreferences(POSITION_TICK_PREFS, Context.MODE_PRIVATE)
+            val tickSongId = tick.getString(KEY_TICK_SONG_ID, null)
+            if (!tickSongId.isNullOrEmpty() && tickSongId == prefs.getString("last_played_song_id", null)) {
+                tick.getLong(KEY_TICK_POSITION_MS, 0L).coerceAtLeast(0L)
+            } else {
+                prefs.getLong("last_played_position_ms", 0L).coerceAtLeast(0L)
+            }
         } catch (_: Exception) {
             0L
+        }
+    }
+
+    /**
+     * 播放中每 5 秒一次的进度落盘：只写一个几十字节的独立小文件。
+     *
+     * 原先这里走 [savePlaybackState]，SharedPreferences 每次都会把整个文件重写一遍 ——
+     * 也就是每 5 秒把「当前歌曲 JSON + 最多 120 首的队列 JSON」整份写一次闪存。
+     * 歌曲与队列在切歌 / 改队列时已经完整保存过，播放途中变化的只有进度，单独存即可。
+     */
+    private fun savePositionTick(context: Context, songId: String, positionMs: Long) {
+        try {
+            context.getSharedPreferences(POSITION_TICK_PREFS, Context.MODE_PRIVATE).edit()
+                .putString(KEY_TICK_SONG_ID, songId)
+                .putLong(KEY_TICK_POSITION_MS, positionMs)
+                .apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to save position tick", e)
         }
     }
 
@@ -516,13 +546,19 @@ object PlaybackQueueManager {
             if (_playlistFlow.value.isNotEmpty()) {
                 editor.putString("last_played_queue_json", queueToJsonCached(_playlistFlow.value, target.id))
             }
-            if (positionMs != null && positionMs >= 0L) {
+            // 进度同时写进独立小文件，保证它始终是最新的那份（读取时同一首歌以小文件为准）
+            val tickEditor = if (positionMs != null && positionMs >= 0L) {
                 editor.putLong("last_played_position_ms", positionMs)
-            }
+                ctx.getSharedPreferences(POSITION_TICK_PREFS, Context.MODE_PRIVATE).edit()
+                    .putString(KEY_TICK_SONG_ID, target.id)
+                    .putLong(KEY_TICK_POSITION_MS, positionMs)
+            } else null
             if (commitSync) {
                 editor.commit()
+                tickEditor?.commit()
             } else {
                 editor.apply()
+                tickEditor?.apply()
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to save playback state", e)
@@ -538,13 +574,14 @@ object PlaybackQueueManager {
         } catch (_: Exception) {}
 
         try {
-            val savedQueue = getSavedQueue(context)
-            if (_playlistFlow.value.isEmpty() && savedQueue.isNotEmpty()) {
-                _playlistFlow.value = savedQueue
+            // 2026-11-13：内存里已经有队列 / 当前歌时不再解析保存的 JSON（桌面小组件每点一次切歌都会调用这里，
+            // 以前每次都把最多 120 首的队列 JSON 在主线程整段解析一遍，白白拖慢切歌）
+            if (_playlistFlow.value.isEmpty()) {
+                val savedQueue = getSavedQueue(context)
+                if (savedQueue.isNotEmpty()) _playlistFlow.value = savedQueue
             }
-            val savedSong = getSavedLastSong(context)
-            if (_currentSongFlow.value == null && savedSong != null) {
-                _currentSongFlow.value = savedSong
+            if (_currentSongFlow.value == null) {
+                getSavedLastSong(context)?.let { _currentSongFlow.value = it }
             }
         } catch (_: Exception) {}
     }
@@ -717,7 +754,7 @@ object PlaybackQueueManager {
         val target = _currentSongFlow.value ?: return
         if (com.lm.player.core.podcast.PodcastSongs.isPodcast(target)) {
             // 播客单集不进「我喜欢的音乐」（黑胶卡 / 通知栏 / 小组件上的红心都会走到这里）
-            Toast.makeText(appCtx, "播客单集不支持收藏", Toast.LENGTH_SHORT).show()
+            com.lm.player.core.designsystem.component.AppToast.makeText(appCtx, "播客单集不支持收藏", Toast.LENGTH_SHORT).show()
             return
         }
         val newFav = !target.isFavorite
@@ -778,7 +815,7 @@ object PlaybackQueueManager {
                     if (r.isFailure) {
                         val reason = r.exceptionOrNull()?.message.orEmpty()
                         withContext(Dispatchers.Main) {
-                            Toast.makeText(
+                            com.lm.player.core.designsystem.component.AppToast.makeText(
                                 appCtx,
                                 "收藏未同步到服务器，请稍后重试${if (reason.isNotBlank()) "：$reason" else ""}",
                                 Toast.LENGTH_SHORT
@@ -830,7 +867,13 @@ object PlaybackQueueManager {
                     val flowSongId = _currentSongFlow.value?.id
                     val positionBelongsToCurrentSong = actualMediaId == null || flowSongId == null || actualMediaId == flowSongId
                     if (pos > 0L && positionBelongsToCurrentSong) {
-                        savePlaybackState(context, _currentSongFlow.value, positionMs = pos, commitSync = false)
+                        // 只写进度小文件：歌曲与队列在切歌 / 改队列时已完整保存，不必每 5 秒整份重写
+                        val tickSongId = flowSongId
+                        if (tickSongId != null) {
+                            savePositionTick(context, tickSongId, pos)
+                        } else {
+                            savePlaybackState(context, _currentSongFlow.value, positionMs = pos, commitSync = false)
+                        }
                     }
                     if (Media3Factory.isSoftwareDecodingActive) {
                         val songId = _currentSongFlow.value?.id
@@ -887,6 +930,7 @@ object PlaybackQueueManager {
             override fun onIsPlayingChanged(playing: Boolean) {
                 _isPlayingFlow.value = playing
                 if (playing) {
+                    SkipLatencyStats.onPlaying(_currentSongFlow.value?.id)
                     startPeriodicPositionSave(context, player)
                     startDecoderWatchdog(player, context)
                 } else {
@@ -995,22 +1039,30 @@ object PlaybackQueueManager {
         decoderWatchdogJob?.cancel()
         decoderWatchdogJob = coroutineScope.launch {
             var lastPosition = -1L
-            var stalledTicks = 0
+            var stalledMs = 0L
             var lastSongId: String? = null
+            // 2026-11-13 性能优化第 9 项：硬解卡死基本出在起播阶段 —— 每首歌前 30 秒每 1 秒查一次，
+            // 之后每 5 秒查一次（后台播放时每小时唤醒从 3600 次降到约 750 次）。判定仍是「卡住满 6 秒」
+            var watchedMs = 0L
             while (isActive) {
-                delay(1000L)
+                val interval = if (watchedMs < 30_000L) 1000L else 5000L
+                delay(interval)
+                // 已经是软解：这个看门狗只负责「硬解卡死 → 降级软解」，没有事可做了
+                if (Media3Factory.isSoftwareDecodingActive) return@launch
                 if (player !== Media3Factory.getSharedExoPlayer(context)) return@launch
                 val songId = _currentSongFlow.value?.id
                 if (songId != lastSongId) {
                     lastSongId = songId
                     lastPosition = -1L
-                    stalledTicks = 0
+                    stalledMs = 0L
+                    watchedMs = 0L
                 }
+                watchedMs += interval
                 // 未在播放时直接结束本次看门狗，恢复播放时由 onIsPlayingChanged 重新启动。
                 // 原先这里是 continue，会让 24 小时开机的盒子在待机状态下每秒空转唤醒一次。
                 // 说明：卡顿判定本来就只在 STATE_READY 下进行，因此退出 BUFFERING 分支不损失任何检测能力
                 if (!player.playWhenReady || !player.isPlaying || player.playbackState != Player.STATE_READY) {
-                    stalledTicks = 0
+                    stalledMs = 0L
                     lastPosition = -1L
                     return@launch
                 }
@@ -1018,13 +1070,13 @@ object PlaybackQueueManager {
                 val buffered = player.bufferedPosition
                 val dataAvailable = buffered - position > 3_000L
                 if (dataAvailable && position <= lastPosition) {
-                    stalledTicks++
+                    stalledMs += interval
                 } else {
-                    stalledTicks = 0
+                    stalledMs = 0L
                 }
                 lastPosition = position
-                if (stalledTicks >= 6 && !Media3Factory.isSoftwareDecodingActive) {
-                    triggerSoftwareDecodingFallback(context, "缓冲充足但播放位停滞 ${stalledTicks}s，疑似硬件解码卡死")
+                if (stalledMs >= 6_000L && !Media3Factory.isSoftwareDecodingActive) {
+                    triggerSoftwareDecodingFallback(context, "缓冲充足但播放位停滞 ${stalledMs / 1000}s，疑似硬件解码卡死")
                     return@launch
                 }
             }
@@ -1094,8 +1146,45 @@ object PlaybackQueueManager {
 
     private var prefetchJob: Job? = null
     @Volatile private var prefetchedItem: PrefetchedItem? = null
-    /** 随机播放时预先选定的下一首：playNext 优先使用它，保证预取能命中 */
-    @Volatile private var plannedShuffleNextId: String? = null
+    /**
+     * 随机播放时预先排好的「接下来要播」的歌（按顺序，最多 [SHUFFLE_PLAN_SIZE] 首）：
+     * playNext 依次取用（预取的播放地址因此能命中），播放页「全屏封面」后面叠着的两张卡也显示这几首
+     * （2026-11-13：以前叠卡按歌单顺序显示，随机时和真正要播的对不上，切过去还会闪一下）。
+     */
+    private const val SHUFFLE_PLAN_SIZE = 2
+    private val _shufflePlanFlow = MutableStateFlow<List<String>>(emptyList())
+    val shufflePlanFlow: StateFlow<List<String>> = _shufflePlanFlow.asStateFlow()
+
+    /** 补齐 / 修正随机计划：去掉已不在队列里的、就是当前这首的，再随机补到 [SHUFFLE_PLAN_SIZE] 首 */
+    @Synchronized
+    fun ensureShufflePlan(): List<String> {
+        if (!_isShuffleFlow.value) return emptyList()
+        val list = _playlistFlow.value
+        val currentId = _currentSongFlow.value?.id
+        val candidateIds = list.asSequence().map { it.id }.filter { it != currentId }.distinct().toList()
+        if (candidateIds.isEmpty()) {
+            if (_shufflePlanFlow.value.isNotEmpty()) _shufflePlanFlow.value = emptyList()
+            return emptyList()
+        }
+        val valid = candidateIds.toHashSet()
+        val plan = _shufflePlanFlow.value.filter { it in valid }.distinct().toMutableList()
+        val want = minOf(SHUFFLE_PLAN_SIZE, candidateIds.size)
+        while (plan.size < want) {
+            val pick = candidateIds.filter { it !in plan }.randomOrNull() ?: break
+            plan.add(pick)
+        }
+        if (plan != _shufflePlanFlow.value) _shufflePlanFlow.value = plan
+        return plan
+    }
+
+    /** 取走计划里的第一首（playNext 用），其余顺延 */
+    @Synchronized
+    private fun takePlannedShuffleNext(candidates: List<UnifiedSong>): UnifiedSong? {
+        val plan = ensureShufflePlan()
+        val first = plan.firstOrNull()?.let { id -> candidates.firstOrNull { it.id == id } }
+        if (first != null) _shufflePlanFlow.value = plan.drop(1)
+        return first
+    }
 
     private suspend fun activeServerKeyForPrefetch(ctx: Context): String = withContext(Dispatchers.IO) {
         runCatching {
@@ -1123,7 +1212,7 @@ object PlaybackQueueManager {
         val idx = list.indexOfFirst { it.id == current.id }
         val next = if (idx >= 0) list.drop(idx + 1).firstOrNull { com.lm.player.core.podcast.PodcastSongs.isPodcast(it) } else null
         if (next == null) {
-            if (auto) pause(context) else Toast.makeText(context.applicationContext, "已经是最后一集", Toast.LENGTH_SHORT).show()
+            if (auto) pause(context) else com.lm.player.core.designsystem.component.AppToast.makeText(context.applicationContext, "已经是最后一集", Toast.LENGTH_SHORT).show()
             return
         }
         playSong(next, context, startPositionMs = com.lm.player.core.podcast.PodcastController.resumePositionFor(next))
@@ -1145,14 +1234,14 @@ object PlaybackQueueManager {
     private fun handlePodcastPlayError(context: Context, song: UnifiedSong, resumePos: Long) {
         val alreadyProxied = song.streamUrl.contains("/api/play/proxy") || !podcastProxyTried.add(song.id)
         if (alreadyProxied) {
-            Toast.makeText(context.applicationContext, "播客《${song.title}》无法播放，请稍后再试或拉取最新", Toast.LENGTH_SHORT).show()
+            com.lm.player.core.designsystem.component.AppToast.makeText(context.applicationContext, "播客《${song.title}》无法播放，请稍后再试或拉取最新", Toast.LENGTH_SHORT).show()
             return
         }
         coroutineScope.launch {
             val proxy = com.lm.player.core.podcast.PodcastController.resolveProxyUrl(context, song)
             if (_currentSongFlow.value?.id != song.id) return@launch
             if (proxy.isNullOrBlank()) {
-                Toast.makeText(context.applicationContext, "播客《${song.title}》无法播放，服务器也没能提供播放地址", Toast.LENGTH_SHORT).show()
+                com.lm.player.core.designsystem.component.AppToast.makeText(context.applicationContext, "播客《${song.title}》无法播放，服务器也没能提供播放地址", Toast.LENGTH_SHORT).show()
                 return@launch
             }
             Log.w(TAG, "Podcast direct url failed, retrying via server proxy: ${song.title}")
@@ -1168,12 +1257,38 @@ object PlaybackQueueManager {
         val current = _currentSongFlow.value ?: return null
         return if (_isShuffleFlow.value) {
             val candidates = list.filter { it.id != current.id }
-            val planned = plannedShuffleNextId?.let { id -> candidates.firstOrNull { it.id == id } }
-            (planned ?: candidates.randomOrNull())?.also { plannedShuffleNextId = it.id }
+            val plannedId = ensureShufflePlan().firstOrNull()
+            candidates.firstOrNull { it.id == plannedId } ?: candidates.randomOrNull()
         } else {
             val idx = list.indexOfFirst { it.id == current.id }
             if (idx >= 0 && idx < list.size - 1) list[idx + 1] else list.first()
         }
+    }
+
+    /**
+     * 服务器歌曲加速第 4 期：预先把下一首和待播队列前几首的封面下载进图片缓存（不预下载整个曲库，省流量）。
+     * 走同一个图片加载器，服务器歌曲的封面同样会和平台封面竞速。
+     */
+    private fun prefetchUpcomingCovers(ctx: Context, next: UnifiedSong) {
+        runCatching {
+            val list = _playlistFlow.value
+            val idx = list.indexOfFirst { it.id == _currentSongFlow.value?.id }
+            val urls = LinkedHashSet<String>()
+            urls += next.coverUrl
+            if (idx >= 0 && !_isShuffleFlow.value) {
+                for (i in 1..3) list.getOrNull(idx + i)?.coverUrl?.let { urls += it }
+            }
+            val loader = coil.Coil.imageLoader(ctx)
+            urls.filter { it.startsWith("http", ignoreCase = true) }.forEach { url ->
+                loader.enqueue(
+                    coil.request.ImageRequest.Builder(ctx)
+                        .data(url)
+                        .size(256)
+                        .memoryCachePolicy(coil.request.CachePolicy.DISABLED)
+                        .build()
+                )
+            }
+        }.onFailure { Log.w(TAG, "prefetch covers failed: ${it.message}") }
     }
 
     private fun schedulePrefetchNext(ctx: Context, playingSongId: String) {
@@ -1182,6 +1297,7 @@ object PlaybackQueueManager {
             delay(PREFETCH_DELAY_MS) // 先让当前歌曲缓冲，避免抢带宽
             if (_currentSongFlow.value?.id != playingSongId) return@launch
             val next = pickNextSongForPrefetch() ?: return@launch
+            prefetchUpcomingCovers(ctx, next)
             if (next.id == playingSongId || hasLocalFileForPrefetch(next)) return@launch
             val existing = prefetchedItem
             if (existing != null && existing.songId == next.id &&
@@ -1218,7 +1334,7 @@ object PlaybackQueueManager {
         val updates = synchronized(p.capture.songUpdates) { p.capture.songUpdates.toList() }
         updates.forEach { if (_currentSongFlow.value?.id == song.id) updateCurrentSong(it) }
         p.capture.pendingToast?.let { msg ->
-            withContext(Dispatchers.Main) { Toast.makeText(ctx.applicationContext, msg, Toast.LENGTH_SHORT).show() }
+            withContext(Dispatchers.Main) { com.lm.player.core.designsystem.component.AppToast.makeText(ctx.applicationContext, msg, Toast.LENGTH_SHORT).show() }
         }
         Log.i(TAG, "Using prefetched link for ${song.title}")
         return p.mediaItem
@@ -1235,6 +1351,8 @@ object PlaybackQueueManager {
     ) {
         ensurePlayerListener(context)
         _currentSongFlow.value = targetSong
+        // 切歌耗时统计（运行诊断）：从这里到真正出声
+        SkipLatencyStats.onPlayRequested(targetSong.id, targetSong.title)
         // 写入本地播放足迹：离线时「最近播放」卡片即展示这份记录（播客单集不计入，播客有「继续收听」）
         if (!com.lm.player.core.podcast.PodcastSongs.isPodcast(targetSong)) {
             promoteToRecentPlay(context, targetSong)
@@ -1261,20 +1379,25 @@ object PlaybackQueueManager {
             try {
                 val db = ZdsDatabase.getInstance(context)
                 val router = PlaybackRouter(db.downloadDao(), context)
-                val mediaItem: MediaItem? = (if (!forceRefresh && !streamPreResolved && overrideQuality == null) takePrefetchedItem(context, targetSong) else null)
+                val prefetched: MediaItem? =
+                    if (!forceRefresh && !streamPreResolved && overrideQuality == null) takePrefetchedItem(context, targetSong) else null
+                val mediaItem: MediaItem? = prefetched
                     ?: router.resolveMediaItem(
                         targetSong,
                         forceRefresh = forceRefresh,
                         streamPreResolved = streamPreResolved,
                         overrideQuality = overrideQuality
                     )
+                SkipLatencyStats.onResolved(targetSong.id, prefetched = prefetched != null)
                 if (mediaItem == null) {
                     // 明确告知用户"这首放不了"，而不是让它显示成正在播放却毫无声音
                     Log.e(TAG, "playSong 中断：无法解析播放地址 (${targetSong.title})")
                     withContext(Dispatchers.Main) {
-                        Toast.makeText(
+                        com.lm.player.core.designsystem.component.AppToast.makeText(
                             context.applicationContext,
-                            "「${targetSong.title}」暂时无法获取播放地址，请检查网络或服务器设置",
+                            if (com.lm.player.core.source.ServerLinkState.isLost)
+                                "服务器离线，本地音源也没找到「${targetSong.title}」的可用音源"
+                            else "「${targetSong.title}」暂时无法获取播放地址，请检查网络或服务器设置",
                             Toast.LENGTH_SHORT
                         ).show()
                     }
@@ -1330,9 +1453,7 @@ object PlaybackQueueManager {
             // 直接 random() 会抛 NoSuchElementException（该回调运行在 ExoPlayer 主线程 → 必崩）。
             val candidates = list.filter { it.id != current?.id }.ifEmpty { list }
             // 优先使用预取时选定的下一首，让预取的播放地址能命中
-            val planned = plannedShuffleNextId?.let { id -> candidates.firstOrNull { it.id == id } }
-            plannedShuffleNextId = null
-            planned ?: candidates.randomOrNull() ?: return
+            takePlannedShuffleNext(candidates) ?: candidates.randomOrNull() ?: return
         } else {
             val currentIndex = list.indexOfFirst { it.id == current?.id }
             if (currentIndex >= 0 && currentIndex < list.size - 1) {

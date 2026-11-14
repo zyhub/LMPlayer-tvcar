@@ -296,6 +296,10 @@ fun SettingsScreen(
 
     // 当切换到音源脚本或存储路径 Tab 时，若连接了柠檬音乐则自动拉取
     LaunchedEffect(selectedTab, activeServer?.id, isScanningLocalAndServer, isPurgingLegacyData) {
+        // TV 按需启动：打开「音源」页（含服务器离线时）就加载音源引擎，状态卡片才有内容
+        if (selectedTab == SettingsTab.SOURCES) {
+            com.lm.player.core.source.SourceAccelerationController.demandEngines(context, "settings_sources_tab")
+        }
         if (selectedTab == SettingsTab.SOURCES && liveServerOnline == true && sourceStatusServer != null) {
             isRefreshingSources = true
             sourceStatusError = null
@@ -303,6 +307,8 @@ fun SettingsScreen(
                 val client = NetworkClientFactory.createOkHttpClient(context)
                 val proto = LemonMusicProtocol(client, sourceStatusServer.serverUrl, sourceStatusServer.username, sourceStatusServer.tokenOrApiKey)
                 ServerSourceRepository.syncFromServer(sourceStatusServer, proto)
+                // TV 按需启动：打开「音源」页即需要查看 / 使用音源引擎
+                com.lm.player.core.source.SourceAccelerationController.demandEngines(context, "settings_sources_tab")
                 com.lm.player.core.source.SourceAccelerationController.start(context, sourceStatusServer, proto)
             } catch (_: Exception) {
             } finally {
@@ -604,13 +610,13 @@ fun SettingsScreen(
                                                         val client = NetworkClientFactory.createOkHttpClient(context)
                                                         val proto = LemonMusicProtocol(client, accountServer.serverUrl, accountServer.username, accountServer.tokenOrApiKey)
                                                         val res = proto.testConnection()
-                                                        Toast.makeText(
+                                                        com.lm.player.core.designsystem.component.AppToast.makeText(
                                                             context,
                                                             if (res.isSuccess) "连接成功！服务端响应正常" else "连接失败: ${res.exceptionOrNull()?.message}",
                                                             if (res.isSuccess) Toast.LENGTH_SHORT else Toast.LENGTH_LONG
                                                         ).show()
                                                     } catch (e: Exception) {
-                                                        Toast.makeText(context, "连接测试异常: ${e.message}", Toast.LENGTH_LONG).show()
+                                                        com.lm.player.core.designsystem.component.AppToast.makeText(context, "连接测试异常: ${e.message}", Toast.LENGTH_LONG).show()
                                                     } finally {
                                                         isTestingConnection = false
                                                     }
@@ -716,7 +722,7 @@ fun SettingsScreen(
                                                     showVersionNotesDialog = true
                                                 }
                                             } else {
-                                                Toast.makeText(context, "检测更新失败: ${res.exceptionOrNull()?.message ?: "网络异常"}", Toast.LENGTH_LONG).show()
+                                                com.lm.player.core.designsystem.component.AppToast.makeText(context, "检测更新失败: ${res.exceptionOrNull()?.message ?: "网络异常"}", Toast.LENGTH_LONG).show()
                                             }
                                         }
                                     },
@@ -766,6 +772,93 @@ fun SettingsScreen(
                                     Text("更新日志", fontSize = dimensions.bodySize)
                                 }
                             }
+                        }
+                    }
+
+                    // 运行诊断（2026-11-13 从「本地存储」挪到这里，紧跟软件更新）：车机没有 adb，直接在这里看 / 复制
+                    item {
+                        SettingsCard(title = "运行诊断", icon = Icons.Default.Info) {
+                            // 启动提速：最近一次冷启动各节点耗时（距进程启动），用于在车机上直接对比优化前后
+                            Spacer(modifier = Modifier.height(8.dp))
+                            val startupSummary = remember { com.lm.player.core.startup.StartupTrace.lastSummary(context) }
+                            SettingActionRow(
+                                title = "启动耗时",
+                                subtitle = startupSummary?.let { "最近一次冷启动：$it" }
+                                    ?: "暂无记录：冷启动后约 20 秒会记录一次",
+                                actionText = "复制",
+                                onAction = {
+                                    val text = startupSummary ?: "暂无启动耗时记录"
+                                    runCatching {
+                                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                        cm.setPrimaryClip(android.content.ClipData.newPlainText("启动耗时", text))
+                                    }
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已复制：$text", Toast.LENGTH_SHORT).show()
+                                }
+                            )
+
+                            // 切歌耗时（2026-11-13）：每次切歌从收到指令到出声用了多久，分前台 / 后台和来源，取地址与缓冲分开
+                            Spacer(modifier = Modifier.height(8.dp))
+                            var skipStatsText by remember { mutableStateOf(com.lm.player.core.media.SkipLatencyStats.summary()) }
+                            SettingActionRow(
+                                title = "切歌耗时",
+                                subtitle = skipStatsText.replace("\n", "；"),
+                                actionText = "复制",
+                                onAction = {
+                                    val text = com.lm.player.core.media.SkipLatencyStats.summary()
+                                    skipStatsText = text
+                                    runCatching {
+                                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                        cm.setPrimaryClip(android.content.ClipData.newPlainText("切歌耗时", text))
+                                    }
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已复制切歌耗时记录", Toast.LENGTH_SHORT).show()
+                                }
+                            )
+
+                            // 封面加载统计（本次运行）：封面不显示时用来判断是加载失败、解码异常还是请求没结束
+                            Spacer(modifier = Modifier.height(8.dp))
+                            val imageStats = remember { com.lm.player.core.startup.ImageLoadStats.summary() }
+                            SettingActionRow(
+                                title = "封面加载统计",
+                                subtitle = "本次运行：$imageStats",
+                                actionText = "复制",
+                                onAction = {
+                                    val text = com.lm.player.core.startup.ImageLoadStats.summary()
+                                    runCatching {
+                                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                        cm.setPrimaryClip(android.content.ClipData.newPlainText("封面加载统计", text))
+                                    }
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已复制：$text", Toast.LENGTH_LONG).show()
+                                }
+                            )
+
+                            // 界面流畅度（性能优化第 0 项）：按界面统计的卡顿比例 / 平均帧耗时，用来对比优化前后
+                            Spacer(modifier = Modifier.height(8.dp))
+                            var frameStatsText by remember { mutableStateOf(com.lm.player.core.startup.FrameStats.summary()) }
+                            SettingActionRow(
+                                title = "界面流畅度",
+                                subtitle = frameStatsText.replace("\n", "；"),
+                                actionText = "复制",
+                                onAction = {
+                                    val text = com.lm.player.core.startup.FrameStats.summary()
+                                    frameStatsText = text
+                                    runCatching {
+                                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                        cm.setPrimaryClip(android.content.ClipData.newPlainText("界面流畅度", text))
+                                    }
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已复制界面流畅度统计", Toast.LENGTH_SHORT).show()
+                                }
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SettingActionRow(
+                                title = "重新统计流畅度",
+                                subtitle = "清零后到要测的界面停留一两分钟，再回来复制；每批优化前后各测一次对比",
+                                actionText = "清零",
+                                onAction = {
+                                    com.lm.player.core.startup.FrameStats.reset()
+                                    frameStatsText = com.lm.player.core.startup.FrameStats.summary()
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已清零，开始重新统计", Toast.LENGTH_SHORT).show()
+                                }
+                            )
                         }
                     }
                 }
@@ -824,7 +917,10 @@ fun SettingsScreen(
                                             if (res.isFailure) {
                                                 sourceStatusError = res.exceptionOrNull()?.message ?: "音源状态同步失败"
                                             }
+                                            com.lm.player.core.source.SourceAccelerationController.demandEngines(context, "settings_sources_sync")
                                             com.lm.player.core.source.SourceAccelerationController.start(context, sourceStatusServer, proto)
+                                            // 2026-11-13：刷新按钮立即从服务器拉取本地加速音源（不等 2 分钟），存为待用版、下次启动生效
+                                            com.lm.player.core.source.SourceAccelerationController.manualPull(context)
                                         } catch (e: kotlinx.coroutines.CancellationException) {
                                             throw e
                                         } catch (e: Exception) {
@@ -836,6 +932,11 @@ fun SettingsScreen(
                                 }
                             }
                         )
+                    }
+
+                    // 服务器歌曲加速：后台预匹配开关、进度、立即补全（2026-11-13）
+                    item {
+                        ServerAccelPrematchCard()
                     }
                 }
 
@@ -1407,7 +1508,7 @@ fun SettingsScreen(
                                     onClick = {
                                         Media3Factory.clearStreamCache(context)
                                         cacheSizeBytes = Media3Factory.getCacheSizeBytes(context)
-                                        Toast.makeText(context, "已成功清空在线试听缓存切片", Toast.LENGTH_SHORT).show()
+                                        com.lm.player.core.designsystem.component.AppToast.makeText(context, "已成功清空在线试听缓存切片", Toast.LENGTH_SHORT).show()
                                     },
                                     shape = RoundedCornerShape(10.dp),
                                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
@@ -1695,40 +1796,102 @@ fun SettingsScreen(
 
                             Spacer(modifier = Modifier.height(10.dp))
 
-                            // 流畅模式 (性能优化第二批)：自动按设备性能判定，也可强制开启 / 关闭
-                            val smoothSetting = com.lm.player.core.designsystem.theme.SmoothMode.setting
-                            val smoothActive = com.lm.player.core.designsystem.theme.SmoothMode.isActive
-                            val smoothDeviceHint = if (com.lm.player.core.designsystem.theme.SmoothMode.isLowEndDevice) {
-                                "本机判定为低性能设备（${com.lm.player.core.designsystem.theme.SmoothMode.lowEndReason}）"
+                            // 性能模式（2026-11-13 由「流畅模式」开 / 关扩成三档，统一管理所有画面效果）
+                            val perfSetting = com.lm.player.core.designsystem.theme.SmoothMode.setting
+                            val perfLevel = com.lm.player.core.designsystem.theme.SmoothMode.level
+                            val perfDeviceHint = if (com.lm.player.core.designsystem.theme.SmoothMode.isLowEndDevice) {
+                                "本机判定为低性能设备（${com.lm.player.core.designsystem.theme.SmoothMode.lowEndReason}），自动 = 流畅优先"
                             } else {
-                                "本机性能充足"
+                                "本机性能充足，自动 = 均衡"
                             }
                             SettingDropdownRow(
-                                title = "流畅模式",
-                                subtitle = "老车机 / 老电视卡顿时开启：动画降到 20 帧、切歌封面不渐变、全屏封面主题去掉背景大图。" +
-                                    "当前${if (smoothActive) "已开启" else "未开启"}，$smoothDeviceHint",
+                                title = "性能模式",
+                                subtitle = "画质优先：全部效果（黑胶背景旋转、最强景深模糊、11 张卡片）；均衡：去掉最费 GPU 的几项；" +
+                                    "流畅优先：动画 20 帧、关闭景深模糊与推近、过渡减半。当前：${perfLevel.label}。$perfDeviceHint",
                                 icon = Icons.Default.Speed,
-                                selectedValue = smoothSetting,
-                                options = listOf(
-                                    com.lm.player.core.designsystem.theme.SmoothModeSetting.AUTO,
-                                    com.lm.player.core.designsystem.theme.SmoothModeSetting.ON,
-                                    com.lm.player.core.designsystem.theme.SmoothModeSetting.OFF
-                                ),
+                                selectedValue = perfSetting,
+                                options = com.lm.player.core.designsystem.theme.PerformanceSetting.entries.toList(),
                                 getLabel = { mode ->
-                                    when (mode) {
-                                        com.lm.player.core.designsystem.theme.SmoothModeSetting.AUTO -> "自动"
-                                        com.lm.player.core.designsystem.theme.SmoothModeSetting.ON -> "开启"
-                                        com.lm.player.core.designsystem.theme.SmoothModeSetting.OFF -> "关闭"
-                                    }
+                                    if (mode == com.lm.player.core.designsystem.theme.PerformanceSetting.AUTO) {
+                                        "自动（${com.lm.player.core.designsystem.theme.SmoothMode.autoLevel.label}）"
+                                    } else mode.label
                                 },
                                 onSelect = { mode ->
                                     com.lm.player.core.designsystem.theme.SmoothMode.updateSetting(context, mode)
-                                    // 动画与界面效果立即生效；图片加载器在启动时创建，并发限制要重启后才变
+                                    // 动画与界面效果立即生效；图片加载器在启动时创建，色彩与并发要重启后才变
                                     if (com.lm.player.core.designsystem.theme.SmoothMode.isActive !=
                                         com.lm.player.core.designsystem.theme.SmoothMode.activeAtStartup
                                     ) {
-                                        Toast.makeText(context, "已切换。图片加载优化将在重启应用后生效", Toast.LENGTH_SHORT).show()
+                                        com.lm.player.core.designsystem.component.AppToast.makeText(context, "已切换。图片加载优化将在重启应用后生效", Toast.LENGTH_SHORT).show()
                                     }
+                                }
+                            )
+
+                            // 界面优化（2026-11-08）：启动页面 / 主界面黑胶旋转 / 大封面淡入
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingDropdownRow(
+                                title = "启动页面",
+                                subtitle = "「我的」启动最快：只读本地资料库；「发现」启动后要拉取推荐歌单、榜单等。下次启动生效",
+                                icon = Icons.Default.Home,
+                                selectedValue = com.lm.player.core.designsystem.theme.AppUiPrefs.startPage,
+                                options = com.lm.player.core.designsystem.theme.StartPage.values().toList(),
+                                getLabel = { it.label },
+                                onSelect = { page ->
+                                    com.lm.player.core.designsystem.theme.AppUiPrefs.updateStartPage(context, page)
+                                }
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingDropdownRow(
+                                title = "主界面黑胶旋转",
+                                subtitle = "关闭后左侧黑胶卡片静止、卡片歌词不逐字流光（只整行高亮），主界面播放时基本不重画，更省电更流畅；全屏播放页不受影响",
+                                icon = Icons.Default.Album,
+                                selectedValue = com.lm.player.core.designsystem.theme.AppUiPrefs.mainVinylRotation,
+                                options = listOf(true, false),
+                                getLabel = { if (it) "旋转" else "静止" },
+                                onSelect = { enabled ->
+                                    com.lm.player.core.designsystem.theme.AppUiPrefs.updateMainVinylRotation(context, enabled)
+                                }
+                            )
+
+                            // 2026-11-13：全屏播放页隐藏系统顶部状态栏（默认开启）
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingDropdownRow(
+                                title = "播放页隐藏状态栏",
+                                subtitle = "进入播放页时隐藏屏幕顶部的系统状态栏，画面更完整；需要时从屏幕顶部往下滑可临时呼出",
+                                icon = Icons.Default.Fullscreen,
+                                selectedValue = com.lm.player.core.designsystem.theme.AppUiPrefs.hidePlayerStatusBar,
+                                options = listOf(true, false),
+                                getLabel = { if (it) "隐藏" else "显示" },
+                                onSelect = { enabled ->
+                                    com.lm.player.core.designsystem.theme.AppUiPrefs.updateHidePlayerStatusBar(context, enabled)
+                                }
+                            )
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingDropdownRow(
+                                title = "大封面淡入",
+                                subtitle = "黑胶卡、歌单 / 专辑大卡片的封面加载完成时柔和淡入；列表小图始终直接显示",
+                                icon = Icons.Default.Image,
+                                selectedValue = com.lm.player.core.designsystem.theme.AppUiPrefs.coverFadeIn,
+                                options = listOf(true, false),
+                                getLabel = { if (it) "开启" else "关闭" },
+                                onSelect = { enabled ->
+                                    com.lm.player.core.designsystem.theme.AppUiPrefs.updateCoverFadeIn(context, enabled)
+                                }
+                            )
+
+                            // 切页提速（2026-11-11）：「我的」「发现」进入过一次后保留在后台
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingDropdownRow(
+                                title = "切页保留页面",
+                                subtitle = "「我的」「发现」打开过一次后留在后台，来回切换不用重新加载，回来时停在离开的位置；10 分钟不切页自动释放。切页出现异常时可关闭",
+                                icon = Icons.Default.Home,
+                                selectedValue = com.lm.player.core.designsystem.theme.AppUiPrefs.keepPagesAlive,
+                                options = listOf(true, false),
+                                getLabel = { if (it) "开启" else "关闭" },
+                                onSelect = { enabled ->
+                                    com.lm.player.core.designsystem.theme.AppUiPrefs.updateKeepPagesAlive(context, enabled)
                                 }
                             )
                         }
@@ -1783,7 +1946,7 @@ fun SettingsScreen(
                                 // 此时 File.exists() 会对外置目录下的所有曲目返回 false，
                                 // 执行下去会把整个本地曲库误判成"已删除"整批清掉。
                                 if (!LocalMediaScanner.isLocalStorageReadable(context)) {
-                                    Toast.makeText(
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(
                                         context,
                                         "未授予音频读取权限或外置存储未挂载，已跳过清理（未删除任何记录）",
                                         Toast.LENGTH_LONG
@@ -1792,9 +1955,9 @@ fun SettingsScreen(
                                 }
                                 val purgedCount = LocalMediaScanner.purgeLegacyResidualData(database, emptyList(), context)
                                 onLocalScanCompleted()
-                                Toast.makeText(context, "资料库清理完成！成功清理 $purgedCount 条遗留记录", Toast.LENGTH_LONG).show()
+                                com.lm.player.core.designsystem.component.AppToast.makeText(context, "资料库清理完成！成功清理 $purgedCount 条遗留记录", Toast.LENGTH_LONG).show()
                             } catch (e: Exception) {
-                                Toast.makeText(context, "清理异常: ${e.message}", Toast.LENGTH_SHORT).show()
+                                com.lm.player.core.designsystem.component.AppToast.makeText(context, "清理异常: ${e.message}", Toast.LENGTH_SHORT).show()
                             } finally {
                                 isPurgingLegacyData = false
                             }
@@ -1942,9 +2105,9 @@ fun SettingsScreen(
                                         if (res.isSuccess) {
                                             serverDownloadPath = target
                                             showServerPathDialog = false
-                                            Toast.makeText(context, "已成功更新服务端下载路径: $target", Toast.LENGTH_SHORT).show()
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(context, "已成功更新服务端下载路径: $target", Toast.LENGTH_SHORT).show()
                                         } else {
-                                            Toast.makeText(context, "更新失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(context, "更新失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
                                         }
                                     }
                                 }
@@ -2114,11 +2277,11 @@ fun SettingsScreen(
                                         // 只做轻量判断：主线程上不列目录 (1500 首的文件夹列一次也要上百毫秒)
                                         val readable = java.io.File(path).let { it.isDirectory && it.canRead() }
                                         if (!readable) {
-                                            Toast.makeText(context, "无法读取该目录（路径不存在或缺少存储读取权限）。可在 设置 → 存储权限诊断 中查看", Toast.LENGTH_LONG).show()
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(context, "无法读取该目录（路径不存在或缺少存储读取权限）。可在 设置 → 存储权限诊断 中查看", Toast.LENGTH_LONG).show()
                                         } else {
                                             val dlDir = java.io.File(downloadSettings.customDownloadPath.ifBlank { context.getExternalFilesDir(null)?.absolutePath ?: "" })
                                             if (com.lm.player.core.media.LocalScanEngine.start(context, listOf(path), includeMediaStore = false, downloadDir = dlDir)) {
-                                                Toast.makeText(context, "已添加扫描目录，正在后台扫描，进度见「本地音乐路径」", Toast.LENGTH_SHORT).show()
+                                                com.lm.player.core.designsystem.component.AppToast.makeText(context, "已添加扫描目录，正在后台扫描，进度见「本地音乐路径」", Toast.LENGTH_SHORT).show()
                                             }
                                         }
                                     }
@@ -2224,11 +2387,11 @@ fun SettingsScreen(
                                             proto.importSourceScript(importScriptCode.trim())
                                         }
                                         if (res.isSuccess) {
-                                            Toast.makeText(context, "导入成功！", Toast.LENGTH_SHORT).show()
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(context, "导入成功！", Toast.LENGTH_SHORT).show()
                                             sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
                                             showImportScriptDialog = false
                                         } else {
-                                            Toast.makeText(context, "导入失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(context, "导入失败: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
                                         }
                                     }
                                 }
@@ -2270,7 +2433,7 @@ fun SettingsScreen(
                                 )
                                 proto.deleteSource(s.id)
                                 sourceScripts = proto.fetchSourceList().getOrDefault(emptyList())
-                                Toast.makeText(context, "脚本已删除", Toast.LENGTH_SHORT).show()
+                                com.lm.player.core.designsystem.component.AppToast.makeText(context, "脚本已删除", Toast.LENGTH_SHORT).show()
                             }
                         }
                     },
@@ -2485,7 +2648,7 @@ fun SettingsScreen(
         fun resolveServerUrl(): String? {
             val policy = com.lm.player.core.network.ServerUrlPolicy
             val composed = policy.compose(serverUrlInput, portInput).getOrElse {
-                Toast.makeText(context, it.message ?: "服务器地址格式不正确", Toast.LENGTH_LONG).show()
+                com.lm.player.core.designsystem.component.AppToast.makeText(context, it.message ?: "服务器地址格式不正确", Toast.LENGTH_LONG).show()
                 return null
             }
             val (addr, port) = policy.splitForEditing(composed)
@@ -2612,18 +2775,18 @@ fun SettingsScreen(
                                         if (authRes.isSuccess) {
                                             isTestSuccess = true
                                             testResultMsg = "✓ 连接成功 (耗时 ${latency}ms)"
-                                            Toast.makeText(context, "连接成功 (耗时 ${latency}ms)", Toast.LENGTH_SHORT).show()
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(context, "连接成功 (耗时 ${latency}ms)", Toast.LENGTH_SHORT).show()
                                         } else {
                                             isTestSuccess = false
                                             val err = authRes.exceptionOrNull()?.message ?: "鉴权失败"
                                             testResultMsg = "✕ 连接失败: $err"
-                                            Toast.makeText(context, "连接失败: $err", Toast.LENGTH_SHORT).show()
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(context, "连接失败: $err", Toast.LENGTH_SHORT).show()
                                         }
                                     } catch (e: Exception) {
                                         isTestSuccess = false
                                         val err = e.localizedMessage ?: "无法访问服务器"
                                         testResultMsg = "✕ 无法访问: $err"
-                                        Toast.makeText(context, "无法访问: $err", Toast.LENGTH_SHORT).show()
+                                        com.lm.player.core.designsystem.component.AppToast.makeText(context, "无法访问: $err", Toast.LENGTH_SHORT).show()
                                     } finally {
                                         isTestingConnection = false
                                     }
@@ -2684,20 +2847,20 @@ fun SettingsScreen(
                                         if (authRes.isSuccess) {
                                             isTestSuccess = true
                                             testResultMsg = "✓ 连接成功 (耗时 ${latency}ms)"
-                                            Toast.makeText(context, "服务器连接成功，配置已保存", Toast.LENGTH_SHORT).show()
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(context, "服务器连接成功，配置已保存", Toast.LENGTH_SHORT).show()
                                             onAddOrUpdateServer(targetConfig)
                                             showAddServerDialog = false
                                         } else {
                                             isTestSuccess = false
                                             val err = authRes.exceptionOrNull()?.message ?: "鉴权失败"
                                             testResultMsg = "✕ 连接失败: $err (未保存)"
-                                            Toast.makeText(context, "与服务器无法正常连接: $err，未保存配置", Toast.LENGTH_LONG).show()
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(context, "与服务器无法正常连接: $err，未保存配置", Toast.LENGTH_LONG).show()
                                         }
                                     } catch (e: Exception) {
                                         isTestSuccess = false
                                         val err = e.localizedMessage ?: "无法访问服务器"
                                         testResultMsg = "✕ 无法访问: $err (未保存)"
-                                        Toast.makeText(context, "与服务器无法正常连接: $err，未保存配置", Toast.LENGTH_LONG).show()
+                                        com.lm.player.core.designsystem.component.AppToast.makeText(context, "与服务器无法正常连接: $err，未保存配置", Toast.LENGTH_LONG).show()
                                     } finally {
                                         isSavingAndConnecting = false
                                     }
@@ -2739,7 +2902,7 @@ fun SettingsScreen(
             onNeverUpdate = {
                 showUpdateDialog = false
                 AppUpdateManager.setNeverUpdate(context, true)
-                Toast.makeText(context, "已关闭自动更新提醒", Toast.LENGTH_SHORT).show()
+                com.lm.player.core.designsystem.component.AppToast.makeText(context, "已关闭自动更新提醒", Toast.LENGTH_SHORT).show()
             },
             onStartDownload = {
                 if (activeUpdateInfo?.downloadUrl?.isNotBlank() == true && !isDownloadingUpdate) {
@@ -2760,11 +2923,11 @@ fun SettingsScreen(
                             isDownloadingUpdate = false
                             isUpdateDownloaded = true
                             downloadedApkFile = apkFile
-                            Toast.makeText(context, "安装包下载完成，正在调起安装...", Toast.LENGTH_SHORT).show()
+                            com.lm.player.core.designsystem.component.AppToast.makeText(context, "安装包下载完成，正在调起安装...", Toast.LENGTH_SHORT).show()
                             AppUpdateManager.installApk(context, apkFile)
                         }.onFailure { error ->
                             isDownloadingUpdate = false
-                            Toast.makeText(context, "下载更新失败: ${error.message ?: "网络异常"}", Toast.LENGTH_LONG).show()
+                            com.lm.player.core.designsystem.component.AppToast.makeText(context, "下载更新失败: ${error.message ?: "网络异常"}", Toast.LENGTH_LONG).show()
                         }
                         }
                     }
@@ -3215,5 +3378,45 @@ private fun formatStorageSize(bytes: Long): String {
     } else {
         val mb = bytes.toDouble() / (1024.0 * 1024.0)
         String.format(java.util.Locale.getDefault(), "%.1f MB", mb)
+    }
+}
+
+/**
+ * 服务器歌曲加速（2026-11-13）：后台预匹配服务器曲库的开关、进度与「立即补全」。
+ * 预匹配把服务器歌曲在各平台上的对应关系提前存进本地数据库，弱网 / 服务器离线时播放不用现搜。
+ */
+@Composable
+private fun ServerAccelPrematchCard() {
+    val context = LocalContext.current
+    val progress by com.lm.player.core.source.ServerTrackPrematcher.progress.collectAsState()
+    LaunchedEffect(Unit) { com.lm.player.core.source.ServerTrackPrematcher.refreshCounts() }
+    SettingsCard(title = "服务器歌曲加速", icon = Icons.Default.Speed) {
+        Spacer(modifier = Modifier.height(8.dp))
+        SettingSwitchRow(
+            title = "后台预匹配服务器曲库",
+            subtitle = "提前为服务器歌曲找到平台对应，弱网或服务器离线时播放不用现搜；每天最多 ${progress.dailyLimit} 首，播放时自动让路，已下载的歌跳过",
+            checked = progress.enabled,
+            onCheckedChange = { com.lm.player.core.source.ServerTrackPrematcher.setEnabled(context, it) }
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        val detail = buildString {
+            append("已匹配 ${progress.matched} / 共 ${progress.total} 首")
+            if (progress.notFound > 0) append("，未找到 ${progress.notFound} 首")
+            append(" · 今天已补全 ${progress.todayCount} 首")
+            if (progress.status.isNotBlank()) append(" · ${progress.status}")
+        }
+        SettingActionRow(
+            title = "匹配进度",
+            subtitle = detail,
+            actionText = if (progress.running) "补全中…" else "立即补全",
+            onAction = {
+                if (!progress.running) {
+                    com.lm.player.core.source.ServerTrackPrematcher.kick("settings_now", force = true, delayMs = 0L)
+                    com.lm.player.core.designsystem.component.AppToast.makeText(
+                        context, "已开始补全：本次不受每天上限限制，播放时自动让路", Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        )
     }
 }

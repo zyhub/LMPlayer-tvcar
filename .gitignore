@@ -26,3 +26,9 @@ tvcar审计报告.md
 *.iml
 .DS_Store
 *.log
+
+# 签名文件永不上传
+*.jks
+*.keystore
+*keystore.properties
+*signing.properties

@@ -14,6 +14,9 @@ import javax.net.ssl.X509TrustManager
 object NetworkClientFactory {
     private const val TAG = "NetworkClientFactory"
 
+    /** 图片拦截器用：只编译一次（原先每个酷我封面请求都重新编译） */
+    private val KWCDN_HOST_REGEX = Regex("""(?i)(?:[a-zA-Z0-9_\-]+\.)*kwcdn\.kuwo\.cn""")
+
     @Volatile
     private var isConscryptInstalled = false
 
@@ -331,7 +334,7 @@ object NetworkClientFactory {
 
                 // 1. 酷我 kwcdn 在 HTTPS 下会触发 514 频控重定向，替换为 img1 节点
                 if (urlStr.contains("kwcdn.kuwo.cn", ignoreCase = true)) {
-                    urlStr = urlStr.replace(Regex("""(?i)(?:[a-zA-Z0-9_\-]+\.)*kwcdn\.kuwo\.cn"""), "img1.kuwo.cn")
+                    urlStr = urlStr.replace(KWCDN_HOST_REGEX, "img1.kuwo.cn")
                     urlStr = urlStr.replace("img1.img1.kuwo.cn", "img1.kuwo.cn")
                 }
                 if (urlStr.startsWith("http://img1.kuwo.cn/")) {

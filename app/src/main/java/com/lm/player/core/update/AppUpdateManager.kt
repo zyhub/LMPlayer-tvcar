@@ -442,14 +442,14 @@ object AppUpdateManager {
      */
     fun installApk(context: Context, apkFile: File) {
         if (!apkFile.exists()) {
-            Toast.makeText(context, "安装包不存在，请重新下载", Toast.LENGTH_SHORT).show()
+            com.lm.player.core.designsystem.component.AppToast.makeText(context, "安装包不存在，请重新下载", Toast.LENGTH_SHORT).show()
             return
         }
 
         // 安装前再校验一次签名：downloadApk 已校验，但文件在磁盘上可能被替换
         val signerProblem = verifySameSigner(context, apkFile)
         if (signerProblem != null) {
-            Toast.makeText(context, "安装包校验未通过：$signerProblem", Toast.LENGTH_LONG).show()
+            com.lm.player.core.designsystem.component.AppToast.makeText(context, "安装包校验未通过：$signerProblem", Toast.LENGTH_LONG).show()
             Log.e(TAG, "拒绝安装：$signerProblem (file=${apkFile.absolutePath})")
             return
         }
@@ -464,7 +464,7 @@ object AppUpdateManager {
                 true   // 查询失败时不阻断，交给系统安装器判断
             }
             if (!canInstall) {
-                Toast.makeText(
+                com.lm.player.core.designsystem.component.AppToast.makeText(
                     context,
                     "请先允许本应用「安装未知应用」，再重新点击更新",
                     Toast.LENGTH_LONG
@@ -509,7 +509,7 @@ object AppUpdateManager {
             Log.w(TAG, "复制安装包到公共目录失败", e)
             apkFile.absolutePath
         }
-        Toast.makeText(
+        com.lm.player.core.designsystem.component.AppToast.makeText(
             context,
             "已尝试调起安装器失败，安装包已保存至：$exposedPath（可用电视文件管理器或U盘助手安装）",
             Toast.LENGTH_LONG

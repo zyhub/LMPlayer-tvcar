@@ -256,60 +256,20 @@ fun TvPodcastSoundWaveIndicator(
     modifier: Modifier = Modifier,
     color: Color = AppleRed
 ) {
-    val infiniteTransition = rememberInfiniteTransition(label = "podcast_soundwave")
-    val wave1 by infiniteTransition.animateFloat(
-        initialValue = 0.2f,
-        targetValue = 1.0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(450, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "w1"
+    // 2026-11-13 性能优化第 4 项：改用共享 30 帧时钟、只重画不重排（原来 3 条 60 帧无限动画、每帧改高度）
+    com.lm.player.core.designsystem.component.ClockWaveBars(
+        animate = !com.lm.player.core.designsystem.theme.SmoothMode.isActive,
+        color = color,
+        barWidth = 2.5.dp,
+        gap = 2.5.dp,
+        bars = PodcastWaveBars,
+        staticHeights = listOf(0.6f, 0.6f, 0.6f),
+        modifier = modifier.size(width = 12.5.dp, height = 16.dp)
     )
-    val wave2 by infiniteTransition.animateFloat(
-        initialValue = 0.3f,
-        targetValue = 0.9f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(650, easing = LinearEasing, delayMillis = 150),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "w2"
-    )
-    val wave3 by infiniteTransition.animateFloat(
-        initialValue = 0.25f,
-        targetValue = 0.85f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(550, easing = LinearEasing, delayMillis = 80),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "w3"
-    )
-
-    Row(
-        modifier = modifier.height(16.dp),
-        horizontalArrangement = Arrangement.spacedBy(2.5.dp),
-        verticalAlignment = Alignment.Bottom
-    ) {
-        Box(
-            modifier = Modifier
-                .width(2.5.dp)
-                .height(16.dp * wave1)
-                .clip(CircleShape)
-                .background(color)
-        )
-        Box(
-            modifier = Modifier
-                .width(2.5.dp)
-                .height(16.dp * wave2)
-                .clip(CircleShape)
-                .background(color)
-        )
-        Box(
-            modifier = Modifier
-                .width(2.5.dp)
-                .height(16.dp * wave3)
-                .clip(CircleShape)
-                .background(color)
-        )
-    }
 }
+
+private val PodcastWaveBars = listOf(
+    com.lm.player.core.designsystem.component.WaveBarSpec(0.2f, 1.0f, 900f, 0.0),
+    com.lm.player.core.designsystem.component.WaveBarSpec(0.3f, 0.9f, 1300f, 1.7),
+    com.lm.player.core.designsystem.component.WaveBarSpec(0.25f, 0.85f, 1100f, 3.4)
+)
