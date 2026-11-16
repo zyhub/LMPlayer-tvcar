@@ -162,34 +162,70 @@ object ExitDiagnostics {
         Thread({
             var reportedThisHang = false
             var reports = 0
+            // 只累计「看门狗自己按时醒来、主线程却没回应」的时间（2026-11-15 修正误报）：
+            // 以前直接拿「现在 − 上次回应」算，进程在后台被系统冻结（华为等省电策略）一冻十几分钟，
+            // 解冻后看门狗先醒、主线程还没来得及处理探针，就报成「主线程卡住 1034 秒」——其实主线程一直是空闲的
+            var stallMs = 0L
+            var lastTick = SystemClock.uptimeMillis()
             while (true) {
+                val postedAt = SystemClock.uptimeMillis()
                 main.post(ack)
                 try {
                     Thread.sleep(1_000L)
                 } catch (_: InterruptedException) {
                     return@Thread
                 }
-                val stall = SystemClock.uptimeMillis() - lastAck
-                if (stall >= HANG_MS) {
-                    if (!reportedThisHang && reports < 3) {
-                        reportedThisHang = true
-                        reports++
-                        val stack = Looper.getMainLooper().thread.stackTrace.joinToString("\n") { "    at $it" }
-                        Log.w(TAG, "main thread stalled ${stall}ms")
-                        CrashLogger.writeExtraReport(
-                            app,
-                            "主线程卡住记录",
-                            "主线程已经 ${stall / 1000} 秒没有响应（超过 5 秒系统会判定无响应并可能直接结束程序）。\n" +
-                                "卡住时主线程正在执行：\n$stack"
-                        )
-                    }
-                } else if (stall < 2_000L) {
+                val now = SystemClock.uptimeMillis()
+                val tick = now - lastTick
+                lastTick = now
+                if (tick > 3_000L) {
+                    // 看门狗自己也被耽误了很久：整个进程被冻结 / 挂起过，这段时间不算主线程卡住
+                    stallMs = 0L
                     reportedThisHang = false
+                    continue
+                }
+                if (lastAck >= postedAt) {
+                    // 主线程按时处理了探针
+                    stallMs = 0L
+                    reportedThisHang = false
+                    continue
+                }
+                stallMs += tick
+                if (stallMs >= HANG_MS && !reportedThisHang && reports < 3) {
+                    val frames = Looper.getMainLooper().thread.stackTrace
+                    // 主线程停在消息循环本身（没有任何业务代码在执行）：是空闲 / 刚被唤醒，不是卡住
+                    if (isIdleLoopStack(frames)) continue
+                    reportedThisHang = true
+                    reports++
+                    val stack = frames.joinToString("\n") { "    at $it" }
+                    Log.w(TAG, "main thread stalled ${stallMs}ms")
+                    CrashLogger.writeExtraReport(
+                        app,
+                        "主线程卡住记录",
+                        "主线程已经 ${stallMs / 1000} 秒没有响应（超过 5 秒系统会判定无响应并可能直接结束程序）。\n" +
+                            "卡住时主线程正在执行：\n$stack"
+                    )
                 }
             }
         }, "main-watchdog").apply {
             isDaemon = true
             priority = Thread.MIN_PRIORITY
         }.start()
+    }
+
+    /** 主线程堆栈全是消息循环 / 进程入口本身（没有业务代码）：空闲或刚被唤醒 */
+    private fun isIdleLoopStack(frames: Array<StackTraceElement>): Boolean {
+        if (frames.isEmpty()) return true
+        val idlePrefixes = listOf(
+            "android.os.MessageQueue",
+            "android.os.Looper",
+            "android.os.ThreadLocalWorkSource",
+            "android.os.Binder.",
+            "java.lang.ThreadLocal",
+            "android.app.ActivityThread",
+            "java.lang.reflect.Method",
+            "com.android.internal.os."
+        )
+        return frames.all { f -> idlePrefixes.any { f.className.startsWith(it) || "${f.className}.".startsWith(it) } }
     }
 }
