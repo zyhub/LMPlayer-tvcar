@@ -27,6 +27,19 @@ LMPlayer TV 是 [柠檬音乐服务端（lemon-muisc）](https://github.com/jia0
 - **歌单与下载**：多选加入 / 移出歌单；按所选音质下载，已有且音质达标的歌曲自动跳过，全局下载窗口查看进度。
 - **更多**：点歌台首字母快搜、播客、桌面小组件、应用内检查更新。
 
+## 截图
+
+| 我的 | 搜索 |
+| :---: | :---: |
+| <img src="docs/screenshots/01_home.webp" width="420" alt="我的" /> | <img src="docs/screenshots/02_search.webp" width="420" alt="搜索" /> |
+| **发现** | **播放页 · 黑胶唱片** |
+| <img src="docs/screenshots/03_discover.webp" width="420" alt="发现" /> | <img src="docs/screenshots/04_player_vinyl.webp" width="420" alt="播放页 · 黑胶唱片" /> |
+
+<p align="center">
+  <img src="docs/screenshots/05_player_cardflow.webp" width="860" alt="播放页 · 专辑卡片" /><br />
+  播放页 · 专辑卡片
+</p>
+
 ## 下载安装
 
 在 [Releases](https://github.com/zyhub/LMPlayer-tvcar/releases) 下载最新的 `LMPlayerTV-<版本号>.apk`，用 U 盘拷贝或在设备上直接下载安装（首次需允许安装未知来源应用）。
