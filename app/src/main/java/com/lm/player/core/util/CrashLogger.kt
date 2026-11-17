@@ -100,8 +100,10 @@ object CrashLogger {
         }
     }
 
+    /** 版本号 + 构建时间（版本号锁定后每次出包都相同，构建时间才能分辨是哪一次的包） */
     private fun versionName(context: Context): String = runCatching {
         @Suppress("DEPRECATION")
-        context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "?"
+        val name = context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "?"
+        "$name（构建 ${com.lm.player.BuildConfig.BUILD_TIME}）"
     }.getOrDefault("?")
 }

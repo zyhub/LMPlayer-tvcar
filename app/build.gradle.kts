@@ -1,4 +1,7 @@
 ﻿import java.util.Properties
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.TimeZone
 
 plugins {
     id("com.android.application")
@@ -46,6 +49,15 @@ android {
         // 【版本号已锁定】按维护者要求固定为 1.10.33 (80)（2026-11-08 由 1.10.32 升级），编译出包时不要自动递增；如需变更请先征得维护者同意
         versionCode = 80
         versionName = "1.10.33"
+        // 构建时间（北京时间，2026-11-16）：版本号锁定后每次出包都叫 1.10.33，靠它分辨装的是哪一次的包；
+        // 崩溃 / 卡住记录与设置「运行诊断」里都会显示
+        buildConfigField(
+            "String",
+            "BUILD_TIME",
+            "\"" + SimpleDateFormat("yyyy-MM-dd HH:mm").apply {
+                timeZone = TimeZone.getTimeZone("Asia/Shanghai")
+            }.format(Date()) + "\""
+        )
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

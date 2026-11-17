@@ -169,7 +169,10 @@ object ExitDiagnostics {
             var lastTick = SystemClock.uptimeMillis()
             while (true) {
                 val postedAt = SystemClock.uptimeMillis()
-                main.post(ack)
+                // 探针用「异步消息」（2026-11-16）：界面在后台时系统可能停发画面刷新信号，消息队列里留着一道
+                // 「等下一帧刷新」的屏障，普通消息会被挡在后面，但主线程其实是空闲的（堆栈停在 nativePollOnce）。
+                // 异步消息不受这道屏障影响，测的才是主线程真的有没有在忙
+                main.sendMessage(android.os.Message.obtain(main, ack).apply { isAsynchronous = true })
                 try {
                     Thread.sleep(1_000L)
                 } catch (_: InterruptedException) {

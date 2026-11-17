@@ -778,6 +778,22 @@ fun SettingsScreen(
                     // 运行诊断（2026-11-13 从「本地存储」挪到这里，紧跟软件更新）：车机没有 adb，直接在这里看 / 复制
                     item {
                         SettingsCard(title = "运行诊断", icon = Icons.Default.Info) {
+                            // 安装包构建时间（2026-11-16）：版本号锁定后每次出包都叫 1.10.33，用它核对装的是哪一次的包
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SettingActionRow(
+                                title = "安装包构建时间",
+                                subtitle = "${com.lm.player.BuildConfig.VERSION_NAME} · 构建于 ${com.lm.player.BuildConfig.BUILD_TIME}（北京时间）",
+                                actionText = "复制",
+                                onAction = {
+                                    val text = "${com.lm.player.BuildConfig.VERSION_NAME} 构建 ${com.lm.player.BuildConfig.BUILD_TIME}"
+                                    runCatching {
+                                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                        cm.setPrimaryClip(android.content.ClipData.newPlainText("构建时间", text))
+                                    }
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已复制：$text", Toast.LENGTH_SHORT).show()
+                                }
+                            )
+
                             // 启动提速：最近一次冷启动各节点耗时（距进程启动），用于在车机上直接对比优化前后
                             Spacer(modifier = Modifier.height(8.dp))
                             val startupSummary = remember { com.lm.player.core.startup.StartupTrace.lastSummary(context) }
