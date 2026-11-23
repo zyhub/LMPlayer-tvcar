@@ -194,6 +194,7 @@ fun TvPlayerThemeContent(theme: PlayerThemeStyle, input: TvThemeInput) {
     when (theme) {
         PlayerThemeStyle.IPOD_RETRO -> TvCardFlowTheme(input)
         PlayerThemeStyle.NETEASE_TV_COVER -> TvFullCoverTheme(input)
+        PlayerThemeStyle.RECORD_SLEEVE -> TvSleeveTheme(input)
         else -> TvVinylTheme(input)
     }
 }

@@ -565,9 +565,16 @@ class PlaybackRouter(
         // 2026-11-13：播放的是本机文件（已下载 / 已缓存 / 本地导入）时，优先用它自己的封面
         // （应用缓存里的封面，缓存被清掉就从音频文件重新取内嵌封面）。在线模式下这类歌曲的封面是服务器地址，
         // 启动时还没登录完、服务器偶尔超时都会加载失败；本地封面不依赖服务器和登录
+        // 2026-11-22 修正「本地歌曲切歌后封面闪一下」：只有原封面显示不出来时才换成本机封面
+        // （没有封面 / 地址已失效 / 网络封面还没缓存过）。已经能显示的封面保持原地址 ——
+        // 以前一律换，播放一开始封面地址就变了，播放页和黑胶卡都要重新解码一张本机原图，期间露出底色
         val localCover: String? = if (resolvedLocalPath != null && !com.lm.player.core.media.LocalCoverResolver.isUsableLocalCover(song.coverUrl)) {
             withContext(Dispatchers.IO) {
-                runCatching { com.lm.player.core.media.LocalCoverResolver.resolve(context, song.id, resolvedLocalPath) }.getOrNull()
+                val keepCurrent = song.coverUrl.isNotBlank() &&
+                    !com.lm.player.core.network.LemonMusicProtocol.isKnownMissingEmbeddedCoverUrl(song.coverUrl) &&
+                    runCatching { isCurrentCoverDisplayable(song.coverUrl) }.getOrDefault(false)
+                if (keepCurrent) null
+                else runCatching { com.lm.player.core.media.LocalCoverResolver.resolve(context, song.id, resolvedLocalPath) }.getOrNull()
             }
         } else null
 
@@ -645,6 +652,21 @@ class PlaybackRouter(
             .apply { if (cacheKey != null) setCustomCacheKey(cacheKey) }
             .setMediaMetadata(metadataBuilder.build())
             .build()
+    }
+
+    /**
+     * 网络封面此刻能不能直接显示（图片缓存里已经有它，或服务器封面对应的平台封面已缓存）。
+     * 能显示就不换成本机封面，避免播放开始时封面地址变化引起闪烁。必须在 IO 线程调用
+     */
+    private suspend fun isCurrentCoverDisplayable(coverUrl: String): Boolean {
+        val cached = com.lm.player.core.designsystem.component.isNetworkCoverCached(context, coverUrl) ?: return false
+        if (cached) return true
+        // 服务器封面与平台封面竞速时，可能是平台那张进了缓存
+        val alt = runCatching {
+            com.lm.player.core.source.ServerTrackAccelStore.platformCoverForServerCoverUrl(coverUrl)
+        }.getOrNull()
+        return !alt.isNullOrBlank() &&
+            com.lm.player.core.designsystem.component.isNetworkCoverCached(context, alt) == true
     }
 
     /** 播客单集的 MediaItem：流地址为 RSS 音频直链或服务器代理地址 */

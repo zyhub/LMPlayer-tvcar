@@ -852,9 +852,6 @@ class MainActivity : ComponentActivity() {
 
             // 全屏播放页隐藏系统顶部状态栏（设置「播放页隐藏状态栏」，默认开启）；离开播放页恢复显示
             val hidePlayerStatusBar = com.lm.player.core.designsystem.theme.AppUiPrefs.hidePlayerStatusBar
-            LaunchedEffect(isFullPlayerVisible, hidePlayerStatusBar) {
-                applyPlayerStatusBar(isFullPlayerVisible && hidePlayerStatusBar)
-            }
 
             // 桌面搜索小部件：带关键词进入搜索页 / 打开资料库（离开搜索页后清掉关键词，免得下次手动进入还带着）
             var widgetSearchQuery by remember { mutableStateOf("") }
@@ -883,6 +880,45 @@ class MainActivity : ComponentActivity() {
             var fullPlayerEnterSettled by remember { mutableStateOf(false) }
             var fullPlayerSheetCovering by remember { mutableStateOf(true) }
             var isLyricsMode by remember { mutableStateOf(false) }
+
+            // 专辑卡片 / 全屏封面与主界面卡片之间过渡时（2026-11-22）：状态栏等播放页完全盖住主界面后再隐藏、
+            // 一开始收回就恢复 —— 状态栏显隐会让主界面上下挪一点，挪动都发生在被盖住的时候，卡片落位后不再跳。
+            // 过渡状态在 snapshotFlow 里读，不让整个界面跟着重组
+            LaunchedEffect(isFullPlayerVisible, hidePlayerStatusBar) {
+                snapshotFlow {
+                    isFullPlayerVisible && hidePlayerStatusBar &&
+                        (!com.lm.player.feature.player.tv.PlayerCardHandoff.active ||
+                            (fullPlayerSheetCovering &&
+                                com.lm.player.feature.player.tv.PlayerCardHandoff.coversHome(com.lm.player.feature.player.tv.PlayerCardHandoff.progress)))
+                }.collect { applyPlayerStatusBar(it) }
+            }
+
+            // 启动后直接进入播放页（设置「启动后进入播放页」，2026-11-23）：只在这次界面全新打开时做一次
+            // （转屏 / 被系统回收后恢复的不算）；等上次的歌恢复出来、首次运行的平台选择完成后再打开。
+            // 「上次在播放页退出时」要在本次记录播放页开关之前读出上一次的记录
+            val openPlayerOnLaunch = remember {
+                com.lm.player.core.designsystem.theme.AppUiPrefs.shouldOpenPlayerOnLaunch(this@MainActivity)
+            }
+            var launchPlayerHandled by rememberSaveable { mutableStateOf(false) }
+            LaunchedEffect(Unit) {
+                if (launchPlayerHandled) return@LaunchedEffect
+                launchPlayerHandled = true
+                if (!openPlayerOnLaunch) return@LaunchedEffect
+                val ready = kotlinx.coroutines.withTimeoutOrNull(10_000L) {
+                    snapshotFlow { currentSong != null && platformModeState.value != null }
+                        .first { it }
+                }
+                if (ready != true) return@LaunchedEffect
+                // 让主界面先排好版（左侧播放卡片的位置量出来，播放页才能从卡片翻出来）
+                delay(350L)
+                if (!isFullPlayerVisible && com.lm.player.core.widget.WidgetLaunch.pending.value == null) {
+                    isSearchDialogOpen = false
+                    isFullPlayerVisible = true
+                }
+            }
+            LaunchedEffect(isFullPlayerVisible) {
+                com.lm.player.core.designsystem.theme.AppUiPrefs.recordPlayerVisible(this@MainActivity, isFullPlayerVisible)
+            }
 
             // 播放页主题风格 (决定进入/退出播放页的转场方式：「全屏封面」走底部滑入滑出)
             var playerThemeStyle by remember {
@@ -2967,7 +3003,10 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier
                                 .fillMaxSize()
                                 .drawWithContent {
-                                    val covered = isFullPlayerVisible && fullPlayerEnterSettled && fullPlayerSheetCovering
+                                    val covered = isFullPlayerVisible && fullPlayerEnterSettled && fullPlayerSheetCovering &&
+                                        // 与主界面卡片之间收拢 / 翻转时，播放页背景完全不透明之前主界面要照画
+                                        (!com.lm.player.feature.player.tv.PlayerCardHandoff.active ||
+                                            com.lm.player.feature.player.tv.PlayerCardHandoff.coversHome(com.lm.player.feature.player.tv.PlayerCardHandoff.progress))
                                     if (!covered) drawContent()
                                 }
                         ) {
@@ -4360,9 +4399,16 @@ class MainActivity : ComponentActivity() {
                     val useSlideTransition = playerThemeStyle ==
                         com.lm.player.core.designsystem.theme.PlayerThemeStyle.NETEASE_TV_COVER ||
                         playerThemeStyle == com.lm.player.core.designsystem.theme.PlayerThemeStyle.KARAOKE_COVER
+                    // 「专辑卡片」「全屏封面」与主界面左侧播放卡片之间的收拢 / 翻转过渡（2026-11-22）：
+                    // 画面全由播放页自己做，外层不再淡入缩放 / 滑入；退场时画面已经收回主界面，只留一个很短的淡出兜底
+                    remember { com.lm.player.feature.player.tv.TvPlayerPrefs.ensureLoaded(this@MainActivity) }
+                    val useCardHandoff = !com.lm.player.core.podcast.PodcastSongs.isPodcast(currentSong) &&
+                        com.lm.player.feature.player.tv.PlayerCardHandoff.canRun(com.lm.player.feature.player.tv.TvPlayerPrefs.theme)
                     AnimatedVisibility(
                         visible = isFullPlayerVisible && currentSong != null,
-                        enter = if (useSlideTransition) {
+                        enter = if (useCardHandoff) {
+                            androidx.compose.animation.EnterTransition.None
+                        } else if (useSlideTransition) {
                             slideInVertically(
                                 initialOffsetY = { it },
                                 animationSpec = androidx.compose.animation.core.tween(320)
@@ -4370,7 +4416,9 @@ class MainActivity : ComponentActivity() {
                         } else {
                             fadeIn(animationSpec = androidx.compose.animation.core.tween(220)) + scaleIn(initialScale = 0.96f, animationSpec = androidx.compose.animation.core.tween(220))
                         },
-                        exit = if (useSlideTransition) {
+                        exit = if (useCardHandoff) {
+                            fadeOut(animationSpec = androidx.compose.animation.core.tween(150))
+                        } else if (useSlideTransition) {
                             slideOutVertically(
                                 targetOffsetY = { it },
                                 animationSpec = androidx.compose.animation.core.tween(260)

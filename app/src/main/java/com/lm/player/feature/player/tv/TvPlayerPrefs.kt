@@ -35,7 +35,11 @@ object TvPlayerPrefs {
     private val fontSizes = mutableStateMapOf<PlayerThemeStyle, Float>()
 
     /** 三个可选主题（顺序即主题面板里的顺序） */
-    val selectableThemes = listOf(PlayerThemeStyle.MODERN, PlayerThemeStyle.IPOD_RETRO, PlayerThemeStyle.NETEASE_TV_COVER)
+    val selectableThemes = listOf(
+        PlayerThemeStyle.MODERN, PlayerThemeStyle.IPOD_RETRO, PlayerThemeStyle.NETEASE_TV_COVER,
+        // 2026-11-23 新增
+        PlayerThemeStyle.RECORD_SLEEVE
+    )
 
     fun ensureLoaded(context: Context) {
         if (prefs != null) return

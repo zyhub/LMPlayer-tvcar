@@ -1857,6 +1857,20 @@ fun SettingsScreen(
                                 }
                             )
 
+                            // 2026-11-23：启动后直接进入播放页
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingDropdownRow(
+                                title = "启动后进入播放页",
+                                subtitle = "「上次在播放页退出时」：上次关掉软件（或车辆熄火）时停在播放页，这次打开直接回到播放页；「每次打开」：只要有上次播放的歌，打开就进播放页",
+                                icon = Icons.Default.PlayCircle,
+                                selectedValue = com.lm.player.core.designsystem.theme.AppUiPrefs.playerOnLaunch,
+                                options = com.lm.player.core.designsystem.theme.PlayerOnLaunch.values().toList(),
+                                getLabel = { it.label },
+                                onSelect = { mode ->
+                                    com.lm.player.core.designsystem.theme.AppUiPrefs.updatePlayerOnLaunch(context, mode)
+                                }
+                            )
+
                             Spacer(modifier = Modifier.height(10.dp))
                             SettingDropdownRow(
                                 title = "主界面黑胶旋转",
@@ -1867,6 +1881,20 @@ fun SettingsScreen(
                                 getLabel = { if (it) "旋转" else "静止" },
                                 onSelect = { enabled ->
                                     com.lm.player.core.designsystem.theme.AppUiPrefs.updateMainVinylRotation(context, enabled)
+                                }
+                            )
+
+                            // 2026-11-22：主界面左侧播放卡片的主图跟随播放页主题（默认跟随）
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingDropdownRow(
+                                title = "主界面播放卡片样式",
+                                subtitle = "跟随播放页主题：专辑卡片显示一排小封面、全屏封面显示叠在一起的封面，进出播放页时卡片收拢 / 翻转衔接；固定黑胶：始终显示黑胶唱片",
+                                icon = Icons.Default.Image,
+                                selectedValue = com.lm.player.core.designsystem.theme.AppUiPrefs.homeCardFollowTheme,
+                                options = listOf(true, false),
+                                getLabel = { if (it) "跟随播放页主题" else "固定黑胶" },
+                                onSelect = { enabled ->
+                                    com.lm.player.core.designsystem.theme.AppUiPrefs.updateHomeCardFollowTheme(context, enabled)
                                 }
                             )
 

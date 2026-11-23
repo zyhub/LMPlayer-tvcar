@@ -6,7 +6,11 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitTouchSlopOrCancellation
+import androidx.compose.foundation.gestures.drag as awaitPointerDrag
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.ui.zIndex
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
@@ -294,10 +298,17 @@ fun AdaptiveAppScaffold(
             horizontalArrangement = Arrangement.spacedBy(18.dp)
         ) {
             // 左侧常驻黑胶唱片播控大卡 (~29% 宽度)
+            // 专辑卡片 / 全屏封面主题退出播放页时，这张卡片会从播放页那边翻回来：一开始收回就恢复实时显示（歌词换成当前歌曲）
+            val cardExposedByHandoff by remember {
+                derivedStateOf {
+                    com.lm.player.feature.player.tv.PlayerCardHandoff.active &&
+                        !com.lm.player.feature.player.tv.PlayerCardHandoff.coversHome(com.lm.player.feature.player.tv.PlayerCardHandoff.progress)
+                }
+            }
             TvPersistentVinylPlayerCard(
                 song = currentPlayingSong,
                 isPlaying = isPlaying,
-                animateVinyl = !isFullPlayerVisible,
+                animateVinyl = !isFullPlayerVisible || cardExposedByHandoff,
                 progressMsProvider = progressMsProvider,
                 totalDurationMs = totalDurationMs,
                 currentLyrics = currentLyrics,
@@ -315,6 +326,8 @@ fun AdaptiveAppScaffold(
                 modifier = Modifier
                     .width(dimensions.scale(276.dp))
                     .fillMaxHeight()
+                    // 翻转飞行时这张卡片会飞到右侧内容上方：画在右侧内容之后
+                    .zIndex(1f)
             )
 
             // 右侧 70% 动态主内容舞台
@@ -484,6 +497,16 @@ private fun TvPersistentVinylPlayerCard(
         return if (drag != null && effectiveDuration > 0L) (drag * effectiveDuration).toLong() else progressMsProvider()
     }
 
+    // 2026-11-22：主图跟随播放页主题（黑胶 / 一排封面 / 叠卡）
+    val heroStyle = rememberHomeHeroStyle()
+    val heroHeight = dimensions.scale(164.dp)
+    val currentSong by rememberUpdatedState(song)
+    val currentHeroStyle by rememberUpdatedState(heroStyle)
+    val currentOpen by rememberUpdatedState(onOpenFullPlayer)
+    val screenWidthPx = with(androidx.compose.ui.platform.LocalDensity.current) {
+        androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.dp.toPx()
+    }
+
     Surface(
         shape = RoundedCornerShape(24.dp),
         color = Color.Transparent,
@@ -492,6 +515,69 @@ private fun TvPersistentVinylPlayerCard(
             if (isPlaying) Color(0xFFFFC947).copy(alpha = 0.32f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.25f)
         ),
         modifier = modifier
+            // 卡片的静止位置（放在翻转图层之前：量到的是没变换时的位置）
+            .onGloballyPositioned { com.lm.player.feature.player.tv.PlayerCardHandoff.homeCardRect = it.boundsInRoot() }
+            // 专辑卡片 / 全屏封面主题：按住卡片上方的封面往右或往上拉，播放页跟着手指翻出来（2026-11-22）。
+            // 手势挂在翻转图层之前，手指坐标不受卡片自己翻转移动的影响
+            .pointerInput(Unit) {
+                val heroBottomPx = (14.dp + 4.dp + heroHeight + 6.dp).toPx()
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    if (down.position.y > heroBottomPx) return@awaitEachGesture
+                    if (currentSong == null || currentHeroStyle == HomeHeroStyle.VINYL) return@awaitEachGesture
+                    if (!com.lm.player.feature.player.tv.PlayerCardHandoff.canRun(com.lm.player.feature.player.tv.TvPlayerPrefs.theme)) return@awaitEachGesture
+                    val start = down.position
+                    // 只认往右或往上拉；其它方向不当作拉出（交给点击等）
+                    val slop = awaitTouchSlopOrCancellation(down.id) { change, _ ->
+                        val d = change.position - start
+                        if ((d.x > 0f && d.x >= kotlin.math.abs(d.y)) || (d.y < 0f && -d.y >= kotlin.math.abs(d.x))) change.consume()
+                    } ?: return@awaitEachGesture
+                    val span = (screenWidthPx * 0.4f).coerceAtLeast(1f)
+                    val tracker = androidx.compose.ui.input.pointer.util.VelocityTracker()
+                    tracker.addPosition(slop.uptimeMillis, slop.position)
+                    com.lm.player.feature.player.tv.PlayerCardHandoff.startHomeDrag()
+                    currentOpen()
+                    fun progressOf(pos: Offset): Float {
+                        val d = pos - start
+                        return (maxOf(d.x, -d.y).coerceAtLeast(0f) / span).coerceIn(0f, 1f)
+                    }
+                    com.lm.player.feature.player.tv.PlayerCardHandoff.progress = progressOf(slop.position)
+                    val finished = awaitPointerDrag(slop.id) { change ->
+                        tracker.addPosition(change.uptimeMillis, change.position)
+                        com.lm.player.feature.player.tv.PlayerCardHandoff.progress = progressOf(change.position)
+                        change.consume()
+                    }
+                    val p = com.lm.player.feature.player.tv.PlayerCardHandoff.progress
+                    val v = tracker.calculateVelocity()
+                    val vp = (maxOf(v.x, -v.y) / span).coerceIn(-8f, 8f)
+                    val open = finished && (p > 0.2f || vp > 1.2f)
+                    com.lm.player.feature.player.tv.PlayerCardHandoff.releaseHomeDrag(if (open) 1f else 0f, if (finished) vp else 0f)
+                }
+            }
+            // 翻转飞行的后半程：这张卡片就是那张卡的背面，从播放页那边翻回来、落进卡槽（打开时反过来）
+            .graphicsLayer {
+                val h = com.lm.player.feature.player.tv.PlayerCardHandoff
+                // 全屏封面放大状态（缩放模式）：卡片原地不动，只有里面那张封面由播放页的封面缩进来
+                if (!h.active || h.zoomMode) return@graphicsLayer
+                val home = h.homeCardRect ?: return@graphicsLayer
+                val p = h.progress
+                // 播放页那张卡的位置还没量出来（拉出的头一两帧）：先按卡片右侧附近估一个
+                val player = h.playerCardRect ?: androidx.compose.ui.geometry.Rect(
+                    center = Offset(home.right + home.width * 1.4f, home.center.y),
+                    radius = home.width * 0.55f
+                )
+                val f = h.flightAt(p, home, player)
+                if (f.frontVisible) {
+                    alpha = 0f
+                    return@graphicsLayer
+                }
+                translationX = f.cx - home.center.x
+                translationY = f.cy - home.center.y
+                scaleX = f.backScale
+                scaleY = f.backScale
+                rotationY = f.backRotationY
+                cameraDistance = 16f * density
+            }
     ) {
         // 界面美化：卡片底色跟随当前封面取色（Antigravity 设计的 CoverTintBackground；
         // 没封面 / 还没算出时与原来的固定渐变底色一致）。原 .background(cardBg) 由这一层取代。
@@ -512,6 +598,33 @@ private fun TvPersistentVinylPlayerCard(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.SpaceBetween
             ) {
+                if (heroStyle != HomeHeroStyle.VINYL) {
+                    // 专辑卡片 → 一排小封面；全屏封面 → 叠在一起的封面（点它进入播放页，往右 / 往上拉也能拉出来）
+                    Box(
+                        modifier = Modifier
+                            .padding(top = 4.dp)
+                            .fillMaxWidth()
+                            .height(heroHeight)
+                            .focusRequester(cardFocusRequester)
+                            .tvFocusable(
+                                shape = RoundedCornerShape(14.dp),
+                                focusedScale = 1.03f,
+                                focusedBorderColor = Color(0xFFFFC947),
+                                onClick = {
+                                    if (song != null) {
+                                        try { onOpenFullPlayer() } catch (_: Exception) {}
+                                    }
+                                }
+                            )
+                    ) {
+                        when (heroStyle) {
+                            HomeHeroStyle.COVER_FLOW -> HomeCoverFlowHero(song, Modifier.fillMaxSize())
+                            // 2026-11-23 唱片封套主题的主界面小播放器
+                            HomeHeroStyle.SLEEVE -> HomeSleeveHero(song, isPlaying, { vinylRotation.value }, Modifier.fillMaxSize())
+                            else -> HomeStackHero(song, Modifier.fillMaxSize())
+                        }
+                    }
+                } else
                 Box(
                     modifier = Modifier
                         .padding(top = 4.dp)

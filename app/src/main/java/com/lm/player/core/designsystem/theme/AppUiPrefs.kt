@@ -17,6 +17,17 @@ enum class StartPage(val label: String) {
     LAST("上次离开的页面")
 }
 
+/** 启动后是否直接进入播放页（2026-11-23） */
+enum class PlayerOnLaunch(val label: String) {
+    OFF("关闭"),
+
+    /** 上次是在播放页里退出 / 被关掉的，这次打开直接回到播放页 */
+    IF_LAST_IN_PLAYER("上次在播放页退出时"),
+
+    /** 每次打开都直接进播放页（有歌可放时） */
+    ALWAYS("每次打开")
+}
+
 /**
  * TV 端界面偏好（2026-11-08 界面优化）：启动页面、主界面黑胶旋转、大封面淡入。
  * 值是 Compose 可观察状态，设置页修改后界面立即生效。
@@ -29,6 +40,9 @@ object AppUiPrefs {
     private const val KEY_COVER_FADE_IN = "ui_cover_fade_in_v1"
     private const val KEY_KEEP_PAGES_ALIVE = "ui_keep_pages_alive_v1"
     private const val KEY_HIDE_PLAYER_STATUS_BAR = "ui_player_hide_status_bar_v1"
+    private const val KEY_HOME_CARD_FOLLOW_THEME = "ui_home_card_follow_theme_v1"
+    private const val KEY_PLAYER_ON_LAUNCH = "ui_player_on_launch_v1"
+    private const val KEY_LAST_IN_PLAYER = "ui_last_in_player_v1"
 
     @Volatile
     private var initialized = false
@@ -52,6 +66,17 @@ object AppUiPrefs {
     var hidePlayerStatusBar by mutableStateOf(true)
         private set
 
+    /**
+     * 主界面左侧播放卡片的主图跟随播放页主题（2026-11-22，默认开启）：专辑卡片 → 小号的一排封面，
+     * 全屏封面 → 叠在一起的封面，黑胶 → 黑胶。关闭后固定显示黑胶。
+     */
+    var homeCardFollowTheme by mutableStateOf(true)
+        private set
+
+    /** 启动后直接进入播放页（默认关闭） */
+    var playerOnLaunch by mutableStateOf(PlayerOnLaunch.OFF)
+        private set
+
     /** 须在 [SmoothMode.init] 之后调用：大封面淡入的默认值随流畅模式（流畅模式下默认关闭） */
     fun init(context: Context) {
         if (initialized) return
@@ -64,6 +89,32 @@ object AppUiPrefs {
         else !SmoothMode.activeAtStartup
         keepPagesAlive = p.getBoolean(KEY_KEEP_PAGES_ALIVE, true)
         hidePlayerStatusBar = p.getBoolean(KEY_HIDE_PLAYER_STATUS_BAR, true)
+        homeCardFollowTheme = p.getBoolean(KEY_HOME_CARD_FOLLOW_THEME, true)
+        playerOnLaunch = runCatching { PlayerOnLaunch.valueOf(p.getString(KEY_PLAYER_ON_LAUNCH, PlayerOnLaunch.OFF.name)!!) }
+            .getOrDefault(PlayerOnLaunch.OFF)
+    }
+
+    fun updatePlayerOnLaunch(context: Context, mode: PlayerOnLaunch) {
+        playerOnLaunch = mode
+        prefs(context).edit().putString(KEY_PLAYER_ON_LAUNCH, mode.name).apply()
+    }
+
+    /** 记下播放页此刻是否开着（打开 / 关上时调用）：下次启动据此判断「上次是不是在播放页退出的」 */
+    fun recordPlayerVisible(context: Context, visible: Boolean) {
+        val p = prefs(context)
+        if (p.getBoolean(KEY_LAST_IN_PLAYER, false) != visible) p.edit().putBoolean(KEY_LAST_IN_PLAYER, visible).apply()
+    }
+
+    /** 这次打开要不要直接进播放页；须在本次界面记录播放页状态之前读取 */
+    fun shouldOpenPlayerOnLaunch(context: Context): Boolean = when (playerOnLaunch) {
+        PlayerOnLaunch.OFF -> false
+        PlayerOnLaunch.IF_LAST_IN_PLAYER -> prefs(context).getBoolean(KEY_LAST_IN_PLAYER, false)
+        PlayerOnLaunch.ALWAYS -> true
+    }
+
+    fun updateHomeCardFollowTheme(context: Context, enabled: Boolean) {
+        homeCardFollowTheme = enabled
+        prefs(context).edit().putBoolean(KEY_HOME_CARD_FOLLOW_THEME, enabled).apply()
     }
 
     fun updateHidePlayerStatusBar(context: Context, enabled: Boolean) {

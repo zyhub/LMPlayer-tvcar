@@ -105,17 +105,30 @@ fun TvVinylTheme(input: TvThemeInput) {
     )
     // 从主界面小黑胶飞入（0 = 在主界面小黑胶的位置，1 = 到位）
     val flight = remember { Animatable(if (VinylHandoff.consume()) 0f else 1f) }
-    // 实际用的飞行进度：再乘上手指下滑收回的进度（下滑时唱片跟着手指飞回主界面小黑胶）
-    fun fl(): Float = flight.value * (1f - input.recallProgress())
+    // 实际用的飞行进度：再乘上手指下滑收回的进度（下滑时唱片跟着手指飞回主界面小黑胶）。
+    // 2026-11-22 磁吸落位：飞入 / 飞回改用带轻微回弹的弹簧，唱片到位时会多走一点再回来；
+    // flRaw 可略超出 0～1（只用于唱片的位置与大小），fl 截在 0～1（用于透明度）
+    fun flRaw(): Float = flight.value * (1f - input.recallProgress())
+    fun fl(): Float = flRaw().coerceIn(0f, 1f)
     LaunchedEffect(Unit) {
-        if (flight.value < 1f) flight.animateTo(1f, tween(if (SmoothMode.isActive) 280 else 560, easing = FastOutSlowInEasing))
+        if (flight.value < 1f) {
+            flight.animateTo(
+                1f,
+                if (SmoothMode.isActive) tween(280, easing = FastOutSlowInEasing)
+                else androidx.compose.animation.core.spring(dampingRatio = 0.74f, stiffness = 140f)
+            )
+        }
     }
     // 关闭：先飞回主界面小黑胶的位置（页面其余部分同时淡出、露出主界面），落到小黑胶上后隐藏，再真正关闭
     var discLanded by remember { mutableStateOf(false) }
     LaunchedEffect(input.closing) {
         if (input.closing) {
             if (VinylHandoff.sourceRect != null) {
-                flight.animateTo(0f, tween(if (SmoothMode.isActive) 210 else 420, easing = FastOutSlowInEasing))
+                flight.animateTo(
+                    0f,
+                    if (SmoothMode.isActive) tween(210, easing = FastOutSlowInEasing)
+                    else androidx.compose.animation.core.spring(dampingRatio = 0.72f, stiffness = 200f)
+                )
                 discLanded = true
             }
             input.onCloseAnimationDone()
@@ -175,9 +188,9 @@ fun TvVinylTheme(input: TvThemeInput) {
                     var tx = (collapsedCx.toPx() - expandedCx.toPx()) * p
                     var ty = (collapsedCy.toPx() - expandedCy.toPx()) * p
                     var s = startScale + (1f - startScale) * p
-                    // 飞入 / 飞出：从主界面小黑胶的位置与大小过渡到上面算出的位置与大小
-                    val f = fl()
-                    if (f < 1f && src != null) {
+                    // 飞入 / 飞出：从主界面小黑胶的位置与大小过渡到上面算出的位置与大小（回弹时略超出两端）
+                    val f = flRaw()
+                    if (f != 1f && src != null) {
                         val fromTx = src.center.x - expandedCx.toPx()
                         val fromTy = src.center.y - expandedCy.toPx()
                         val fromS = src.width / bigPx
@@ -221,8 +234,8 @@ fun TvVinylTheme(input: TvThemeInput) {
                     val p = collapseState.value
                     var cx = expandedCx.toPx() + (collapsedCx.toPx() - expandedCx.toPx()) * p
                     var cy = expandedCy.toPx()
-                    val f = fl()
-                    if (f < 1f && src != null) {
+                    val f = flRaw()
+                    if (f != 1f && src != null) {
                         cx = src.center.x + (cx - src.center.x) * f
                         cy = src.center.y + (cy - src.center.y) * f
                     }

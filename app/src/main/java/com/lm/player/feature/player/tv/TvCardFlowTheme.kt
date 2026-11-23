@@ -83,6 +83,8 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
@@ -200,9 +202,14 @@ fun TvCardFlowTheme(input: TvThemeInput) {
         }
     }
 
-    // 进场：唱片架放大淡入，信息区 / 侧栏随后滑入（手机端 760ms）
-    val enterAnim = remember { Animatable(0f) }
-    LaunchedEffect(Unit) { enterAnim.animateTo(1f, tween(durationMillis = 760, easing = FastOutSlowInEasing)) }
+    // 进场：唱片架放大淡入，信息区 / 侧栏随后滑入（手机端 760ms）。
+    // 从主界面卡片翻进来时（2026-11-22）不做这段，由卡片翻转 + 展开代替
+    val enterAnim = remember { Animatable(if (PlayerCardHandoff.active) 1f else 0f) }
+    LaunchedEffect(Unit) { if (enterAnim.value < 1f) enterAnim.animateTo(1f, tween(durationMillis = 760, easing = FastOutSlowInEasing)) }
+    // 正在播放的那一张在歌单里的位置（与主界面卡片之间翻转飞行的就是它）
+    val songIndex = remember(currentPlaylist, song.id) { currentPlaylist.indexOfFirst { it.id == song.id }.coerceAtLeast(0) }
+    /** 过渡进度（不在过渡时为 1）；只在图层 / 绘制阶段读 */
+    fun hp(): Float = PlayerCardHandoff.themeProgress()
 
     // 歌词栏开合（0 收起 / 1 展开）
     val paneProgress by animateFloatAsState(
@@ -217,6 +224,15 @@ fun TvCardFlowTheme(input: TvThemeInput) {
     val railCardPx = remember { floatArrayOf(1f) }
 
     Box(modifier = Modifier.fillMaxSize()) {
+        // 背景（模糊底图 + 聚光 + 暗角）：与主界面卡片之间翻转时随进度淡入淡出
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer {
+                    alpha = PlayerCardHandoff.backgroundAlpha(hp())
+                    compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.ModulateAlpha
+                }
+        ) {
         TvCoverBackdrop(song.coverUrl, song.id, scrimAlpha = 0.58f, modifier = Modifier.fillMaxSize())
         // 静态舞台聚光 + 暗角（只画一次）
         val spotColor = if (colors.isDark) Color.White.copy(alpha = 0.10f) else Color.White.copy(alpha = 0.50f)
@@ -237,6 +253,7 @@ fun TvCardFlowTheme(input: TvThemeInput) {
                     radius = size.maxDimension * 0.62f
                 )
             )
+        }
         }
 
         BoxWithConstraints(
@@ -259,14 +276,15 @@ fun TvCardFlowTheme(input: TvThemeInput) {
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth()
-                        // 与手机端 Pager 一样裁在自己的区域里：歌词展开时唱片架被挤到左边，两侧的卡片不会伸进歌词区
-                        .clipToBounds()
                         .graphicsLayer {
                             val p = enterAnim.value
                             alpha = p
                             val s = 0.86f + 0.14f * p
                             scaleX = s
                             scaleY = s
+                            // 与手机端 Pager 一样裁在自己的区域里：歌词展开时唱片架被挤到左边，两侧的卡片不会伸进歌词区。
+                            // 与主界面卡片之间翻转飞行时不裁：正在播放那张卡要飞出唱片架
+                            clip = !(PlayerCardHandoff.active && PlayerCardHandoff.progress < 0.999f)
                         }
                         // 遥控器：整个唱片架一个焦点；左右翻页、确定播放暂停、下键进胶囊
                         .focusRequester(input.stageFocus)
@@ -350,13 +368,16 @@ fun TvCardFlowTheme(input: TvThemeInput) {
                         modifier = Modifier
                             .matchParentSize()
                             .drawBehind {
+                                // 正在播放那张卡飞走时，脚下的投影随之淡掉
+                                val k = PlayerCardHandoff.smooth(PlayerCardHandoff.FLIGHT_END, 0.8f, hp())
+                                if (k <= 0.001f) return@drawBehind
                                 val cardTop = (size.height - cardSizePx * (1f + reflectionRatio)) / 2f
                                 val floorY = cardTop + cardSizePx
                                 val r = cardSizePx * 0.95f
                                 val cx = size.width / 2f
                                 drawOval(
                                     brush = Brush.radialGradient(
-                                        colors = listOf(floorShadow, Color.Transparent),
+                                        colors = listOf(floorShadow.copy(alpha = floorShadow.alpha * k), Color.Transparent),
                                         center = Offset(cx, floorY),
                                         radius = r
                                     ),
@@ -389,9 +410,17 @@ fun TvCardFlowTheme(input: TvThemeInput) {
                                 animationSpec = spring(dampingRatio = 0.6f, stiffness = 700f),
                                 label = "card_press"
                             )
+                            val isSongCard = index == songIndex
                             Column(
                                 modifier = Modifier
                                     .width(cardSizeDp)
+                                    // 正在播放那张卡的静止位置（根坐标），主界面卡片翻转飞行的另一端；放在图层之前量
+                                    .then(
+                                        if (isSongCard) Modifier.onGloballyPositioned {
+                                            val b = it.boundsInRoot()
+                                            PlayerCardHandoff.playerCardRect = androidx.compose.ui.geometry.Rect(b.left, b.top, b.left + b.width, b.top + b.width)
+                                        } else Modifier
+                                    )
                                     .graphicsLayer {
                                         // 与手机端相同的唱片架变换（pageOffset = 当前位置 - 这一张）
                                         val pageOffset = pos.value - index
@@ -403,18 +432,66 @@ fun TvCardFlowTheme(input: TvThemeInput) {
                                         val far = (absOffset - 1f).coerceAtLeast(0f)
                                         // 中心两侧先展开 0.54 张，再往外每张叠 0.21 张
                                         val visualDist = eased * 0.54f + far * 0.21f
-                                        translationX = -sign * visualDist * cardSizePx
-                                        rotationY = sign * eased * 60f
-                                        val s = (1f - eased * 0.15f - far * 0.018f).coerceIn(0.70f, 1f) * pressScale
-                                        scaleX = s
-                                        scaleY = s
+                                        var tx = -sign * visualDist * cardSizePx
+                                        var ty = 0f
+                                        var ry = sign * eased * 60f
+                                        var s = (1f - eased * 0.15f - far * 0.018f).coerceIn(0.70f, 1f) * pressScale
                                         // 边缘 2.8～4.2 张之间平滑渐隐
-                                        alpha = when {
+                                        var a = when {
                                             absOffset <= 2.8f -> 1f
                                             absOffset <= 4.2f -> ((4.2f - absOffset) / 1.4f).coerceIn(0f, 1f)
                                             else -> 0f
                                         }
-                                        transformOrigin = TransformOrigin(0.5f, 0.5f)
+                                        var originY = 0.5f
+                                        // 与主界面卡片之间的过渡（2026-11-22）：其余卡片收拢到正在播放那张后面并入；
+                                        // 这张再一边飞向主界面卡片、一边翻面（翻过侧面后交给主界面卡片自己画）
+                                        val handoff = PlayerCardHandoff
+                                        if (handoff.active) {
+                                            val p = handoff.progress
+                                            if (isSongCard) {
+                                                // 以封面中心为翻转 / 缩放中心（下面还挂着倒影）
+                                                originY = if (showReflection) 0.5f / (1f + reflectionRatio) else 0.5f
+                                                if (p < PlayerCardHandoff.FLIGHT_END) {
+                                                    val home = handoff.homeCardRect
+                                                    val rest = handoff.playerCardRect
+                                                    if (home == null || rest == null) {
+                                                        a = 0f
+                                                    } else {
+                                                        val f = handoff.flightAt(p, home, rest)
+                                                        if (!f.frontVisible) {
+                                                            a = 0f
+                                                        } else {
+                                                            tx = f.cx - rest.center.x
+                                                            ty = f.cy - rest.center.y
+                                                            s = f.frontSize / rest.width.coerceAtLeast(1f)
+                                                            ry = f.frontRotationY
+                                                            a = 1f
+                                                        }
+                                                    }
+                                                } else {
+                                                    s *= handoff.mergePop(p)
+                                                }
+                                            } else if (p < PlayerCardHandoff.FLIGHT_END) {
+                                                a = 0f
+                                            } else {
+                                                val g = handoff.gather(p)
+                                                val gv = g.coerceIn(0f, 1f)
+                                                // 收拢：摆正、缩小，叠在正在播放那张的后面（略微错开）
+                                                val gatherTx = -sign * absOffset.coerceAtMost(2f) * 0.03f * cardSizePx
+                                                tx = gatherTx + (tx - gatherTx) * g
+                                                ry *= gv
+                                                val gs = 0.95f - 0.02f * absOffset.coerceAtMost(3f)
+                                                s = gs + (s - gs) * g
+                                                a *= handoff.smooth(0f, 0.35f, g)
+                                            }
+                                        }
+                                        translationX = tx
+                                        translationY = ty
+                                        rotationY = ry
+                                        scaleX = s
+                                        scaleY = s
+                                        alpha = a
+                                        transformOrigin = TransformOrigin(0.5f, originY)
                                         cameraDistance = 24f * density.density
                                     },
                                 horizontalAlignment = Alignment.CenterHorizontally
@@ -498,7 +575,8 @@ fun TvCardFlowTheme(input: TvThemeInput) {
                                         .height(reflectionHeightDp)
                                         .graphicsLayer {
                                             scaleY = -1f
-                                            this.alpha = 0.35f
+                                            // 翻转飞行时倒影不跟着飞（卡片收拢后、起飞前淡掉）
+                                            this.alpha = 0.35f * PlayerCardHandoff.smooth(PlayerCardHandoff.FLIGHT_END, PlayerCardHandoff.FLIGHT_END + 0.12f, hp())
                                             // 透明度乘到每次绘制上，不为每张倒影单独开离屏缓冲（性能优化第 8 项）
                                             compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.ModulateAlpha
                                         }
@@ -540,7 +618,7 @@ fun TvCardFlowTheme(input: TvThemeInput) {
                         .padding(top = dims.scale(4.dp))
                         .graphicsLayer {
                             val p = enterAnim.value
-                            alpha = p
+                            alpha = p * PlayerCardHandoff.contentAlpha(hp())
                             translationY = (1f - p) * 26.dp.toPx()
                         },
                     horizontalAlignment = Alignment.CenterHorizontally
@@ -603,7 +681,7 @@ fun TvCardFlowTheme(input: TvThemeInput) {
                         .width(paneW)
                         .fillMaxHeight()
                         .graphicsLayer {
-                            alpha = paneProgress * enterAnim.value
+                            alpha = paneProgress * enterAnim.value * PlayerCardHandoff.contentAlpha(hp())
                             translationX = (1f - paneProgress) * paneW.toPx() * 0.6f
                         }
                 ) {
@@ -622,6 +700,7 @@ fun TvCardFlowTheme(input: TvThemeInput) {
                 modifier = Modifier
                     .align(Alignment.CenterStart)
                     .offset(x = flowW - dims.scale(10.dp))
+                    .graphicsLayer { alpha = PlayerCardHandoff.contentAlpha(hp()) }
             )
             // 收起后右侧的「歌词」小签（触屏）
             if (paneProgress < 0.99f) {
@@ -629,7 +708,7 @@ fun TvCardFlowTheme(input: TvThemeInput) {
                     modifier = Modifier
                         .align(Alignment.CenterEnd)
                         .padding(end = dims.scale(14.dp))
-                        .graphicsLayer { alpha = 1f - paneProgress }
+                        .graphicsLayer { alpha = (1f - paneProgress) * PlayerCardHandoff.contentAlpha(hp()) }
                         .clip(RoundedCornerShape(12.dp))
                         .background(colors.subtleFill)
                         .border(0.6.dp, colors.panelBorder, RoundedCornerShape(12.dp))

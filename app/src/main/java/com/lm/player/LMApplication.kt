@@ -24,6 +24,8 @@ class LMApplication : Application(), ImageLoaderFactory {
 
         // 0. 安装全局崩溃捕获：电视/车机无法取 logcat，闪退后把堆栈留在本机供下次启动展示
         CrashLogger.install(this)
+        // 换了安装包后的第一次启动：旧包留下的记录不再当成当前版本的问题弹出（2026-11-17）
+        CrashLogger.discardIfBuildChanged(this)
         // 0.001 没有崩溃日志的闪退（主线程卡死 / 系统层崩溃 / 内存不足被结束）也要留下记录（2026-11-13）
         com.lm.player.core.util.ExitDiagnostics.startWatchdog(this)
         CoroutineScope(Dispatchers.IO).launch {

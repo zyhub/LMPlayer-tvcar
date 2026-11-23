@@ -72,6 +72,7 @@ import com.lm.player.core.model.PlatformMode
 import com.lm.player.core.model.UnifiedPlaylist
 import com.lm.player.core.model.UnifiedSong
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
 /**
@@ -275,6 +276,92 @@ private fun PlayerShell(
 
     var closing by remember { mutableStateOf(false) }
 
+    // ---------------- 与主界面卡片之间的收拢 / 翻转过渡（专辑卡片 / 全屏封面，2026-11-22） ----------------
+    // 进来时决定：主题支持、主界面卡片的位置已量出 → 用这套过渡（MainActivity 同样的条件下关掉了外层进出场动画）。
+    // 主界面卡片被手指拉出时已经开始了（进度由手指给），这里不再从 0 开始
+    /** 按此刻的样子选过渡：全屏封面主题 → 直接飞回（封面铺满着就是缩放）；专辑卡片 → 收拢 + 翻转（2026-11-23） */
+    fun chooseHandoffMode() {
+        val t = TvPlayerPrefs.theme
+        // 全屏封面 / 唱片封套 / 唱机唱臂：直接飞回（首页卡片不翻面）；封面铺满全屏的那两个在放大时走缩放
+        PlayerCardHandoff.zoomMode = PlayerCardHandoff.isDirectTheme(t)
+        PlayerCardHandoff.zoomExpanded = PlayerCardHandoff.expandsToFullScreen(t) && !controlsVisible
+    }
+    remember {
+        if (PlayerCardHandoff.canRun(theme)) {
+            if (!PlayerCardHandoff.active) PlayerCardHandoff.begin(0f)
+            chooseHandoffMode()
+        } else if (PlayerCardHandoff.active) {
+            PlayerCardHandoff.end()
+        }
+        Unit
+    }
+    val handoffScope = androidx.compose.runtime.rememberCoroutineScope()
+    val handoffJob = remember { arrayOfNulls<kotlinx.coroutines.Job>(1) }
+    /** 正在收回主界面卡片（返回键、下拖松手、拉出后又松回去） */
+    var handoffClosing by remember { mutableStateOf(false) }
+    val dismissForHandoff by rememberUpdatedState(onDismiss)
+    /**
+     * 带到目标：1 = 展开，0 = 收回主界面（到了才真正关闭）；可从任意进度接着走（中途反向、松手后也是它）。
+     * 2026-11-23：由弹簧改为按时间匀速推进进度（剩下多少走多久），两段各自的缓动在 [PlayerCardHandoff] 里做，
+     * 整体更慢、更连贯（用户反馈弹簧版太快）
+     */
+    @Suppress("UNUSED_PARAMETER")
+    fun runHandoff(target: Float, velocity: Float = 0f) {
+        handoffJob[0]?.cancel()
+        handoffJob[0] = handoffScope.launch {
+            val start = PlayerCardHandoff.progress
+            val duration = PlayerCardHandoff.durationMs(target - start, com.lm.player.core.designsystem.theme.SmoothMode.isActive)
+            androidx.compose.animation.core.animate(
+                start, target,
+                animationSpec = tween(duration, easing = androidx.compose.animation.core.LinearEasing)
+            ) { v, _ ->
+                PlayerCardHandoff.progress = v
+            }
+            if (target <= 0f) dismissForHandoff()
+        }
+    }
+    LaunchedEffect(Unit) {
+        if (PlayerCardHandoff.active && !PlayerCardHandoff.homeDragging && PlayerCardHandoff.release == null &&
+            PlayerCardHandoff.progress < 1f
+        ) runHandoff(1f)
+    }
+    // 主界面卡片拉出后松手：接着展开或吸回
+    LaunchedEffect(Unit) {
+        snapshotFlow { PlayerCardHandoff.release }.collect { r ->
+            if (r != null) {
+                PlayerCardHandoff.release = null
+                handoffClosing = r.target <= 0f
+                runHandoff(r.target, r.velocity)
+            }
+        }
+    }
+    // 在播放页里换了主题：换到这两个主题就接上（已完全展开），换走就结束
+    LaunchedEffect(theme) {
+        if (PlayerCardHandoff.supports(theme)) {
+            if (!PlayerCardHandoff.active && PlayerCardHandoff.homeCardRect != null) {
+                PlayerCardHandoff.begin(1f)
+                PlayerCardHandoff.zoomMode = false
+                PlayerCardHandoff.zoomExpanded = false
+            }
+        } else if (PlayerCardHandoff.active) {
+            handoffJob[0]?.cancel()
+            handoffClosing = false
+            PlayerCardHandoff.end()
+        }
+    }
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        onDispose {
+            handoffJob[0]?.cancel()
+            PlayerCardHandoff.end()
+        }
+    }
+    fun startHandoffClose(velocity: Float = 0f) {
+        // 从完全展开开始收回时按此刻的样子选：全屏封面放大着 → 缩放模式；否则收拢 + 翻转（中途反向保持原来的模式）
+        if (PlayerCardHandoff.progress >= 0.999f) chooseHandoffMode()
+        handoffClosing = true
+        runHandoff(0f, velocity)
+    }
+
     /**
      * 返回键的固定顺序（2026-11-13 用户要求：只有没有任何二级窗口时，返回才退出播放页）：
      * 1. 弹出窗口（下载 / 加入歌单 / 睡眠定时 / 音质信息菜单）—— 它们在自己的窗口里先收到返回并自行关闭；
@@ -288,12 +375,17 @@ private fun PlayerShell(
     fun handleBack() {
         interactionTick++
         when {
+            // 正在翻进来 / 收拢展开还没到位：直接从当前位置反向收回
+            PlayerCardHandoff.active && !handoffClosing && PlayerCardHandoff.progress < 0.999f -> startHandoffClose()
+            handoffClosing -> Unit
             downloadMenuOpen -> { downloadMenuOpen = false; focus(capsuleFocus.download) }
             lyricsPanel > LyricsPanel.STRIP -> lyricsPanel = LyricsPanel.STRIP
             lyricsPanel == LyricsPanel.STRIP -> { lyricsPanel = LyricsPanel.CLOSED; focus(capsuleFocus.lyrics) }
             moreOpen -> { moreOpen = false; focus(capsuleFocus.more) }
             queueOpen -> { queueOpen = false; focus(primaryFocus) }
             controlsVisible -> { controlsVisible = false; collapsedByBack = true }
+            // 专辑卡片 / 全屏封面：卡片收拢，再翻回主界面左侧播放卡片（到位后才真正关闭）
+            PlayerCardHandoff.active -> startHandoffClose()
             // 黑胶主题：先让唱片飞回主界面小黑胶的位置（主题里做完后回调真正关闭）
             theme == PlayerThemeStyle.MODERN && !closing -> closing = true
             closing -> Unit
@@ -330,7 +422,11 @@ private fun PlayerShell(
     )
     val currentCovers by rememberUpdatedState(onCoversBackgroundChanged)
     LaunchedEffect(Unit) {
-        snapshotFlow { animatedOffsetY < 0.5f && !closing && recallAnim < 0.001f }.collect { currentCovers(it) }
+        snapshotFlow {
+            animatedOffsetY < 0.5f && !closing && recallAnim < 0.001f &&
+                // 与主界面卡片之间过渡时：背景完全不透明之后才算盖住主界面
+                (!PlayerCardHandoff.active || PlayerCardHandoff.coversHome(PlayerCardHandoff.progress))
+        }.collect { currentCovers(it) }
     }
 
     // 状态栏透明（画面延伸到它下面），图标深浅随播放页配色
@@ -354,7 +450,12 @@ private fun PlayerShell(
         modifier = Modifier
             .fillMaxSize()
             .offset { IntOffset(0, animatedOffsetY.roundToInt().coerceAtLeast(0)) }
-            .drawBehind { drawRect(colors.background, alpha = closeFade * (1f - recallAnim)) }
+            .drawBehind {
+                drawRect(
+                    colors.background,
+                    alpha = closeFade * (1f - recallAnim) * PlayerCardHandoff.screenBackgroundAlpha(PlayerCardHandoff.themeProgress())
+                )
+            }
             .onFocusChanged { pageHasFocus = it.hasFocus }
             .onPreviewKeyEvent { event ->
                 val native = event.nativeKeyEvent
@@ -394,6 +495,18 @@ private fun PlayerShell(
                     // 胶囊收起后：滑动 / 点唱片、封面、卡片都不展开胶囊，只有点细进度胶囊才展开（三个主题统一）
                     if (!controlsVisible) interactionTick++ else touchInteraction()
                     val p = down.position
+                    // 正在收回主界面卡片时点一下：从当前位置反向，重新展开（卡片已快落进卡槽时不再拦）
+                    if (handoffClosing && PlayerCardHandoff.active && PlayerCardHandoff.progress > 0.3f) {
+                        handoffClosing = false
+                        runHandoff(1f)
+                        down.consume()
+                        while (true) {
+                            val e = awaitPointerEvent(PointerEventPass.Initial)
+                            e.changes.forEach { it.consume() }
+                            if (e.changes.none { it.pressed }) break
+                        }
+                        return@awaitEachGesture
+                    }
                     var dismissed = false
                     if (lyricsPanel != LyricsPanel.CLOSED && stripBounds[0]?.contains(p) != true) {
                         lyricsPanel = LyricsPanel.CLOSED; dismissed = true
@@ -414,10 +527,27 @@ private fun PlayerShell(
             }
             .pointerInput(Unit) {
                 var recallDragPx = 0f
+                // 专辑卡片 / 全屏封面：往下拖 = 卡片收拢、再翻回主界面卡片，跟着手指走（2026-11-22）
+                var handoffDrag = false
+                var handoffDragPx = 0f
+                val handoffTracker = androidx.compose.ui.input.pointer.util.VelocityTracker()
                 detectVerticalDragGestures(
-                    onDragStart = { recallDragPx = 0f },
-                    onVerticalDrag = { _, amount ->
-                        if (recallModeNow.value && !closing) {
+                    onDragStart = {
+                        recallDragPx = 0f
+                        handoffDrag = PlayerCardHandoff.active && !handoffClosing && PlayerCardHandoff.progress > 0.98f
+                        if (handoffDrag) {
+                            handoffJob[0]?.cancel()
+                            chooseHandoffMode()
+                            handoffDragPx = 0f
+                            handoffTracker.resetTracking()
+                        }
+                    },
+                    onVerticalDrag = { change, amount ->
+                        if (handoffDrag) {
+                            handoffDragPx = (handoffDragPx + amount).coerceAtLeast(0f)
+                            PlayerCardHandoff.progress = (1f - handoffDragPx / (size.height * 0.8f)).coerceIn(0f, 1f)
+                            handoffTracker.addPosition(change.uptimeMillis, change.position)
+                        } else if (recallModeNow.value && !closing) {
                             // 黑胶：页面不跟着往下走，而是唱片跟着手指收回主界面小黑胶、页面同时淡出
                             recallDragPx = (recallDragPx + amount).coerceAtLeast(0f)
                             recallTarget = (recallDragPx / (size.height * 0.45f)).coerceIn(0f, 1f)
@@ -426,7 +556,12 @@ private fun PlayerShell(
                         }
                     },
                     onDragEnd = {
-                        if (recallModeNow.value && recallTarget > 0f) {
+                        if (handoffDrag) {
+                            handoffDrag = false
+                            val vp = (-handoffTracker.calculateVelocity().y / (size.height * 0.8f)).coerceIn(-8f, 8f)
+                            // 拉过约两成（屏高的六分之一）或往下一甩：吸回主界面；不够就重新展开
+                            if (PlayerCardHandoff.progress < 0.8f || vp < -1.2f) startHandoffClose(vp) else runHandoff(1f, vp)
+                        } else if (recallModeNow.value && recallTarget > 0f) {
                             // 拉过三成：接着飞回去（与遥控器返回键同一段收回动画）；不够就弹回
                             if (recallTarget > 0.3f) closing = true else recallTarget = 0f
                         } else if (dragOffsetY > with(density) { 160.dp.toPx() }) {
@@ -438,6 +573,10 @@ private fun PlayerShell(
                         }
                     },
                     onDragCancel = {
+                        if (handoffDrag) {
+                            handoffDrag = false
+                            runHandoff(1f)
+                        }
                         dragOffsetY = 0f
                         if (!closing) recallTarget = 0f
                     }
@@ -475,7 +614,7 @@ private fun PlayerShell(
                 lyricsPaneOpen = TvPlayerPrefs.cardLyricsOpen,
                 onToggleLyricsPane = { TvPlayerPrefs.updateCardLyricsOpen(!TvPlayerPrefs.cardLyricsOpen) },
                 animationsActive = true,
-                closing = closing,
+                closing = closing || handoffClosing,
                 onCloseAnimationDone = { onDismiss() },
                 recallProgress = { recallAnim }
             )
@@ -487,7 +626,9 @@ private fun PlayerShell(
                 .align(Alignment.BottomCenter)
                 .padding(bottom = capsuleBottom)
                 .onGloballyPositioned { capsuleTopPx = it.boundsInRoot().top }
-                .graphicsLayer { alpha = closeFade * (1f - recallAnim) }
+                .graphicsLayer {
+                    alpha = closeFade * (1f - recallAnim) * PlayerCardHandoff.contentAlpha(PlayerCardHandoff.themeProgress())
+                }
         ) {
             TvPlayerCapsule(
                 expanded = controlsVisible,

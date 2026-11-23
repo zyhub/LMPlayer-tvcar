@@ -48,6 +48,7 @@ import androidx.compose.material.icons.filled.ViewCarousel
 import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Wallpaper
+import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Bedtime
 import androidx.compose.material3.Icon
@@ -504,6 +505,7 @@ fun TvMorePanel(
                 val icon = when (t) {
                     PlayerThemeStyle.IPOD_RETRO -> Icons.Filled.ViewCarousel
                     PlayerThemeStyle.NETEASE_TV_COVER -> Icons.Filled.Wallpaper
+                    PlayerThemeStyle.RECORD_SLEEVE -> Icons.Filled.LibraryMusic
                     else -> Icons.Filled.Album
                 }
                 Row(

@@ -36,6 +36,30 @@ object CrashLogger {
         }
     }
 
+    private const val KEY_LAST_BUILD = "crash_log_last_build"
+    private const val PREV_BUILD_FILE_NAME = "crash_prev_build.txt"
+
+    /**
+     * 换了安装包（构建时间变了）后的第一次启动：把旧包留下、还没弹出过的记录挪到 crash_prev_build.txt，
+     * 不再当成当前版本的问题弹出来（2026-11-17：用户装新包后，旧包写下的「主线程卡住」记录在新包第一次
+     * 启动时弹出，被误以为新包还有问题）。必须在 Application.onCreate 里、任何新记录写入之前调用。
+     */
+    fun discardIfBuildChanged(context: Context) {
+        runCatching {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val current = com.lm.player.BuildConfig.BUILD_TIME
+            val last = prefs.getString(KEY_LAST_BUILD, null)
+            if (last == current) return
+            val f = file(context)
+            if (f.exists() && f.length() > 0L) {
+                val prev = File(context.filesDir, PREV_BUILD_FILE_NAME)
+                prev.delete()
+                if (!f.renameTo(prev)) f.delete()
+            }
+            prefs.edit().putString(KEY_LAST_BUILD, current).commit()
+        }
+    }
+
     /** 取出尚未展示过的崩溃堆栈；没有新崩溃时返回 null */
     fun pendingReport(context: Context): String? {
         val f = file(context)

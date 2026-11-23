@@ -27,6 +27,12 @@ enum class PlayerThemeStyle(
         id = "karaoke_cover",
         displayName = "大字歌词",
         description = "不放封面，超大字号歌词与翻译，右上角时钟"
+    ),
+    /** 2026-11-23 新增：封套里抽出黑胶；放大且播放时黑胶整张抽出、叠在封套上；切歌时封套不动、只换黑胶 */
+    RECORD_SLEEVE(
+        id = "record_sleeve",
+        displayName = "唱片封套",
+        description = "封套里抽出黑胶，放大时黑胶叠在封套上"
     );
 
     companion object {

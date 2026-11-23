@@ -110,6 +110,23 @@ private fun normalizeMusicCoverUrl(raw: String?, preferLarge: Boolean = true): S
 }
 
 /**
+ * 网络封面是否已经在图片磁盘缓存里（2026-11-22）：播放本机文件时，已经能显示的封面不再换成本机封面文件
+ * （换地址会让播放页 / 黑胶卡重新解码一张大图，表现为「闪一下」）。
+ * @return 不是网络地址时返回 null；必须在 IO 线程调用
+ */
+fun isNetworkCoverCached(context: android.content.Context, rawUrl: String?): Boolean? {
+    val keys = listOfNotNull(
+        normalizeMusicCoverUrl(rawUrl, preferLarge = true),
+        normalizeMusicCoverUrl(rawUrl, preferLarge = false)
+    ).distinct()
+    if (keys.isEmpty() || keys.none { it.startsWith("http://") || it.startsWith("https://") }) return null
+    val disk = coil.Coil.imageLoader(context).diskCache ?: return false
+    return keys.any { key ->
+        runCatching { disk.openSnapshot(key)?.use { true } ?: false }.getOrDefault(false)
+    }
+}
+
+/**
  * @param width / height 解码尺寸（像素）；[COVER_SIZE_BY_LAYOUT] 表示按控件实际大小解码（交给 Coil 按约束决定）
  * @param large 大封面：强制 32 位色（低性能设备全局是 16 位色），酷我取 500 像素
  * @param fadeIn 加载完成时 120ms 淡入（只给大封面用，列表小图保持直接显示）
@@ -125,7 +142,16 @@ private fun buildMusicImageRequest(
     val cleanUrl = normalizeMusicCoverUrl(rawUrl, preferLarge = large) ?: return null
     val builder = ImageRequest.Builder(context)
         .data(cleanUrl)
-        .apply { if (width > 0 && height > 0) size(width, height) }
+        .apply {
+            if (width > 0 && height > 0) {
+                size(width, height)
+                // 2026-11-23：不精确尺寸。同一张封面在主界面 384、播放页 700+、唱片中间 512 各要一次：
+                // 精确尺寸下内存缓存里只要尺寸对不上就作废、回磁盘重新解码（内存缓存一个地址只存一张，几处来回互相顶掉），
+                // 进出播放页、切歌时就先露底色渐变再出图 = 「封面闪一下」。改成内存里有一张不小于要求的就直接用；
+                // 原图比要求小时也不再放大解码（省内存，画的时候照样铺满）
+                precision(coil.size.Precision.INEXACT)
+            }
+        }
         .apply {
             if (fadeIn) crossfade(120) else crossfade(false)
             if (large) {
@@ -152,11 +178,23 @@ private fun buildMusicImageRequest(
  */
 internal fun buildCoverPaletteRequest(context: android.content.Context, rawUrl: String?, sizePx: Int): ImageRequest? =
     buildMusicImageRequest(context, rawUrl, sizePx, sizePx, large = false, fadeIn = false)
-        ?.newBuilder()
-        ?.allowHardware(false)
-        ?.bitmapConfig(android.graphics.Bitmap.Config.ARGB_8888)
-        ?.allowRgb565(false)
-        ?.build()
+        ?.let { r ->
+            r.newBuilder()
+                .allowHardware(false)
+                .bitmapConfig(android.graphics.Bitmap.Config.ARGB_8888)
+                .allowRgb565(false)
+                // 2026-11-23：取色小图单独存一格内存缓存。以前和封面共用一格（按地址），切歌时 64 像素的取色图
+                // 把刚解码好的大封面顶掉，播放页封面又得回磁盘重新解码 → 闪一下
+                .memoryCacheKey(coil.memory.MemoryCache.Key(r.data.toString(), mapOf("lm_thumb" to sizePx.toString())))
+                .build()
+        }
+
+/**
+ * 每个封面地址最近一次显示成功的内存缓存键（2026-11-23）。
+ * 新建的封面控件（进出播放页、切歌时换位置）先拿它当占位图：内存里已有这张封面（哪怕尺寸不同）就先显示，
+ * 不再先露一下底色渐变。本机文件封面的缓存键不是地址本身，所以按地址记下实际的键
+ */
+private val lastShownKeyByUrl = android.util.LruCache<String, coil.memory.MemoryCache.Key>(96)
 
 /**
  * 高性能专辑/歌曲封面组件 (限制解码尺寸杜绝车机内存溢出与 GC 卡顿)
@@ -174,16 +212,25 @@ fun AlbumArtworkImage(
     /** 大封面（铺满卡片 / 黑胶卡 / 播放页）：32 位色、可淡入、取高分辨率原图 */
     highQuality: Boolean = false,
     /** 加载成功后回报原图像素尺寸（播放页「全屏封面」据此判断封面是否够清晰） */
-    onImageSize: ((Int, Int) -> Unit)? = null
+    onImageSize: ((Int, Int) -> Unit)? = null,
+    /**
+     * 是否允许加载完成时淡入（2026-11-23）。淡入要从第一次真正画出来才开始计时：主界面卡片被播放页盖住期间
+     * 加载好的封面，会等到卡片翻回来那一刻才从底色慢慢淡入，看着像「没封面 / 加载很慢」。这类位置传 false
+     */
+    allowFadeIn: Boolean = true
 ) {
     val large = highQuality || targetSize >= LARGE_COVER_PX
-    val fadeIn = large && com.lm.player.core.designsystem.theme.AppUiPrefs.coverFadeIn
+    val fadeIn = allowFadeIn && large && com.lm.player.core.designsystem.theme.AppUiPrefs.coverFadeIn
     val cleanModel = remember(model, large) { normalizeMusicCoverUrl(model, preferLarge = large) }
     var loadFailed by remember(cleanModel) { mutableStateOf(false) }
     val gradientColors = remember(seedId, cleanModel) {
         getGradientForId(if (seedId.isNotBlank()) seedId else (cleanModel ?: "seed"))
     }
     val context = LocalContext.current
+    // 大封面换地址时保留上一张（2026-11-22）：新图解码出来之前继续显示旧图，好了再淡入，
+    // 不再先闪成底色渐变（切歌、播放开始时封面地址变化、本机大图解码慢都会出现那一下）。
+    // 普通字段而非 Compose 状态：记下来只给下一次请求用，不需要因此重组
+    val lastShownKey = remember { arrayOfNulls<coil.memory.MemoryCache.Key>(1) }
 
     Box(
         modifier = modifier
@@ -201,13 +248,25 @@ fun AlbumArtworkImage(
             AsyncImage(
                 model = remember(cleanModel, targetSize, large, fadeIn, retry) {
                     val req = buildMusicImageRequest(context, cleanModel, targetSize, targetSize, large, fadeIn)
-                    if (retry == 0 || req == null) req else req.newBuilder().setParameter("lm_retry", retry, memoryCacheKey = null).build()
+                    val withRetry = if (retry == 0 || req == null) req else req.newBuilder().setParameter("lm_retry", retry, memoryCacheKey = null).build()
+                    // 换地址：先垫上一张；新建的控件：先垫这张封面在内存里现有的那一份
+                    val previous = lastShownKey[0] ?: lastShownKeyByUrl.get(cleanModel)
+                    if (large && previous != null && withRetry != null) {
+                        withRetry.newBuilder().placeholderMemoryCacheKey(previous).build()
+                    } else withRetry
                 },
                 contentDescription = null,
                 contentScale = contentScale,
-                onSuccess = if (onImageSize == null) null else { state ->
-                    val d = state.result.drawable
-                    onImageSize(d.intrinsicWidth, d.intrinsicHeight)
+                onSuccess = { state ->
+                    if (large) {
+                        val k = state.result.memoryCacheKey
+                        lastShownKey[0] = k
+                        if (k != null) lastShownKeyByUrl.put(cleanModel, k)
+                    }
+                    if (onImageSize != null) {
+                        val d = state.result.drawable
+                        onImageSize(d.intrinsicWidth, d.intrinsicHeight)
+                    }
                 },
                 onError = { _ ->
                     if (isNetwork && retry < 2) {
