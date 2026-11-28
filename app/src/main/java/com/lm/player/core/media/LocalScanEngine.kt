@@ -231,6 +231,9 @@ object LocalScanEngine {
                     localByPath[p] = s
                 }
             }
+            // 曲库里已有的歌曲 ID（本机歌曲的 ID 由真实路径算出，同一个文件不管路径怎么写都是同一个 ID）
+            val knownIds = HashSet<String>(all.size * 2)
+            for (s in all) knownIds.add(s.id)
             val work = ArrayList<WorkItem>(files.size)
             for (f in files) {
                 val path = f.absolutePath
@@ -241,6 +244,9 @@ object LocalScanEngine {
                 } else if (known != null) {
                     skipped++
                     if (needsCover(known.coverUrl)) coverJobs.add(CoverJob(known.id, path))
+                } else if (LocalMediaScanner.generateDeterministicLocalSongId(path) in knownIds) {
+                    // 2026-11-24：曲库里已有这首（以前是另一种路径写法入的库）：算未变化，不再当新歌重读、也不重复计数
+                    skipped++
                 } else {
                     work.add(WorkItem(f, null))
                 }
@@ -292,7 +298,13 @@ object LocalScanEngine {
                 setState { it.copy(phase = Phase.MEDIASTORE, processed = 0, total = 0, currentName = "") }
                 val scannedPaths = HashSet<String>(files.size)
                 files.forEach { scannedPaths.add(it.absolutePath) }
-                collectMediaStore(app, knownByPath.keys, scannedPaths) { entity, job ->
+                // 2026-11-24 修「入库数翻倍」：系统媒体库给的路径写法常与目录扫描不同（/storage/emulated/0/Music 对 /sdcard/music），
+                // 按路径字符串比对不出是同一首，于是刚扫到的歌又被当成「目录扫描没覆盖到的」再加一遍、再计一次数
+                // （歌曲 ID 相同，库里只有一份，所以实际歌曲数是对的）。改为按歌曲 ID 排除：曲库已有的 + 这次目录扫到的
+                val skipIds = HashSet<String>((knownIds.size + files.size) * 2)
+                skipIds.addAll(knownIds)
+                files.forEach { skipIds.add(LocalMediaScanner.generateDeterministicLocalSongId(it.absolutePath)) }
+                collectMediaStore(app, knownByPath.keys, scannedPaths, skipIds) { entity, job ->
                     val size = pendingLock.withLock {
                         pending.add(entity)
                         pending.size
@@ -428,7 +440,10 @@ object LocalScanEngine {
 
         suspend fun walk(dir: File) {
             currentCoroutineContext().ensureActive()
-            val canon = try { dir.canonicalPath } catch (_: Exception) { dir.absolutePath }
+            // 2026-11-24 修「扫描数量翻倍」：目录与文件按「真实路径 + 不分大小写」去重（与歌曲 ID 的算法一致）。
+            // 以前按原样字符串去重：同一个文件夹以 /sdcard/Music 与 /storage/emulated/0/music 两种写法出现在扫描目录里时
+            // （车机 / 盒子的存储不分大小写），会被各走一遍，找到的文件数和入库数都算两遍，但两份算出来是同一首歌（ID 相同）
+            val canon = (try { dir.canonicalPath } catch (_: Exception) { dir.absolutePath }).lowercase()
             if (!visitedDirs.add(canon)) return
             val children = try { dir.listFiles() } catch (_: Exception) { null } ?: return
             for (f in children) {
@@ -436,7 +451,7 @@ object LocalScanEngine {
                     walk(f)
                 } else if (f.isFile) {
                     val ext = f.extension.lowercase()
-                    if (ext in LocalMediaScanner.AUDIO_EXTENSIONS && f.length() > 1024 && seenFiles.add(f.absolutePath)) {
+                    if (ext in LocalMediaScanner.AUDIO_EXTENSIONS && f.length() > 1024 && seenFiles.add("$canon/${f.name.lowercase()}")) {
                         out.add(f)
                         if (out.size % 50 == 0) onProgress(out.size, f.name)
                     }
@@ -531,6 +546,8 @@ object LocalScanEngine {
         app: Context,
         knownPaths: Set<String>,
         scannedPaths: Set<String>,
+        /** 不再加入的歌曲 ID（曲库已有 + 这次目录扫描已读到的） */
+        skipIds: Set<String>,
         onEntity: suspend (SongEntity, CoverJob) -> Unit
     ) {
         val projection = arrayOf(
@@ -559,6 +576,8 @@ object LocalScanEngine {
                         if (path.isBlank() || path in knownPaths || path in scannedPaths || !seen.add(path)) continue
                         val file = File(path)
                         if (!file.exists()) continue
+                        // 同一首歌的另一种路径写法（ID 相同）：已经在库里或刚扫到，跳过
+                        if (LocalMediaScanner.generateDeterministicLocalSongId(path) in skipIds) continue
                         val rawTitle = c.getString(titleCol) ?: "未知歌曲"
                         val artist = c.getString(artistCol) ?: "未知艺术家"
                         val album = c.getString(albumCol) ?: "未知专辑"

@@ -50,7 +50,8 @@ object PlaybackQueueManager {
      * 旧版本没有这份数据，读取时按"越靠前越新"回填，升级不丢序。
      */
     private const val KEY_RECENT_PLAYED_AT = "recent_played_at_json"
-    private const val MAX_RECENT_PLAY_SIZE = 60
+    // 2026-11-25：三端统一为服务器那 100 首（原 60）
+    private const val MAX_RECENT_PLAY_SIZE = 100
 
     private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var playJob: Job? = null
@@ -471,6 +472,33 @@ object PlaybackQueueManager {
             recentPlayedAt = finalAt
             _recentPlayedSongsFlow.value = mergedSongs
             snapshot = RecentPlaySnapshot(mergedSongs, finalAt)
+        }
+        ioExecutor.execute { persistRecentPlaySnapshot(appCtx, snapshot) }
+    }
+
+    /**
+     * 2026-11-25：在线时「最近播放」整份采用服务器的记录（三端一致，见 UserDataMirror）。
+     * 顺序以服务器为准；本机已有的同一首沿用本机那条（带本地文件路径等）。
+     */
+    fun replaceRecentPlayedFromServer(context: Context, serverSongs: List<UnifiedSong>) {
+        val appCtx = context.applicationContext
+        primeRecentPlayedSongs(appCtx)
+        val snapshot: RecentPlaySnapshot
+        synchronized(recentPlayLock) {
+            val localById = _recentPlayedSongsFlow.value.associateBy { it.id }
+            val now = System.currentTimeMillis()
+            val songs = serverSongs.asSequence()
+                .filter { it.id.isNotBlank() }
+                .distinctBy { it.id }
+                .take(MAX_RECENT_PLAY_SIZE)
+                .map { localById[it.id] ?: it }
+                .toList()
+            if (songs.map { it.id } == _recentPlayedSongsFlow.value.map { it.id }) return
+            val playedAt = HashMap<String, Long>(songs.size)
+            songs.forEachIndexed { index, s -> playedAt[s.id] = (now - index).coerceAtLeast(1L) }
+            recentPlayedAt = playedAt
+            _recentPlayedSongsFlow.value = songs
+            snapshot = RecentPlaySnapshot(songs, playedAt)
         }
         ioExecutor.execute { persistRecentPlaySnapshot(appCtx, snapshot) }
     }
@@ -927,6 +955,19 @@ object PlaybackQueueManager {
         }
 
         val listener = object : Player.Listener {
+            // 2026-11-24：语音点歌后声音被别的应用拿走（小迪可能先拉起它的默认音乐）——记进语音日志
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                if (!playWhenReady && reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS) {
+                    com.lm.player.core.voice.VoicePlayRouter.noteAudioFocusLoss(context, permanent = true)
+                }
+            }
+
+            override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) {
+                if (playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS) {
+                    com.lm.player.core.voice.VoicePlayRouter.noteAudioFocusLoss(context, permanent = false)
+                }
+            }
+
             override fun onIsPlayingChanged(playing: Boolean) {
                 _isPlayingFlow.value = playing
                 if (playing) {
@@ -1356,6 +1397,8 @@ object PlaybackQueueManager {
         // 写入本地播放足迹：离线时「最近播放」卡片即展示这份记录（播客单集不计入，播客有「继续收听」）
         if (!com.lm.player.core.podcast.PodcastSongs.isPodcast(targetSong)) {
             promoteToRecentPlay(context, targetSong)
+            // 2026-11-25：同时写进服务器「最近播放」（合并 2 秒内的切歌，离线时攒着回到在线再推）
+            com.lm.player.core.network.UserDataMirror.onPlayed(context, targetSong)
         }
         if (newPlaylist != null && newPlaylist.isNotEmpty()) {
             _playlistFlow.value = newPlaylist

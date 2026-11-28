@@ -89,6 +89,27 @@ interface SongDao {
         return result
     }
 
+    // ---- 语音点歌（2026-11-24）：只在有本地文件的歌里查，不再把整个曲库读进内存（车机上连说几句会卡） ----
+
+    /** 歌名 / 歌手 / 专辑里包含 [kw] 的本地歌（候选，排序与精确筛选在调用方做）；[kw] 里的 % _ \ 需先转义 */
+    @Query(
+        "SELECT * FROM songs WHERE ((localFilePath IS NOT NULL AND localFilePath != '') OR downloadStatus = :downloaded) " +
+            "AND (title LIKE '%' || :kw || '%' ESCAPE '\\' OR artist LIKE '%' || :kw || '%' ESCAPE '\\' " +
+            "OR album LIKE '%' || :kw || '%' ESCAPE '\\') LIMIT :limit"
+    )
+    suspend fun searchLocalFileSongs(kw: String, limit: Int, downloaded: DownloadStatus): List<SongEntity>
+
+    /** 同一歌手的本地歌 */
+    @Query(
+        "SELECT * FROM songs WHERE artist = :artist " +
+            "AND ((localFilePath IS NOT NULL AND localFilePath != '') OR downloadStatus = :downloaded) LIMIT :limit"
+    )
+    suspend fun localFileSongsByArtist(artist: String, limit: Int, downloaded: DownloadStatus): List<SongEntity>
+
+    /** 本地曲库前 [limit] 首（有本地文件的） */
+    @Query("SELECT * FROM songs WHERE (localFilePath IS NOT NULL AND localFilePath != '') OR downloadStatus = :downloaded LIMIT :limit")
+    suspend fun localFileSongs(limit: Int, downloaded: DownloadStatus): List<SongEntity>
+
     @Query("UPDATE songs SET downloadStatus = :status, localFilePath = :localPath WHERE id = :songId")
     suspend fun updateDownloadStatus(songId: String, status: DownloadStatus, localPath: String?)
 

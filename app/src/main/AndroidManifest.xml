@@ -91,17 +91,39 @@
                 <category android:name="android.intent.category.LAUNCHER" />
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
-            <!-- 语音点歌：安卓标准的「按搜索词播放」意图（语音助手说「打开柠檬音乐播放某某」时发出），见 VoicePlayRouter -->
+        </activity>
+
+        <!-- 语音点歌中转页（2026-11-23）：点歌意图改由它接，处理完立即关掉、不显示任何东西。
+             独立 taskAffinity：被拉起时不会把主界面任务带到前台（不打断导航）；要不要再打开主界面由设置「语音点歌时打开界面」决定。
+             noHistory / excludeFromRecents：不进返回栈、不进最近任务。见 VoicePlayRouter -->
+        <activity
+            android:name=".core.voice.VoiceRelayActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity="${applicationId}.voicerelay"
+            android:theme="@android:style/Theme.NoDisplay">
+            <!-- 安卓标准的「按搜索词播放」意图（语音助手说「打开柠檬音乐播放某某」时发出） -->
             <intent-filter>
                 <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
-            <!-- 语音点歌：本应用自定义的点歌意图（extra: keyword / artist / title / album） -->
+            <!-- 本应用自定义的点歌意图（extra: keyword / artist / title / album） -->
             <intent-filter>
                 <action android:name="com.lm.player.tv.action.PLAY_SEARCH" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+
+        <!-- 媒体键唤醒续播（2026-11-23）：应用没在运行时，方向盘 / 语音「播放」由系统发到这里，
+             Media3 把播放服务拉成前台，再由 PlaybackService.onMediaButtonEvent 接着放上次的歌（不打开界面） -->
+        <receiver
+            android:name="androidx.media3.session.MediaButtonReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </receiver>
 
         <!-- 语音点歌：自定义点歌广播（不把界面带到前台，直接搜索并播放），给支持「自定义指令 → 发广播」的
              语音中转工具和 adb 测试用。只接受一个搜索词并开始播放，不涉及任何数据读写。 -->

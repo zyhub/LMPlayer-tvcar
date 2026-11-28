@@ -327,7 +327,7 @@ class PlaybackRouter(
                                     serverAlreadyTried = outcome.serverAttempted
                                 }
                             }
-                        } else if (isServerSong && (serverOffline || com.lm.player.core.source.SourceAccelerationController.shouldAccelerate())) {
+                        } else if (isServerSong && (serverOffline || com.lm.player.core.source.SourceAccelerationController.isServerWeak() || com.lm.player.core.source.SourceAccelerationController.shouldAccelerate())) {
                             // 服务器曲库：用本地目录服务搜索同曲目再本地取链（不经服务器，结果已经过 CDN 探活）。
                             // 服务器离线时即使引擎还没加载也进来：resolve 内部会先加载引擎再取链（TV 按需启动），
                             // 并且到其它平台找同一首（离线时本地是唯一出路）

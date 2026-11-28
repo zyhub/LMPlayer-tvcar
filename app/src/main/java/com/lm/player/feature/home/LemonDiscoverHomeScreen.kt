@@ -108,6 +108,11 @@ fun LemonDiscoverHomeScreen(
     // 切页保留页面后本页不随切页重建：切回来时若缓存已过期（30 分钟），和原来重建时一样重新拉取一次
     val pageReentry = com.lm.player.ui.rememberPageReentryCount()
     var staleRefreshEpoch by remember { mutableStateOf(0) }
+    LaunchedEffect(Unit) {
+        if (com.lm.player.core.source.SourceAccelerationController.hasCachedScripts(context)) {
+            com.lm.player.core.source.SourceAccelerationController.demandEngines(context, "discover_home")
+        }
+    }
     LaunchedEffect(pageReentry) {
         if (pageReentry > 0 && DiscoverHomeCache.snapshot(DiscoverHomeCache.keyOf(serverName, currentSource)) == null) {
             staleRefreshEpoch++

@@ -98,10 +98,14 @@ class LMApplication : Application(), ImageLoaderFactory {
             com.lm.player.core.source.SourceAccelerationSession.init(this@LMApplication)
             com.lm.player.core.source.SourceAccelerationController.init(this@LMApplication)
             // 启动提速：「连续未登录启动」计数仍在此刻立即记录；
-            // 音源脚本引擎（每个脚本一个 JS 运行时）等首帧与续播完成、启动闸门放行后再加载
+            // 音源脚本引擎等首帧与续播完成、启动闸门放行后再后台静默预热，既不抢冷启动首帧 CPU，又避免首首在线点播/下载撞上高延迟服务器
             com.lm.player.core.source.SourceAccelerationController.recordProcessStart(this@LMApplication)
             com.lm.player.core.startup.StartupGate.await()
-            com.lm.player.core.source.SourceAccelerationController.restoreFromCache(this@LMApplication)
+            if (com.lm.player.core.source.SourceAccelerationController.hasCachedScripts(this@LMApplication)) {
+                com.lm.player.core.source.SourceAccelerationController.demandEngines(this@LMApplication, "post_startup_prewarm")
+            } else {
+                com.lm.player.core.source.SourceAccelerationController.restoreFromCache(this@LMApplication)
+            }
             // 服务器歌曲加速表：旧匹配文件并入（只做一次），再启动后台预匹配（登录、曲库同步后也会再触发）
             com.lm.player.core.source.ServerTrackAccelStore.ensureLegacyImported()
             com.lm.player.core.source.ServerTrackPrematcher.init(this@LMApplication)

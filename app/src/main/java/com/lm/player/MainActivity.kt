@@ -479,7 +479,26 @@ class MainActivity : ComponentActivity() {
         // 语音点歌：应用是被「播放某某」的意图拉起来的 —— 直接播点的歌，
         // 并把续播标记为已完成，避免启动续播把刚点的歌顶掉
         if (savedInstanceState == null && platformModeState.value != null &&
-            com.lm.player.core.voice.VoicePlayRouter.consumeIntent(this, intent)
+            com.lm.player.core.voice.VoicePlayRouter.consumeIntent(this, intent, runCatching { referrer?.host }.getOrNull())
+        ) {
+            fastResumeResult.complete(true)
+        }
+        // 2026-11-24 诊断：别的应用（音乐助手、桌面）打开主界面时记一条，设置页「最近语音指令」里可见
+        if (savedInstanceState == null) {
+            val caller = runCatching { referrer?.host }.getOrNull()
+            // 音乐助手点完歌顺手打开本应用：不做启动续播（会顶掉刚点的歌）；设置为点歌不打开界面时退回后台
+            val followUp = com.lm.player.core.voice.VoicePlayRouter.isVoiceFollowUpLaunch(caller)
+            val backToBg = followUp && com.lm.player.core.voice.VoicePlayRouter.shouldReturnToBackground(this, caller)
+            com.lm.player.core.voice.VoiceDiagnostics.recordAppOpen(
+                this, caller, intent, "打开主界面",
+                note = if (backToBg) "点歌后顺手打开，已退回后台" else null
+            )
+            if (followUp) fastResumeResult.complete(true)
+            if (backToBg) window.decorView.post { moveTaskToBack(true) }
+        }
+        // 2026-11-23：语音中转页点完歌再把主界面打开（设置「语音点歌时打开界面」）—— 歌已经在换了，同样不做启动续播
+        if (savedInstanceState == null &&
+            intent?.getBooleanExtra(com.lm.player.core.voice.VoicePlayRouter.EXTRA_FROM_VOICE, false) == true
         ) {
             fastResumeResult.complete(true)
         }
@@ -721,7 +740,8 @@ class MainActivity : ComponentActivity() {
                     try {
                         val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
                         val protocol = LemonMusicProtocol(client, srv.serverUrl, srv.username, srv.tokenOrApiKey)
-                        protocol.getPlaylistSongs("lemon_favorites").getOrNull()
+                        // 2026-11-25：拉到服务器收藏的同时把本机红心对齐过去（别处取消的收藏这边也清掉）
+                        com.lm.player.core.network.UserDataMirror.pullFavorites(database, protocol)
                     } catch (e: Exception) {
                         Log.w("MainActivity", "Fetching server favorites failed", e)
                         null
@@ -971,6 +991,28 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            // 2026-11-25：服务器歌单对齐到本机库，三处同步共用（串行执行；服务器上已没有的云端歌单——
+            // 包括本机建的 pl_ 歌单——一律删掉，别的设备删的歌单才同步得过来；见 ServerPlaylistSync）
+            val syncServerPlaylistsWith: suspend (LemonMusicProtocol, ServerConfig) -> Unit = { proto, config ->
+                com.lm.player.core.network.ServerPlaylistSync.sync(database, proto, config) { pl ->
+                    com.lm.player.core.database.entity.PlaylistEntity(
+                        id = pl.id,
+                        name = pl.name,
+                        coverUrl = pl.coverUrl,
+                        serverId = config.id,
+                        isOnline = true,
+                        songCount = pl.songCount
+                    )
+                }.onSuccess { plList ->
+                    // 云端歌单四宫格封面：服务端 user-data 已随歌单下发 trackSnapshots，无需额外请求
+                    val remoteCovers = plList.filter { it.previewCovers.isNotEmpty() }
+                        .associate { it.id to it.previewCovers }
+                    if (remoteCovers.isNotEmpty()) {
+                        playlistPreviewCovers = playlistPreviewCovers + remoteCovers
+                    }
+                }
+            }
+
             // 极速同步服务器歌单 (轻量级秒级同步，完全解耦于大体量歌曲全量同步)
             val syncServerPlaylists: (ServerConfig) -> Unit = { config ->
                 lifecycleScope.launch(Dispatchers.IO) {
@@ -983,36 +1025,7 @@ class MainActivity : ComponentActivity() {
                             LemonMusicProtocol(client, config.serverUrl, config.username, effectiveToken)
                         } else protocol
 
-                        val playlistRes = activeProto.getPlaylists(targetServerId = config.id)
-                        if (playlistRes.isSuccess) {
-                            val plList = playlistRes.getOrNull() ?: emptyList()
-                            // 云端歌单四宫格封面：服务端 user-data 已随歌单下发 trackSnapshots，无需额外请求
-                            val remoteCovers = plList.filter { it.previewCovers.isNotEmpty() }
-                                .associate { it.id to it.previewCovers }
-                            if (remoteCovers.isNotEmpty()) {
-                                playlistPreviewCovers = playlistPreviewCovers + remoteCovers
-                            }
-                            val incomingIds = plList.map { it.id }.toSet()
-                            val existingPlaylists = database.playlistDao().getAllPlaylists()
-                                .filter { it.serverId == config.id || it.serverId == "lemon_music" || it.serverId == config.serverUrl }
-                            for (oldPl in existingPlaylists) {
-                                if (!incomingIds.contains(oldPl.id) && oldPl.isOnline && !oldPl.id.startsWith("pl_")) {
-                                    database.playlistDao().deletePlaylist(oldPl.id)
-                                }
-                            }
-                            val plEntities = plList.map { pl ->
-                                com.lm.player.core.database.entity.PlaylistEntity(
-                                    id = pl.id,
-                                    name = pl.name,
-                                    coverUrl = pl.coverUrl,
-                                    serverId = config.id,
-                                    isOnline = true,
-                                    songCount = pl.songCount
-                                )
-                            }
-                            database.playlistDao().insertPlaylists(plEntities)
-                            Log.i("MainActivity", "Successfully synced ${plEntities.size} server playlists for server ${config.id}")
-                        }
+                        syncServerPlaylistsWith(activeProto, config)
                     } catch (e: Exception) {
                         Log.e("MainActivity", "syncServerPlaylists failed", e)
                     }
@@ -1080,29 +1093,7 @@ class MainActivity : ComponentActivity() {
 
                         // 优先瞬时同步服务器歌单 (不等大体积曲库请求，秒级完成并更新界面)
                         try {
-                            val playlistRes = activeProto.getPlaylists(targetServerId = config.id)
-                            if (playlistRes.isSuccess) {
-                                val plList = playlistRes.getOrNull() ?: emptyList()
-                                val incomingIds = plList.map { it.id }.toSet()
-                                val existingPlaylists = database.playlistDao().getAllPlaylists()
-                                    .filter { it.serverId == config.id || it.serverId == "lemon_music" || it.serverId == config.serverUrl }
-                                for (oldPl in existingPlaylists) {
-                                    if (!incomingIds.contains(oldPl.id) && oldPl.isOnline && !oldPl.id.startsWith("pl_")) {
-                                        database.playlistDao().deletePlaylist(oldPl.id)
-                                    }
-                                }
-                                val plEntities = plList.map { pl ->
-                                    com.lm.player.core.database.entity.PlaylistEntity(
-                                        id = pl.id,
-                                        name = pl.name,
-                                        coverUrl = pl.coverUrl,
-                                        serverId = config.id,
-                                        isOnline = true,
-                                        songCount = pl.songCount
-                                    )
-                                }
-                                database.playlistDao().insertPlaylists(plEntities)
-                            }
+                            syncServerPlaylistsWith(activeProto, config)
                         } catch (e: Exception) {
                             Log.w("MainActivity", "Pre-sync playlists failed", e)
                         }
@@ -1303,48 +1294,18 @@ class MainActivity : ComponentActivity() {
                         } catch (e: Exception) {
                             Log.w("MainActivity", "Syncing user favorites failed", e)
                         }
+                        // 2026-11-25：上面只会「标为喜欢」；这里再按服务器收藏把别处取消的红心清掉
+                        com.lm.player.core.network.UserDataMirror.pullFavorites(database, activeProto)
+                            ?.let { favs -> withContext(Dispatchers.Main) { serverFavoriteSongs = favs } }
 
                         val addedList = activeProto.getRecentlyAdded(limit = 30).getOrNull() ?: emptyList()
                         if (addedList.isNotEmpty()) recentlyAddedSongs = addedList
 
-                        // 服务器「最近播放」足迹：与本地持久化足迹按**真实播放时间**合并而非整段拼接。
-                        // 旧写法 `playedList + local.filter{...}` 会把本地独有的播放记录全部压到底部，
-                        // 而服务器数组本身没有顺序保证 —— 这正是"最近播放看不出最近顺序"的直接原因。
-                        val playedList = activeProto.getServerRecentPlays(limit = 30).getOrNull() ?: emptyList()
-                        if (playedList.isNotEmpty()) {
-                            PlaybackQueueManager.mergeServerRecentPlays(this@MainActivity, playedList)
-                        }
+                        // 2026-11-25：「最近播放」三端统一用服务器那 100 首（本机播放也会写回服务器，见 UserDataMirror）
+                        com.lm.player.core.network.UserDataMirror.pullRecent(this@MainActivity, activeProto)
 
                         // 再次对齐服务器播放列表至数据库（含差量清理）
-                        val playlistRes = activeProto.getPlaylists(targetServerId = config.id)
-                        if (playlistRes.isSuccess) {
-                            val plList = playlistRes.getOrNull() ?: emptyList()
-                            // 云端歌单四宫格封面：服务端 user-data 已随歌单下发 trackSnapshots，无需额外请求
-                            val remoteCovers = plList.filter { it.previewCovers.isNotEmpty() }
-                                .associate { it.id to it.previewCovers }
-                            if (remoteCovers.isNotEmpty()) {
-                                playlistPreviewCovers = playlistPreviewCovers + remoteCovers
-                            }
-                            val incomingIds = plList.map { it.id }.toSet()
-                            val existingPlaylists = database.playlistDao().getAllPlaylists()
-                                .filter { it.serverId == config.id || it.serverId == "lemon_music" || it.serverId == config.serverUrl }
-                            for (oldPl in existingPlaylists) {
-                                if (!incomingIds.contains(oldPl.id) && oldPl.isOnline && !oldPl.id.startsWith("pl_")) {
-                                    database.playlistDao().deletePlaylist(oldPl.id)
-                                }
-                            }
-                            val plEntities = plList.map { pl ->
-                                com.lm.player.core.database.entity.PlaylistEntity(
-                                    id = pl.id,
-                                    name = pl.name,
-                                    coverUrl = pl.coverUrl,
-                                    serverId = config.id,
-                                    isOnline = true,
-                                    songCount = pl.songCount
-                                )
-                            }
-                            database.playlistDao().insertPlaylists(plEntities)
-                        }
+                        syncServerPlaylistsWith(activeProto, config)
 
                         // 服务器歌曲加速第 2 期：曲库同步完成后在后台预匹配（每天上限、让路播放，见 ServerTrackPrematcher）
                         com.lm.player.core.source.ServerTrackPrematcher.kick("library_synced")
@@ -1369,6 +1330,8 @@ class MainActivity : ComponentActivity() {
 
             // 监听本地数据库中的服务器、播放列表与歌曲
             LaunchedEffect(Unit) {
+                // 已查过本机曲目封面的歌单（查不到的也记下，不在每次列表变化时重复查库）
+                val localCoverChecked = HashSet<String>()
                 database.playlistDao().getAllPlaylistsFlow().collect { entities ->
                     val mapped = entities.map { entity ->
                         UnifiedPlaylist(
@@ -1385,8 +1348,11 @@ class MainActivity : ComponentActivity() {
                     playlistsList = mapped.filter { it.id != "lemon_favorites" && it.name != "我的收藏" }
 
                     // 本地与自建歌单的封面目录：取歌单内前 4 首有封面的曲目，供卡片四宫格展示
-                    val pending = mapped.filter { it.previewCovers.isEmpty() && playlistPreviewCovers[it.id] == null }
+                    val pending = mapped.filter {
+                        it.previewCovers.isEmpty() && playlistPreviewCovers[it.id] == null && it.id !in localCoverChecked
+                    }
                     if (pending.isNotEmpty()) {
+                        pending.forEach { localCoverChecked.add(it.id) }
                         val fetched = withContext(Dispatchers.IO) {
                             pending.associate { pl ->
                                 pl.id to runCatching {
@@ -1394,8 +1360,13 @@ class MainActivity : ComponentActivity() {
                                 }.getOrDefault(emptyList())
                             }
                         }
-                        if (fetched.isNotEmpty()) {
-                            playlistPreviewCovers = playlistPreviewCovers + fetched
+                        // 2026-11-25：只补本机查到的、且这期间没被服务器同步填上的。
+                        // 云端歌单的本机曲目关联通常为空：此前把空列表也写进去，若服务器同步恰好先一步写入了
+                        // 四宫格封面，就会被这里的空列表盖掉 → 歌单卡片没封面
+                        val current = playlistPreviewCovers
+                        val additions = fetched.filter { (id, covers) -> covers.isNotEmpty() && current[id].isNullOrEmpty() }
+                        if (additions.isNotEmpty()) {
+                            playlistPreviewCovers = current + additions
                         }
                     }
                 }
@@ -1492,16 +1463,60 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // 服务器可用性（带防抖，见 ServerPresence）驱动「我的」页在线 / 本地模式自动切换：
-            // - 持续离线满 60 秒：切到本地模式（发现页、搜索、播放始终走本地音源，界面不变）；
-            // - 离线后稳定在线满 30 秒：自动登录、切回在线并增量同步、核对音源脚本。
-            // 只自动切回「因离线而进入」的本地模式；用户手动选择的本地曲库不动。
+            // 2026-11-25：在前台时每次回到前台、以及之后每分钟，轻量检查服务器 user-data 的 revision
+            // （服务器对 ?sinceRevision= 没变化只回 unchanged 标记）。别的设备（iOS / 手机 / 网页）建、删歌单后，
+            // 车机停在歌单页不切页也能跟上；有变化才整份拉歌单。退到后台即停。
+            LaunchedEffect(Unit) {
+                com.lm.player.core.startup.StartupGate.await()
+                repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                    while (isActive) {
+                        val active = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
+                        val inLocalMode = activeServerName.contains("本地") || activeServerName.contains("已下载")
+                        if (active != null && !inLocalMode) {
+                            val proto = LemonMusicProtocol(
+                                NetworkClientFactory.createOkHttpClient(this@MainActivity),
+                                active.serverUrl, active.username, active.tokenOrApiKey
+                            )
+                            val changed = withContext(Dispatchers.IO) {
+                                runCatching {
+                                    com.lm.player.core.network.ServerPlaylistSync.changedSinceLastSync(proto, active)
+                                }.getOrDefault(false)
+                            }
+                            if (changed) {
+                                Log.i("MainActivity", "Server user-data changed, re-syncing playlists / favorites / recent plays")
+                                syncServerPlaylists(active)
+                                // 收藏、最近播放同样以服务器为准（别的设备点红心、听歌后这边跟上）
+                                val favs = withContext(Dispatchers.IO) {
+                                    runCatching { com.lm.player.core.network.UserDataMirror.pullFavorites(database, proto) }.getOrNull()
+                                }
+                                if (favs != null) serverFavoriteSongs = favs
+                                withContext(Dispatchers.IO) {
+                                    runCatching { com.lm.player.core.network.UserDataMirror.pullRecent(this@MainActivity, proto) }
+                                }
+                            }
+                        }
+                        delay(60_000L)
+                    }
+                }
+            }
+
+            // 服务器可用性（带防抖 + 持续不稳定自动锁定，见 ServerPresence）驱动「我的」页在线 / 本地模式自动切换：
+            // - 持续断联 / 高延迟满阈值：自动锁定本地模式（LOCKED_LOCAL），不再来回抖动，需手动恢复在线；
+            // - 关闭自动锁定时沿用原 60s 离线切本地、恢复稳定 30s 自动切回在线；
+            // - 发现页、搜索、播放与下载始终继续走本地音源，不受资料库锁定影响。
             val serverPresence by com.lm.player.core.source.ServerPresence.mode.collectAsState()
             LaunchedEffect(serverPresence) {
                 val active = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
                     ?: return@LaunchedEffect
                 val inLocalMode = activeServerName.contains("本地") || activeServerName.contains("已下载")
                 when (serverPresence) {
+                    com.lm.player.core.source.ServerPresence.Mode.LOCKED_LOCAL -> {
+                        if (!inLocalMode || activeServerName == "本地 · 服务器离线") {
+                            Log.w("MainActivity", "Server ${active.name} unstable/offline: library auto-locked to local mode")
+                            activeServerName = "本地 · 网络不稳定已锁定"
+                            localModeDueToOffline = true
+                        }
+                    }
                     com.lm.player.core.source.ServerPresence.Mode.OFFLINE -> if (!inLocalMode) {
                         Log.w("MainActivity", "Server ${active.name} offline (confirmed): library switches to local mode")
                         activeServerName = "本地 · 服务器离线"
@@ -2726,24 +2741,24 @@ class MainActivity : ComponentActivity() {
 
             // 在线状态下以服务器记录的最近播放为准 (离线时回落到上面的本地足迹)。
             // 本地模式下不请求服务器足迹，避免把本地歌单外的在线曲目混进「最近播放」。
+            // 2026-11-25：在线时「最近播放」整份用服务器那 100 首（三端一致），本机播放也写回服务器；
+            // 本地模式不连服务器，播放先攒着，回到在线再补推（见 UserDataMirror）
             LaunchedEffect(serversList, activeServerName) {
-                if (activeServerName.contains("本地") || activeServerName.contains("已下载")) return@LaunchedEffect
+                val inLocalMode = activeServerName.contains("本地") || activeServerName.contains("已下载")
+                val active = if (inLocalMode) null else (
+                    serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
+                        ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
+                    )
+                com.lm.player.core.network.UserDataMirror.setServer(this@MainActivity, active)
+                if (active == null) return@LaunchedEffect
                 // 启动提速：服务器最近播放同步等启动闸门放行后再做
                 com.lm.player.core.startup.StartupGate.await()
-                val active = serversList.firstOrNull { it.isCurrentActive && it.type == ServerType.LEMON_MUSIC }
-                    ?: serversList.firstOrNull { it.type == ServerType.LEMON_MUSIC }
-                    ?: return@LaunchedEffect
-                val serverRecent = try {
-                    val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
-                    val protocol = LemonMusicProtocol(client, active.serverUrl, active.username, active.tokenOrApiKey)
-                    protocol.getServerRecentPlays(limit = 30).getOrNull().orEmpty()
-                } catch (_: Exception) {
-                    emptyList()
-                }
-                if (serverRecent.isNotEmpty()) {
-                    // 与本地足迹按真实播放时间合并：本地已记录的歌曲保留自己的时间，
-                    // 服务器独有的历史从当前最新时间起依次插入，两者顺序都不被对方整体覆盖
-                    PlaybackQueueManager.mergeServerRecentPlays(this@MainActivity, serverRecent)
+                withContext(Dispatchers.IO) {
+                    runCatching {
+                        val client = NetworkClientFactory.createOkHttpClient(this@MainActivity)
+                        val protocol = LemonMusicProtocol(client, active.serverUrl, active.username, active.tokenOrApiKey)
+                        com.lm.player.core.network.UserDataMirror.pullRecent(this@MainActivity, protocol)
+                    }
                 }
             }
 
@@ -3102,6 +3117,7 @@ class MainActivity : ComponentActivity() {
                             navigateToScreen(Screen.SEARCH)
                         },
                         onSelectLocalServer = {
+                            com.lm.player.core.source.ServerPresence.clearAutoLockForManualLocal()
                             activeServerName = "本地 · 已下载"
                             localModeDueToOffline = false
                             activeServerId = ""
@@ -3110,9 +3126,12 @@ class MainActivity : ComponentActivity() {
                             }
                         },
                         onSelectServer = { selectedServer ->
+                            com.lm.player.core.source.ServerPresence.unlockToOnline()
                             activeServerName = selectedServer.name
                             activeServerId = selectedServer.id
+                            localModeDueToOffline = false
                             lifecycleScope.launch(Dispatchers.IO) {
+                                com.lm.player.core.source.ServerLinkState.probeNow()
                                 database.serverDao().setActiveServer(selectedServer.id)
                                 syncServerPlaylists(selectedServer)
                                 syncServerSongs(selectedServer)
@@ -3270,6 +3289,7 @@ class MainActivity : ComponentActivity() {
                                             onDownloadSongWithOptions = handleDownloadWithOptions,
                                             onBatchDownloadSongsWithOptions = handleBatchDownloadWithOptions,
                                             onSelectLocalServer = {
+                                                com.lm.player.core.source.ServerPresence.clearAutoLockForManualLocal()
                                                 activeServerName = "本地 · 已下载"
                                                 activeServerId = ""
                                                 localModeDueToOffline = false
@@ -3278,10 +3298,12 @@ class MainActivity : ComponentActivity() {
                                                 }
                                             },
                                             onSelectServer = { selectedServer ->
+                                                com.lm.player.core.source.ServerPresence.unlockToOnline()
                                                 activeServerName = selectedServer.name
                                                 activeServerId = selectedServer.id
                                                 localModeDueToOffline = false
                                                 lifecycleScope.launch(Dispatchers.IO) {
+                                                    com.lm.player.core.source.ServerLinkState.probeNow()
                                                     database.serverDao().setActiveServer(selectedServer.id)
                                                     syncServerPlaylists(selectedServer)
                                                     syncServerSongs(selectedServer)
@@ -3376,6 +3398,7 @@ class MainActivity : ComponentActivity() {
                                             onDownloadSongWithOptions = handleDownloadWithOptions,
                                             onBatchDownloadSongsWithOptions = handleBatchDownloadWithOptions,
                                             onSelectLocalServer = {
+                                                com.lm.player.core.source.ServerPresence.clearAutoLockForManualLocal()
                                                 activeServerName = "本地 · 已下载"
                                                 localModeDueToOffline = false
                                                 activeServerId = ""
@@ -3384,9 +3407,12 @@ class MainActivity : ComponentActivity() {
                                                 }
                                             },
                                             onSelectServer = { selectedServer ->
+                                                com.lm.player.core.source.ServerPresence.unlockToOnline()
                                                 activeServerName = selectedServer.name
                                                 activeServerId = selectedServer.id
+                                                localModeDueToOffline = false
                                                 lifecycleScope.launch(Dispatchers.IO) {
+                                                    com.lm.player.core.source.ServerLinkState.probeNow()
                                                     database.serverDao().setActiveServer(selectedServer.id)
                                                     syncServerSongs(selectedServer)
                                                 }
@@ -3420,9 +3446,10 @@ class MainActivity : ComponentActivity() {
                                 }
 
                                 Screen.MINE, Screen.LIBRARY -> {
-                                    // 服务器确认离线 / 已删除：「我的」页面自动按本地模式展示（服务器恢复后自动切回）
-                                    // 「我的」页按「防抖后的服务器可用性」切换：服务器短时波动（60 秒内恢复）不会切到本地
-                                    val libraryServerLost = com.lm.player.core.source.ServerPresence.mode.collectAsState().value == com.lm.player.core.source.ServerPresence.Mode.OFFLINE
+                                    // 服务器确认离线 / 长时间不稳定锁定 / 已删除：「我的」页面自动按本地模式展示
+                                    val presenceMode = com.lm.player.core.source.ServerPresence.mode.collectAsState().value
+                                    val libraryAutoLocked = presenceMode == com.lm.player.core.source.ServerPresence.Mode.LOCKED_LOCAL
+                                    val libraryServerLost = presenceMode == com.lm.player.core.source.ServerPresence.Mode.OFFLINE || libraryAutoLocked
                                     val isLocalMode = activeServerName.contains("本地") || activeServerName.contains("已下载") || libraryServerLost
                                     val activeConfig = if (isLocalMode) null else (serversList.firstOrNull { it.isCurrentActive } ?: serversList.firstOrNull())
                                     // 切页提速：这一整段（全库过滤 + 按路径 / 歌名歌手去重）原先每次进「我的」都在主线程重算，
@@ -3597,11 +3624,16 @@ class MainActivity : ComponentActivity() {
                                         activeServerConfig = activeConfig,
                                         activeDownloadTasks = activeDownloadTasksProvider,
                                         activeDownloadCount = activeDownloadCount,
-                                        currentServerName = if (libraryServerLost && !activeServerName.contains("本地")) "本地 · 服务器离线" else activeServerName,
+                                        currentServerName = when {
+                                            libraryAutoLocked && !activeServerName.contains("本地") -> "本地 · 网络不稳定已锁定"
+                                            libraryServerLost && !activeServerName.contains("本地") -> "本地 · 服务器离线"
+                                            else -> activeServerName
+                                        },
                                         configuredServers = serversList,
                                                         currentPlayingSong = currentSong,
                                         isPlaying = isPlaying,
                                         onSelectLocalServer = {
+                                            com.lm.player.core.source.ServerPresence.clearAutoLockForManualLocal()
                                             activeServerName = "本地 · 已下载"
                                             localModeDueToOffline = false
                                             activeServerId = ""
@@ -3610,9 +3642,12 @@ class MainActivity : ComponentActivity() {
                                             }
                                         },
                                         onSelectServer = { selectedServer ->
+                                            com.lm.player.core.source.ServerPresence.unlockToOnline()
                                             activeServerName = selectedServer.name
                                             activeServerId = selectedServer.id
+                                            localModeDueToOffline = false
                                             lifecycleScope.launch(Dispatchers.IO) {
+                                                com.lm.player.core.source.ServerLinkState.probeNow()
                                                 database.serverDao().setActiveServer(selectedServer.id)
                                                 syncServerPlaylists(selectedServer)
                                                 syncServerSongs(selectedServer)
@@ -4058,9 +4093,12 @@ class MainActivity : ComponentActivity() {
                                             onlinePrefs.edit().putString("selected_source", newSrc.name).apply()
                                         },
                                         onSelectServer = { server ->
+                                            com.lm.player.core.source.ServerPresence.unlockToOnline()
                                             activeServerName = server.name
                                             activeServerId = server.id
+                                            localModeDueToOffline = false
                                             lifecycleScope.launch(Dispatchers.IO) {
+                                                com.lm.player.core.source.ServerLinkState.probeNow()
                                                 database.serverDao().setActiveServer(server.id)
                                                 syncServerPlaylists(server)
                                                 syncServerSongs(server)
@@ -4874,7 +4912,16 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         com.lm.player.core.widget.WidgetLaunch.consume(intent)
         // 语音点歌：应用已在运行时收到「播放某某」的意图
-        com.lm.player.core.voice.VoicePlayRouter.consumeIntent(this, intent)
+        val caller = runCatching { referrer?.host }.getOrNull()
+        // 2026-11-24：音乐助手点完歌会再用 MAIN 把本应用切到前台（一次两次）；
+        // 设置为点歌不打开界面、且点歌前界面本来就在后台时，马上退回后台，不打断导航
+        val backToBg = com.lm.player.core.voice.VoicePlayRouter.shouldReturnToBackground(this, caller)
+        com.lm.player.core.voice.VoiceDiagnostics.recordAppOpen(
+            this, caller, intent, "切回主界面",
+            note = if (backToBg) "点歌后顺手打开，已退回后台" else null
+        )
+        com.lm.player.core.voice.VoicePlayRouter.consumeIntent(this, intent, caller)
+        if (backToBg) window.decorView.post { moveTaskToBack(true) }
     }
 
     /** 播放页是否要求隐藏状态栏（窗口重新获得焦点时据此补一次，部分系统会在弹窗 / 下拉通知后把状态栏放回来） */
@@ -4906,6 +4953,7 @@ class MainActivity : ComponentActivity() {
         // 闪退诊断：记下「界面在前台」，下次启动时据此判断上次是不是在前台时突然没了
         com.lm.player.core.util.ExitDiagnostics.markForeground(this, true)
         com.lm.player.core.media.SkipLatencyStats.appInForeground = true
+        com.lm.player.core.voice.VoicePlayRouter.onUiResumed()
     }
 
     /**
@@ -4922,6 +4970,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         persistPlaybackStateSync()
+        com.lm.player.core.voice.VoicePlayRouter.onUiPaused()
         super.onPause()
     }
 

@@ -476,15 +476,17 @@ fun LocalLibraryScreen(
                                             color = if (!isLocalMode) Color(0xFF34C759).copy(alpha = 0.2f) else goldColor.copy(alpha = 0.2f),
                                             modifier = Modifier.size(36.dp)
                                         ) {
+                                            val isAutoLockedLocal = com.lm.player.core.source.ServerPresence.mode.collectAsState().value == com.lm.player.core.source.ServerPresence.Mode.LOCKED_LOCAL
                                             Box(contentAlignment = Alignment.Center) {
                                                 Icon(
-                                                    imageVector = if (!isLocalMode) Icons.Default.CloudDone else Icons.Default.FolderSpecial,
+                                                    imageVector = if (!isLocalMode) Icons.Default.CloudDone else if (isAutoLockedLocal) Icons.Default.Lock else Icons.Default.FolderSpecial,
                                                     contentDescription = null,
                                                     tint = if (!isLocalMode) Color(0xFF34C759) else goldColor,
                                                     modifier = Modifier.size(20.dp)
                                                 )
                                             }
                                         }
+                                        val isAutoLockedLocal = com.lm.player.core.source.ServerPresence.mode.collectAsState().value == com.lm.player.core.source.ServerPresence.Mode.LOCKED_LOCAL
                                         Column(modifier = Modifier.weight(1f)) {
                                             Row(
                                                 verticalAlignment = Alignment.CenterVertically,
@@ -493,6 +495,8 @@ fun LocalLibraryScreen(
                                                 Text(
                                                     text = if (!isLocalMode) {
                                                         "在线服务器模式 · ${activeServerConfig?.name ?: currentServerName}"
+                                                    } else if (isAutoLockedLocal) {
+                                                        "本地缓存模式 · 网络不稳定已锁定"
                                                     } else {
                                                         "本地缓存模式 · 离线畅听"
                                                     },
@@ -507,7 +511,7 @@ fun LocalLibraryScreen(
                                                     color = if (!isLocalMode) Color(0xFF34C759).copy(alpha = 0.22f) else goldColor.copy(alpha = 0.22f)
                                                 ) {
                                                     Text(
-                                                        text = if (!isLocalMode) "云端已连接" else "纯本地模式",
+                                                        text = if (!isLocalMode) "云端已连接" else if (isAutoLockedLocal) "已锁定本地" else "纯本地模式",
                                                         fontSize = dimensions.badgeSize,
                                                         fontWeight = FontWeight.Bold,
                                                         color = if (!isLocalMode) Color(0xFF34C759) else goldColor,
@@ -534,6 +538,7 @@ fun LocalLibraryScreen(
                                 // 底部遥控器可聚焦模式切换与同步按钮排
                                 // 四个按钮一排：以前最后的「配置」只能拿到剩下的宽度，被挤压变形。
                                 // 现在每个按钮按文字排、不换行；万一一排放不下就整排横向滚动（光标移过去自动滚到），绝不压缩按钮
+                                val isAutoLockedLocalBtn = com.lm.player.core.source.ServerPresence.mode.collectAsState().value == com.lm.player.core.source.ServerPresence.Mode.LOCKED_LOCAL
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
@@ -541,11 +546,11 @@ fun LocalLibraryScreen(
                                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    // 按钮 1：切换至在线服务器模式
+                                    // 按钮 1：切换至在线服务器模式 / 恢复在线
                                     Surface(
                                         shape = RoundedCornerShape(12.dp),
-                                        color = if (!isLocalMode) AppleRed else Color.White.copy(alpha = 0.10f),
-                                        border = BorderStroke(1.dp, if (!isLocalMode) AppleRed else Color.White.copy(alpha = 0.18f)),
+                                        color = if (!isLocalMode) AppleRed else if (isAutoLockedLocalBtn) goldColor.copy(alpha = 0.24f) else Color.White.copy(alpha = 0.10f),
+                                        border = BorderStroke(1.dp, if (!isLocalMode) AppleRed else if (isAutoLockedLocalBtn) goldColor else Color.White.copy(alpha = 0.18f)),
                                         modifier = Modifier.tvFocusable(
                                             shape = RoundedCornerShape(12.dp),
                                             focusedScale = 1.05f,
@@ -578,7 +583,7 @@ fun LocalLibraryScreen(
                                                 modifier = Modifier.size(14.dp)
                                             )
                                             Text(
-                                                text = if (!isLocalMode && configuredServers.size > 1) "切换服务器" else "在线模式",
+                                                text = if (!isLocalMode && configuredServers.size > 1) "切换服务器" else if (isAutoLockedLocalBtn) "恢复在线" else "在线模式",
                                                 fontSize = dimensions.captionSize,
                                                 fontWeight = FontWeight.Bold,
                                                 color = Color.White

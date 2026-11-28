@@ -40,6 +40,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.withContext
 
 @OptIn(UnstableApi::class)
@@ -199,6 +200,73 @@ class PlaybackService : MediaSessionService() {
                 val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
                 if (p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
             }
+
+            // ---- 播放模式（2026-11-23）----
+            // 随机 / 单曲循环 / 顺序由 PlaybackQueueManager 的三态管理，底层播放器始终不循环、不随机（播完一首由队列决定下一首）。
+            // 外部控制（音乐助手、媒体中心、语音「单曲循环」「随机播放」）发来的设置改到我们自己的模式上，读到的也是我们的模式。
+            // 以前直通 ExoPlayer：外部设成「列表循环」会让只有一首的播放器原地重复这一首，界面却还显示顺序播放。
+
+            override fun getRepeatMode(): Int =
+                if (PlaybackQueueManager.isRepeatFlow.value) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_ALL
+
+            override fun setRepeatMode(repeatMode: Int) {
+                if (repeatMode == Player.REPEAT_MODE_ONE) {
+                    PlaybackQueueManager.setShuffle(false)
+                    PlaybackQueueManager.setRepeat(true)
+                } else {
+                    PlaybackQueueManager.setRepeat(false)
+                }
+            }
+
+            override fun getShuffleModeEnabled(): Boolean = PlaybackQueueManager.isShuffleFlow.value
+
+            override fun setShuffleModeEnabled(shuffleModeEnabled: Boolean) {
+                if (shuffleModeEnabled) {
+                    PlaybackQueueManager.setShuffle(true)
+                    PlaybackQueueManager.setRepeat(false)
+                } else {
+                    PlaybackQueueManager.setShuffle(false)
+                }
+            }
+
+            // 记下挂在这个播放器上的监听（主要是媒体会话自己的），模式变化时由 [modeSyncJob] 通知它们
+            override fun addListener(listener: Player.Listener) {
+                super.addListener(listener)
+                modeListeners.add(listener)
+            }
+
+            override fun removeListener(listener: Player.Listener) {
+                super.removeListener(listener)
+                modeListeners.remove(listener)
+            }
+        }
+    }
+
+    /** 挂在会话播放器上的监听（见 buildForwardingPlayer 的播放模式部分） */
+    private val modeListeners = java.util.concurrent.CopyOnWriteArraySet<Player.Listener>()
+    private var modeSyncJob: Job? = null
+
+    /**
+     * 本应用的播放模式变化（界面里切换、外部设置）时通知媒体会话，音乐助手 / 媒体中心 / 方控屏看到的模式与界面一致。
+     * 底层播放器的模式从不改变，所以这些通知只能由这里发。
+     */
+    private fun startModeSync() {
+        modeSyncJob?.cancel()
+        modeSyncJob = serviceScope.launch {
+            kotlinx.coroutines.flow.combine(
+                PlaybackQueueManager.isShuffleFlow,
+                PlaybackQueueManager.isRepeatFlow
+            ) { shuffle, repeat -> shuffle to repeat }
+                .distinctUntilChanged()
+                .collect { (shuffle, repeat) ->
+                    val mode = if (repeat) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_ALL
+                    for (l in modeListeners) {
+                        runCatching {
+                            l.onShuffleModeEnabledChanged(shuffle)
+                            l.onRepeatModeChanged(mode)
+                        }.onFailure { Log.w(TAG, "mode sync failed", it) }
+                    }
+                }
         }
     }
 
@@ -358,6 +426,9 @@ class PlaybackService : MediaSessionService() {
                 ): ListenableFuture<SessionResult> {
                     if (controller.packageName != packageName) {
                         Log.w(TAG, "Rejected custom command ${customCommand.customAction} from ${controller.packageName}")
+                        com.lm.player.core.voice.VoiceDiagnostics.record(
+                            this@PlaybackService, "自定义命令（已拒绝）", controller.packageName, customCommand.customAction
+                        )
                         return Futures.immediateFuture(SessionResult(SessionResult.RESULT_ERROR_PERMISSION_DENIED))
                     }
                     when (customCommand.customAction) {
@@ -389,13 +460,28 @@ class PlaybackService : MediaSessionService() {
                 // 走到这里。本应用的播放链路是 PlaybackQueueManager（队列、取链、本地优先），不能让 Media3
                 // 直接往播放器里塞条目，所以交给 VoicePlayRouter 处理，并返回失败的 Future 让 Media3 不再继续。
                 // 不带搜索词的请求（按媒体 ID / 地址播放）保持原有的默认行为。
-                private fun interceptVoiceSearch(mediaItems: List<androidx.media3.common.MediaItem>): Boolean {
-                    val item = mediaItems.firstOrNull { it.requestMetadata.searchQuery != null } ?: return false
+                private fun interceptVoiceSearch(
+                    mediaItems: List<androidx.media3.common.MediaItem>,
+                    caller: String
+                ): Boolean {
+                    val item = mediaItems.firstOrNull { it.requestMetadata.searchQuery != null }
+                    if (item == null) {
+                        // 2026-11-24 诊断：别的应用按媒体 ID / 地址要求播放（不是搜索）时也记一条
+                        if (caller != packageName && mediaItems.isNotEmpty()) {
+                            val first = mediaItems.first()
+                            com.lm.player.core.voice.VoiceDiagnostics.record(
+                                this@PlaybackService, "按 ID / 地址播放", caller,
+                                "mediaId=${first.mediaId.take(60)}，uri=${first.requestMetadata.mediaUri?.toString()?.take(60)}，共 ${mediaItems.size} 条"
+                            )
+                        }
+                        return false
+                    }
                     com.lm.player.core.voice.VoicePlayRouter.requestFromExtras(
                         this@PlaybackService,
                         item.requestMetadata.searchQuery,
                         item.requestMetadata.extras,
-                        "media_session"
+                        "media_session",
+                        caller
                     )
                     return true
                 }
@@ -407,7 +493,7 @@ class PlaybackService : MediaSessionService() {
                     startIndex: Int,
                     startPositionMs: Long
                 ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
-                    if (interceptVoiceSearch(mediaItems)) {
+                    if (interceptVoiceSearch(mediaItems, controller.packageName)) {
                         return Futures.immediateFailedFuture(UnsupportedOperationException("handled by VoicePlayRouter"))
                     }
                     return super.onSetMediaItems(mediaSession, controller, mediaItems, startIndex, startPositionMs)
@@ -418,7 +504,7 @@ class PlaybackService : MediaSessionService() {
                     controller: MediaSession.ControllerInfo,
                     mediaItems: MutableList<androidx.media3.common.MediaItem>
                 ): ListenableFuture<MutableList<androidx.media3.common.MediaItem>> {
-                    if (interceptVoiceSearch(mediaItems)) {
+                    if (interceptVoiceSearch(mediaItems, controller.packageName)) {
                         return Futures.immediateFailedFuture(UnsupportedOperationException("handled by VoicePlayRouter"))
                     }
                     return super.onAddMediaItems(mediaSession, controller, mediaItems)
@@ -486,12 +572,23 @@ class PlaybackService : MediaSessionService() {
                                 KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
                                 KeyEvent.KEYCODE_HEADSETHOOK,
                                 KeyEvent.KEYCODE_BUTTON_START -> {
+                                    // 2026-11-23 媒体键唤醒续播：应用没在运行时由 MediaButtonReceiver 拉起服务后走到这里，
+                                    // 此时还没读上次的歌，先读出来（已读过时不重复解析），togglePlay 才能接着放
+                                    PlaybackQueueManager.initFromPrefs(this@PlaybackService)
+                                    com.lm.player.core.voice.VoiceDiagnostics.record(
+                                        this@PlaybackService, "媒体键", controllerInfo.packageName, "播放 / 暂停"
+                                    )
                                     PlaybackQueueManager.togglePlay(this@PlaybackService)
                                     return true
                                 }
                                 KeyEvent.KEYCODE_MEDIA_PLAY -> {
+                                    PlaybackQueueManager.initFromPrefs(this@PlaybackService)
+                                    com.lm.player.core.voice.VoiceDiagnostics.record(
+                                        this@PlaybackService, "媒体键", controllerInfo.packageName, "播放"
+                                    )
+                                    // 用 playWhenReady 判定（缓冲中 isPlaying 为 false，用它会把「播放」变成暂停）
                                     val p = Media3Factory.getSharedExoPlayer(this@PlaybackService)
-                                    if (!p.isPlaying) PlaybackQueueManager.togglePlay(this@PlaybackService)
+                                    if (!p.playWhenReady) PlaybackQueueManager.togglePlay(this@PlaybackService)
                                     return true
                                 }
                                 KeyEvent.KEYCODE_MEDIA_PAUSE,
@@ -512,6 +609,22 @@ class PlaybackService : MediaSessionService() {
                     controllerInfo: MediaSession.ControllerInfo,
                     playerCommand: Int
                 ): Int {
+                    // 2026-11-23 诊断：记下别的应用（音乐助手、媒体中心等）发来的播放控制，设置页「最近语音指令」里能看到是谁、发了什么
+                    if (controllerInfo.packageName != packageName) {
+                        val what = when (playerCommand) {
+                            Player.COMMAND_PLAY_PAUSE -> "播放 / 暂停"
+                            Player.COMMAND_SEEK_TO_NEXT, Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM -> "下一首"
+                            Player.COMMAND_SEEK_TO_PREVIOUS, Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> "上一首"
+                            Player.COMMAND_SET_SHUFFLE_MODE -> "随机开关"
+                            Player.COMMAND_SET_REPEAT_MODE -> "循环模式"
+                            Player.COMMAND_SET_MEDIA_ITEM, Player.COMMAND_CHANGE_MEDIA_ITEMS -> "设置播放内容"
+                            Player.COMMAND_STOP -> "停止"
+                            else -> null
+                        }
+                        if (what != null) {
+                            com.lm.player.core.voice.VoiceDiagnostics.record(this@PlaybackService, "播放控制", controllerInfo.packageName, what)
+                        }
+                    }
                     when (playerCommand) {
                         Player.COMMAND_SEEK_TO_NEXT,
                         Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
@@ -533,6 +646,8 @@ class PlaybackService : MediaSessionService() {
                 .setBitmapLoader(androidx.media3.session.CacheBitmapLoader(SessionCoverBitmapLoader(this)))
                 .build()
             mediaSession = session
+            // 2026-11-23：播放模式（随机 / 单曲循环 / 顺序）同步给媒体会话
+            startModeSync()
 
             // 注册官方防崩监听器，吸收任何由于后台启动前台服务受限引发的系统异常
             setListener(object : MediaSessionService.Listener {

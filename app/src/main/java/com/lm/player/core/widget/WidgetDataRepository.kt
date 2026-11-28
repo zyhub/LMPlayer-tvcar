@@ -397,12 +397,13 @@ internal object WidgetDataRepository {
      */
     class SearchResult(val songs: List<UnifiedSong>, val onlineAvailable: Boolean, val onlineFailed: Boolean)
 
-    suspend fun searchSongs(context: Context, keyword: String): SearchResult = withContext(Dispatchers.IO) {
+    /** @param includeLocal 语音点歌已经自己搜过本地（2026-11-24），传 false 跳过这里的整库扫描 */
+    suspend fun searchSongs(context: Context, keyword: String, includeLocal: Boolean = true): SearchResult = withContext(Dispatchers.IO) {
         val q = keyword.trim()
         if (q.isEmpty()) return@withContext SearchResult(emptyList(), true, false)
         val tokens = q.split(Regex("\\s+")).filter { it.isNotBlank() }
 
-        val local = runCatching {
+        val local = if (!includeLocal) emptyList() else runCatching {
             ZdsDatabase.getInstance(context).songDao().getAllSongsList().asSequence()
                 .filter { s ->
                     val hay = "${s.title} ${s.artist} ${s.album}"

@@ -69,12 +69,20 @@ import kotlinx.coroutines.withContext
 /**
  * 设置分类选项卡 (对标柠檬音乐 Settings.vue 架构)
  */
+/**
+ * 设置分类（2026-11-24 设置界面方案 A：左侧分类导航 + 右侧分组列表）。
+ * 顺序即左侧导航的顺序；以前「播放与外观」一个标签二十多项，拆成「播放」「界面」，
+ * 诊断类挪到「关于与诊断」，「语音控制」从二级页变成一个分类。
+ */
 enum class SettingsTab(val label: String, val icon: ImageVector) {
-    ACCOUNT("账号与服务", Icons.Default.CloudSync),
-    SOURCES("音源与脚本", Icons.Default.GraphicEq),
-    LIBRARY_PATHS("存储与路径", Icons.Default.Folder),
-    DOWNLOAD("下载偏好", Icons.Default.Download),
-    PLAYBACK_UI("播放与外观", Icons.Default.Palette)
+    ACCOUNT("账号与服务器", Icons.Default.CloudSync),
+    SOURCES("音源", Icons.Default.GraphicEq),
+    PLAYBACK("播放", Icons.Default.PlayCircle),
+    INTERFACE("界面", Icons.Default.Palette),
+    DOWNLOAD("下载", Icons.Default.Download),
+    LIBRARY_PATHS("存储与曲库", Icons.Default.Folder),
+    VOICE("语音控制", Icons.Default.RecordVoiceOver),
+    ABOUT("关于与诊断", Icons.Default.Info)
 }
 
 /**
@@ -385,17 +393,26 @@ fun SettingsScreen(
         }
     }
 
-    Column(
+    // 2026-11-24 设置界面方案 A：左侧分类导航 + 右侧当前分类的分组列表（横屏车机 / 电视都按这个排）
+    Row(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
+            .statusBarsPadding()
     ) {
-        // 1. 顶部固定导航区 (大标题与 Tab 胶囊排)
+        // 1. 左侧分类导航：遥控器光标移到哪一类就切到哪一类，触屏直接点
         Column(
             modifier = Modifier
-                .fillMaxWidth()
-                .statusBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 8.dp)
+                .width(dimensions.scale(216.dp))
+                .fillMaxHeight()
+                .verticalScroll(rememberScrollState())
+                .padding(
+                    start = 16.dp,
+                    end = 10.dp,
+                    top = 12.dp,
+                    bottom = contentPadding.calculateBottomPadding() + 16.dp
+                ),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             Text(
                 text = "设置",
@@ -403,82 +420,84 @@ fun SettingsScreen(
                     fontSize = dimensions.pageTitleSize,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onBackground
-                )
+                ),
+                modifier = Modifier.padding(start = 12.dp)
             )
-            Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "个性化您的音乐播放与同步体验 · 本软件为 TV车机版（智能电视与车载横屏大屏通用）",
-                style = TextStyle(
-                    fontSize = dimensions.captionSize,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                text = "TV车机版" +
+                    " v${com.lm.player.BuildConfig.VERSION_NAME}",
+                fontSize = dimensions.captionSize,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 12.dp, bottom = 10.dp)
             )
-
-            Spacer(modifier = Modifier.height(14.dp))
-
-            // 横向 Tab 胶囊切换排（支持遥控器光标移动到哪个功能上立即自动切换到对应功能）
-            LazyRow(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                contentPadding = PaddingValues(horizontal = 2.dp)
-            ) {
-                items(SettingsTab.entries) { tab ->
-                    val isSelected = selectedTab == tab
-                    Surface(
-                        shape = RoundedCornerShape(14.dp),
-                        color = if (isSelected) AppleRed else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
-                        border = BorderStroke(
-                            1.dp,
-                            if (isSelected) AppleRed else borderColor
-                        ),
-                        modifier = Modifier
-                            .tvFocusable(
-                                shape = RoundedCornerShape(14.dp),
-                                focusedScale = 1.05f,
-                                focusedBorderColor = if (isSelected) Color(0xFFFFD60A) else AppleRed,
-                                onFocusChange = { focused ->
-                                    if (focused && selectedTab != tab) {
-                                        selectedTab = tab
-                                    }
-                                },
-                                onClick = { selectedTab = tab }
-                            )
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = tab.icon,
-                                contentDescription = null,
-                                tint = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = tab.label,
-                                fontSize = dimensions.bodySize,
-                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                color = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurface
-                            )
-                        }
-                    }
+            SettingsTab.entries.forEach { tab ->
+                val isSelected = selectedTab == tab
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(if (isSelected) AppleRed.copy(alpha = 0.14f) else Color.Transparent)
+                        .tvFocusable(
+                            shape = RoundedCornerShape(12.dp),
+                            focusedScale = 1.03f,
+                            focusedBorderColor = AppleRed,
+                            onFocusChange = { focused ->
+                                if (focused && selectedTab != tab) selectedTab = tab
+                            },
+                            onClick = { selectedTab = tab }
+                        )
+                        .padding(horizontal = 12.dp, vertical = 11.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = tab.icon,
+                        contentDescription = null,
+                        tint = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(dimensions.scale(20.dp))
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text(
+                        text = tab.label,
+                        fontSize = dimensions.itemTitleSize,
+                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                        color = if (isSelected) AppleRed else MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(6.dp))
-
-        // 2. 主设置内容区域 (根据选中 Tab 渲染对应设置卡片)
-        LazyColumn(
+        // 分隔线
+        Box(
             modifier = Modifier
+                .width(0.5.dp)
+                .fillMaxHeight()
+                .background(borderColor)
+        )
+
+        // 2. 右侧：当前分类的设置（每个分类单独记滚动位置，切过来从顶上开始）
+        Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
+            Text(
+                text = selectedTab.label,
+                fontSize = dimensions.sectionTitleSize,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onBackground,
+                modifier = Modifier.padding(start = 24.dp, top = 16.dp, bottom = 8.dp)
+            )
+            val categoryListState = remember(selectedTab) { androidx.compose.foundation.lazy.LazyListState() }
+        LazyColumn(
+            state = categoryListState,
+            modifier = Modifier
+                .widthIn(max = 1000.dp)
                 .fillMaxWidth()
                 .weight(1f)
-                .padding(horizontal = 16.dp),
+                .padding(horizontal = 20.dp),
             contentPadding = PaddingValues(
-                top = 6.dp,
+                top = 4.dp,
                 bottom = contentPadding.calculateBottomPadding() + 24.dp
             ),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             when (selectedTab) {
                 // ==================== 1. 账号与服务 ====================
@@ -597,6 +616,10 @@ fun SettingsScreen(
                                 }
 
                                 Spacer(modifier = Modifier.height(16.dp))
+                                val presenceMode by com.lm.player.core.source.ServerPresence.mode.collectAsState()
+                                val disconnectLockSec by com.lm.player.core.source.ServerPresence.disconnectLockSeconds.collectAsState()
+                                val isAutoLockedLocal = presenceMode == com.lm.player.core.source.ServerPresence.Mode.LOCKED_LOCAL
+
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -663,6 +686,45 @@ fun SettingsScreen(
                                         )
                                     }
                                 }
+
+                                if (isAutoLockedLocal) {
+                                    Spacer(modifier = Modifier.height(10.dp))
+                                    Button(
+                                        onClick = {
+                                            com.lm.player.core.source.ServerPresence.unlockToOnline()
+                                            onSelectServer(accountServer)
+                                            com.lm.player.core.designsystem.component.AppToast.makeText(
+                                                context,
+                                                "已解除本地锁定，正在恢复在线模式…",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                        },
+                                        shape = RoundedCornerShape(12.dp),
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD97706)),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .tvButtonFocusable(
+                                                shape = RoundedCornerShape(12.dp),
+                                                focusedBorderColor = Color(0xFFFFD60A)
+                                            )
+                                    ) {
+                                        Icon(Icons.Default.CloudQueue, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("网络不稳定已锁定本地 · 点击恢复在线", fontSize = dimensions.bodySize, fontWeight = FontWeight.SemiBold)
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.height(14.dp))
+                                HorizontalDivider(color = borderColor.copy(alpha = 0.6f))
+                                Spacer(modifier = Modifier.height(10.dp))
+                                SettingDropdownRow(
+                                    title = "断联 / 高延迟自动锁定本地",
+                                    subtitle = "服务器持续断联或高延迟超过该时长后，资料库自动锁定为本地模式不再来回切换（在线发现、播放与下载仍由本地音源接管）",
+                                    selectedValue = disconnectLockSec,
+                                    options = com.lm.player.core.source.ServerPresence.LOCK_SECOND_OPTIONS,
+                                    getLabel = { com.lm.player.core.source.ServerPresence.formatLockSeconds(it) },
+                                    onSelect = { com.lm.player.core.source.ServerPresence.setDisconnectLockSeconds(it) }
+                                )
                             } else {
                                 Spacer(modifier = Modifier.height(14.dp))
                                 Text(
@@ -682,207 +744,12 @@ fun SettingsScreen(
                             }
                         }
                     }
-
-                    // 3. 软件版本与在线更新 (更新源: 用户仓库 zyhub/LMplayer)
-                    item {
-                        SettingsCard(title = "软件版本与在线更新 (TV车机版)", icon = Icons.Default.SystemUpdate) {
-                            val curVerName = AppUpdateManager.getAppVersionName(context)
-                            val curVerCode = AppUpdateManager.getAppVersionCode(context)
-                            SettingInfoRow(label = "软件版本", value = "LMPlayer TV车机版 v$curVerName (Build $curVerCode)")
-                            SettingInfoRow(label = "适用平台", value = "智能电视 / 电视盒子 / 车载横屏中控 (TV车机版)")
-                            SettingInfoRow(label = "更新来源", value = AppUpdateManager.DEFAULT_GITHUB_REPO)
-                            SettingInfoRow(label = "开源地址", value = "https://github.com/${AppUpdateManager.DEFAULT_GITHUB_REPO}")
-                            Spacer(modifier = Modifier.height(6.dp))
-                            Text(
-                                text = AppUpdateManager.APP_DESCRIPTION,
-                                fontSize = dimensions.captionSize,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                lineHeight = (dimensions.captionSize.value * 1.4f).sp
-                            )
-
-                            Spacer(modifier = Modifier.height(12.dp))
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp)
-                            ) {
-                                Button(
-                                    onClick = {
-                                        isCheckingUpdate = true
-                                        coroutineScope.launch {
-                                            AppUpdateManager.resetUpdateIgnore(context)
-                                            val res = AppUpdateManager.checkForUpdates(context)
-                                            isCheckingUpdate = false
-                                            if (res.isSuccess) {
-                                                val info = res.getOrThrow()
-                                                activeUpdateInfo = info
-                                                if (info.hasUpdate) {
-                                                    showUpdateDialog = true
-                                                } else {
-                                                    showVersionNotesDialog = true
-                                                }
-                                            } else {
-                                                com.lm.player.core.designsystem.component.AppToast.makeText(context, "检测更新失败: ${res.exceptionOrNull()?.message ?: "网络异常"}", Toast.LENGTH_LONG).show()
-                                            }
-                                        }
-                                    },
-                                    enabled = !isCheckingUpdate,
-                                    shape = RoundedCornerShape(12.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .tvButtonFocusable(
-                                            shape = RoundedCornerShape(12.dp),
-                                            focusedBorderColor = Color(0xFFFFD60A)
-                                        )
-                                ) {
-                                    if (isCheckingUpdate) {
-                                        CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text("检测中...", fontSize = dimensions.bodySize)
-                                    } else {
-                                        Icon(Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(16.dp))
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text("检查新版本", fontSize = dimensions.bodySize, fontWeight = FontWeight.Bold)
-                                    }
-                                }
-
-                                OutlinedButton(
-                                    onClick = {
-                                        activeUpdateInfo = UpdateInfo(
-                                            hasUpdate = false,
-                                            latestVersion = curVerName,
-                                            latestVersionCode = curVerCode.toInt(),
-                                            releaseNotes = "【v${curVerName} TV车机版 专属更新日志】\n\n" +
-                                                "1. 我喜欢的音乐：改为以柠檬服务器收藏为准加载，本地模式按「服务器收藏 ∩ 已下载」枚举，下载过的才显示\n" +
-                                                "2. 试听与下载音质修复：选最高音质无法播放的问题已解决，本平台无该音质时先跨平台同名曲同档补源，仍拿不到才逐档降级；批量下载同样生效，本地文件不受影响\n" +
-                                                "3. 搜索结果翻页：在线结果新增上一页/下一页，TV 车机版每页 12 首，翻页按钮带焦点围栏，遥控器左右键在「上一页/下一页」之间切换",
-                                            downloadUrl = ""
-                                        )
-                                        showVersionNotesDialog = true
-                                    },
-                                    shape = RoundedCornerShape(12.dp),
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .tvButtonFocusable(shape = RoundedCornerShape(12.dp)),
-                                    border = BorderStroke(1.dp, borderColor)
-                                ) {
-                                    Icon(Icons.Default.Notes, contentDescription = null, modifier = Modifier.size(16.dp))
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text("更新日志", fontSize = dimensions.bodySize)
-                                }
-                            }
-                        }
-                    }
-
-                    // 运行诊断（2026-11-13 从「本地存储」挪到这里，紧跟软件更新）：车机没有 adb，直接在这里看 / 复制
-                    item {
-                        SettingsCard(title = "运行诊断", icon = Icons.Default.Info) {
-                            // 安装包构建时间（2026-11-16）：版本号锁定后每次出包都叫 1.10.33，用它核对装的是哪一次的包
-                            Spacer(modifier = Modifier.height(8.dp))
-                            SettingActionRow(
-                                title = "安装包构建时间",
-                                subtitle = "${com.lm.player.BuildConfig.VERSION_NAME} · 构建于 ${com.lm.player.BuildConfig.BUILD_TIME}（北京时间）",
-                                actionText = "复制",
-                                onAction = {
-                                    val text = "${com.lm.player.BuildConfig.VERSION_NAME} 构建 ${com.lm.player.BuildConfig.BUILD_TIME}"
-                                    runCatching {
-                                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                        cm.setPrimaryClip(android.content.ClipData.newPlainText("构建时间", text))
-                                    }
-                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已复制：$text", Toast.LENGTH_SHORT).show()
-                                }
-                            )
-
-                            // 启动提速：最近一次冷启动各节点耗时（距进程启动），用于在车机上直接对比优化前后
-                            Spacer(modifier = Modifier.height(8.dp))
-                            val startupSummary = remember { com.lm.player.core.startup.StartupTrace.lastSummary(context) }
-                            SettingActionRow(
-                                title = "启动耗时",
-                                subtitle = startupSummary?.let { "最近一次冷启动：$it" }
-                                    ?: "暂无记录：冷启动后约 20 秒会记录一次",
-                                actionText = "复制",
-                                onAction = {
-                                    val text = startupSummary ?: "暂无启动耗时记录"
-                                    runCatching {
-                                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                        cm.setPrimaryClip(android.content.ClipData.newPlainText("启动耗时", text))
-                                    }
-                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已复制：$text", Toast.LENGTH_SHORT).show()
-                                }
-                            )
-
-                            // 切歌耗时（2026-11-13）：每次切歌从收到指令到出声用了多久，分前台 / 后台和来源，取地址与缓冲分开
-                            Spacer(modifier = Modifier.height(8.dp))
-                            var skipStatsText by remember { mutableStateOf(com.lm.player.core.media.SkipLatencyStats.summary()) }
-                            SettingActionRow(
-                                title = "切歌耗时",
-                                subtitle = skipStatsText.replace("\n", "；"),
-                                actionText = "复制",
-                                onAction = {
-                                    val text = com.lm.player.core.media.SkipLatencyStats.summary()
-                                    skipStatsText = text
-                                    runCatching {
-                                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                        cm.setPrimaryClip(android.content.ClipData.newPlainText("切歌耗时", text))
-                                    }
-                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已复制切歌耗时记录", Toast.LENGTH_SHORT).show()
-                                }
-                            )
-
-                            // 封面加载统计（本次运行）：封面不显示时用来判断是加载失败、解码异常还是请求没结束
-                            Spacer(modifier = Modifier.height(8.dp))
-                            val imageStats = remember { com.lm.player.core.startup.ImageLoadStats.summary() }
-                            SettingActionRow(
-                                title = "封面加载统计",
-                                subtitle = "本次运行：$imageStats",
-                                actionText = "复制",
-                                onAction = {
-                                    val text = com.lm.player.core.startup.ImageLoadStats.summary()
-                                    runCatching {
-                                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                        cm.setPrimaryClip(android.content.ClipData.newPlainText("封面加载统计", text))
-                                    }
-                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已复制：$text", Toast.LENGTH_LONG).show()
-                                }
-                            )
-
-                            // 界面流畅度（性能优化第 0 项）：按界面统计的卡顿比例 / 平均帧耗时，用来对比优化前后
-                            Spacer(modifier = Modifier.height(8.dp))
-                            var frameStatsText by remember { mutableStateOf(com.lm.player.core.startup.FrameStats.summary()) }
-                            SettingActionRow(
-                                title = "界面流畅度",
-                                subtitle = frameStatsText.replace("\n", "；"),
-                                actionText = "复制",
-                                onAction = {
-                                    val text = com.lm.player.core.startup.FrameStats.summary()
-                                    frameStatsText = text
-                                    runCatching {
-                                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                        cm.setPrimaryClip(android.content.ClipData.newPlainText("界面流畅度", text))
-                                    }
-                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已复制界面流畅度统计", Toast.LENGTH_SHORT).show()
-                                }
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            SettingActionRow(
-                                title = "重新统计流畅度",
-                                subtitle = "清零后到要测的界面停留一两分钟，再回来复制；每批优化前后各测一次对比",
-                                actionText = "清零",
-                                onAction = {
-                                    com.lm.player.core.startup.FrameStats.reset()
-                                    frameStatsText = com.lm.player.core.startup.FrameStats.summary()
-                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已清零，开始重新统计", Toast.LENGTH_SHORT).show()
-                                }
-                            )
-                        }
-                    }
                 }
 
                 // ==================== 2. 音源与脚本 ====================
                 SettingsTab.SOURCES -> {
                     item {
-                        SettingsCard(title = "默认在线操作音源", icon = Icons.Default.GraphicEq) {
+                        SettingsCard(title = "默认音源", icon = Icons.Default.GraphicEq) {
                             SettingDropdownRow(
                                 title = "默认在线音源",
                                 subtitle = "选择全网搜索、在线流式播放及发现推荐使用的首选音源",
@@ -894,8 +761,8 @@ fun SettingsScreen(
 
                             Spacer(modifier = Modifier.height(14.dp))
                             SettingSwitchRow(
-                                title = "自动音源容灾回退",
-                                subtitle = "当首选音源取链失败时，自动按顺序尝试备用音源 (对标柠檬音乐 source.fallbackMode)",
+                                title = "取不到歌时自动换音源",
+                                subtitle = "首选音源取不到播放地址时，自动按顺序试备用音源",
                                 checked = autoFallbackSource,
                                 onCheckedChange = {
                                     autoFallbackSource = it
@@ -1188,7 +1055,7 @@ fun SettingsScreen(
                     }
 
                     item {
-                        SettingsCard(title = "本地存储使用信息", icon = Icons.Default.Storage) {
+                        SettingsCard(title = "存储使用情况", icon = Icons.Default.Storage) {
                             Surface(
                                 shape = RoundedCornerShape(12.dp),
                                 color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
@@ -1289,7 +1156,7 @@ fun SettingsScreen(
 
                             SettingActionRow(
                                 title = "清除资料库遗留数据",
-                                subtitle = "核对本地物理文件真实性，彻底移除已删除曲目、空专辑、孤立歌手及失效缓存记录",
+                                subtitle = "移除文件已被删掉的歌曲、空专辑、孤立歌手和失效缓存记录",
                                 actionText = if (isPurgingLegacyData) "清理中..." else "立即清理",
                                 onAction = { showPurgeConfirmDialog = true }
                             )
@@ -1300,7 +1167,7 @@ fun SettingsScreen(
                 // ==================== 4. 下载偏好 ====================
                 SettingsTab.DOWNLOAD -> {
                     item {
-                        SettingsCard(title = "默认下载配置 (对标柠檬音乐 download.*)", icon = Icons.Default.Download) {
+                        SettingsCard(title = "下载设置", icon = Icons.Default.Download) {
                             SettingDropdownRow(
                                 title = "默认下载音质",
                                 subtitle = "歌曲与专辑下载时优先选取的音质规格",
@@ -1331,8 +1198,8 @@ fun SettingsScreen(
                             Spacer(modifier = Modifier.height(10.dp))
 
                             SettingDropdownRow(
-                                title = "同时下载缓存数设置",
-                                subtitle = "同时并行下载缓存的任务数上限 (同步服务端 download.maxDownloadNum)",
+                                title = "同时下载数",
+                                subtitle = "同时下载的歌曲数上限，与服务器设置同步",
                                 selectedValue = maxConcurrentDownloads,
                                 options = listOf(1, 2, 3, 4, 5, 6),
                                 getLabel = { "$it 个任务同时下载" },
@@ -1352,8 +1219,8 @@ fun SettingsScreen(
 
                             Spacer(modifier = Modifier.height(14.dp))
                             SettingSwitchRow(
-                                title = "内嵌高清专辑封面",
-                                subtitle = "下载音频文件时将封面写入 ID3 标签 (isEmbedPic)",
+                                title = "写入专辑封面",
+                                subtitle = "下载时把专辑封面写进音频文件",
                                 checked = embedCoverMeta,
                                 onCheckedChange = {
                                     embedCoverMeta = it
@@ -1370,8 +1237,8 @@ fun SettingsScreen(
 
                             Spacer(modifier = Modifier.height(8.dp))
                             SettingSwitchRow(
-                                title = "内嵌歌词与翻译",
-                                subtitle = "将逐字/逐句歌词嵌入音频文件内部标签 (isEmbedLyric)",
+                                title = "写入歌词和翻译",
+                                subtitle = "下载时把歌词（含翻译）写进音频文件",
                                 checked = embedLyricMeta,
                                 onCheckedChange = {
                                     embedLyricMeta = it
@@ -1388,8 +1255,8 @@ fun SettingsScreen(
 
                             Spacer(modifier = Modifier.height(8.dp))
                             SettingSwitchRow(
-                                title = "同时保存 .lrc 独立歌词文件",
-                                subtitle = "在歌曲同级目录下保存独立同名 .lrc 歌词文件 (isDownloadLrc)",
+                                title = "另存 .lrc 歌词文件",
+                                subtitle = "在歌曲旁边另存一份同名的 .lrc 歌词文件",
                                 checked = downloadLrcFile,
                                 onCheckedChange = {
                                     downloadLrcFile = it
@@ -1450,15 +1317,15 @@ fun SettingsScreen(
                     }
                 }
 
-                // ==================== 5. 播放与外观 ====================
-                SettingsTab.PLAYBACK_UI -> {
+                // ==================== 3. 播放 ====================
+                SettingsTab.PLAYBACK -> {
                     item {
-                        SettingsCard(title = "在线试听音质与缓存", icon = Icons.Default.HighQuality) {
+                        SettingsCard(title = "在线试听", icon = Icons.Default.HighQuality) {
                             // 1. Wi-Fi 状态试听音质
                             SettingDropdownRow(
                                 icon = Icons.Default.Wifi,
-                                title = "Wi-Fi 状态试听音质",
-                                subtitle = "连接无线局域网时流式播放音质",
+                                title = "Wi-Fi 下试听音质",
+                                subtitle = "连着 Wi-Fi 时在线播放的音质",
                                 selectedValue = wifiStreamQuality,
                                 options = AudioQuality.entries,
                                 getLabel = { "${it.label} [${it.badge}]" },
@@ -1475,8 +1342,8 @@ fun SettingsScreen(
                             // 2. 移动流量状态试听音质
                             SettingDropdownRow(
                                 icon = Icons.Default.SignalCellularAlt,
-                                title = "移动流量状态试听音质",
-                                subtitle = "使用蜂窝网络时播放音质 (建议标准/极高)",
+                                title = "移动网络下试听音质",
+                                subtitle = "用手机流量时在线播放的音质（建议标准或极高）",
                                 selectedValue = cellularStreamQuality,
                                 options = AudioQuality.entries,
                                 getLabel = { "${it.label} [${it.badge}]" },
@@ -1494,8 +1361,8 @@ fun SettingsScreen(
 
                             // 3. 试听本地缓存开关
                             SettingSwitchRow(
-                                title = "在线试听边听边存",
-                                subtitle = if (streamCacheEnabled) "已开启本地缓存：播放时边听边存，再次试听直接命中本地切片免流量" else "已彻底关闭本地缓存：纯在线内存流式试听，不向本地磁盘写入任何缓存文件",
+                                title = "边听边存",
+                                subtitle = if (streamCacheEnabled) "播放时同时存到本机，再听同一首不费流量" else "只在线播放，不往本机写缓存文件",
                                 checked = streamCacheEnabled,
                                 onCheckedChange = { isEnabled ->
                                     streamCacheEnabled = isEnabled
@@ -1517,14 +1384,14 @@ fun SettingsScreen(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Column {
-                                    Text("当前试听缓存占用", fontSize = dimensions.bodySize, fontWeight = FontWeight.SemiBold)
+                                    Text("试听缓存占用", fontSize = dimensions.bodySize, fontWeight = FontWeight.SemiBold)
                                     Text(formattedCacheSize, fontSize = dimensions.badgeSize, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                                 OutlinedButton(
                                     onClick = {
                                         Media3Factory.clearStreamCache(context)
                                         cacheSizeBytes = Media3Factory.getCacheSizeBytes(context)
-                                        com.lm.player.core.designsystem.component.AppToast.makeText(context, "已成功清空在线试听缓存切片", Toast.LENGTH_SHORT).show()
+                                        com.lm.player.core.designsystem.component.AppToast.makeText(context, "已清空试听缓存", Toast.LENGTH_SHORT).show()
                                     },
                                     shape = RoundedCornerShape(10.dp),
                                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
@@ -1541,99 +1408,51 @@ fun SettingsScreen(
                     }
 
                     item {
-                        SettingsCard(title = "播放与启动行为", icon = Icons.Default.PlayCircle) {
+                        SettingsCard(title = "启动与播放", icon = Icons.Default.PlayCircle) {
                             SettingSwitchRow(
-                                title = "安卓系统启动后自动运行",
-                                subtitle = "开机后自动拉起应用与后台播放服务 (部分电视盒子需在系统安全中心放行自启动)，默认关闭",
+                                title = "开机自动运行",
+                                subtitle = "开机后自动打开软件和后台播放（部分电视盒子要在系统安全中心允许自启动）",
                                 checked = autoLaunchOnBoot,
                                 onCheckedChange = onAutoLaunchOnBootChange
                             )
 
                             Spacer(modifier = Modifier.height(10.dp))
                             SettingSwitchRow(
-                                title = "启动自动继续播放",
-                                subtitle = "打开应用时自动恢复上次关闭前的曲目并继续播放",
+                                title = "打开后继续播放",
+                                subtitle = "打开软件时接着播上次关掉前的那首歌",
                                 checked = autoPlayOnStartup,
                                 onCheckedChange = onAutoPlayOnStartupChange
                             )
 
                             Spacer(modifier = Modifier.height(10.dp))
                             SettingSwitchRow(
-                                title = "网络容灾自动回退本地",
-                                subtitle = "在线音频遇到网络超时或无法缓冲时，无缝切换至已下载的本地歌曲",
+                                title = "断网时改播本地歌曲",
+                                subtitle = "在线歌曲网络超时或卡住时，自动换成已下载的同一首",
                                 checked = autoFallbackToLocal,
                                 onCheckedChange = onAutoFallbackToLocalChange
                             )
 
+                            // 2026-11-23：启动后直接进入播放页
                             Spacer(modifier = Modifier.height(10.dp))
-                            // 平台模式切换入口：与首次启动向导写同一份偏好，切换后即时生效、无需重启。
                             SettingDropdownRow(
-                                title = "使用平台模式",
-                                subtitle = if (currentPlatformMode == PlatformMode.CAR) {
-                                    "车机 / 中控：以触控为主，已停用遥控器焦点光环与方向键操作。\n无触屏设备如需切回电视模式：长按遥控器「返回键」2 秒。"
-                                } else {
-                                    "电视 / 机顶盒：完整启用遥控器焦点光环、方向键导航与菜单键快捷键"
-                                },
-                                icon = if (currentPlatformMode == PlatformMode.CAR) Icons.Default.DirectionsCar else Icons.Default.Tv,
-                                selectedValue = currentPlatformMode,
-                                options = PlatformMode.entries.toList(),
-                                getLabel = { it.displayName },
-                                // 关键：平台模式绝不能被左右方向键「顺手」改掉。
-                                // 车机模式会停用整套遥控焦点体系（tvFocusable 的 canFocus=false）
-                                // 并在 Activity 层吞掉全部 D-Pad 事件，无触屏电视/盒子一旦误切就
-                                // 再也进不了设置页 —— 此前遥控器扫过这一行按一次左右键即触发。
-                                allowHorizontalKeyChange = false,
-                                onSelect = onPlatformModeChange
+                                title = "启动后进入播放页",
+                                subtitle = "「上次在播放页退出时」：上次关掉软件（或车辆熄火）时停在播放页，这次打开直接回到播放页；「每次打开」：只要有上次播放的歌，打开就进播放页",
+                                icon = Icons.Default.PlayCircle,
+                                selectedValue = com.lm.player.core.designsystem.theme.AppUiPrefs.playerOnLaunch,
+                                options = com.lm.player.core.designsystem.theme.PlayerOnLaunch.values().toList(),
+                                getLabel = { it.label },
+                                onSelect = { mode ->
+                                    com.lm.player.core.designsystem.theme.AppUiPrefs.updatePlayerOnLaunch(context, mode)
+                                }
                             )
                         }
                     }
+                }
 
+                // ==================== 4. 界面 ====================
+                SettingsTab.INTERFACE -> {
                     item {
-                        SettingsCard(title = "TV 车机版专属交互与快捷键指南", icon = Icons.Default.Tv) {
-                            Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = AppleRed.copy(alpha = 0.12f),
-                                border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.30f)),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Column(
-                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
-                                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    Text(
-                                        text = if (currentPlatformMode == PlatformMode.CAR) {
-                                            "LMPlayer TV车机版 当前为「车机 / 中控」模式：围绕横向大屏与触控优化，已停用遥控器焦点光环与方向键操作以降低车机端资源占用"
-                                        } else {
-                                            "LMPlayer TV车机版 已开启客厅 10 英尺大屏、车载中控横屏与物理遥控器 (D-Pad) 深度适配"
-                                        },
-                                        fontSize = dimensions.bodySize,
-                                        fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                    Text(
-                                        // 车机文案只陈述**实际存在**的触控路径，逐条与实现核对过；
-                                        // 不照搬电视侧「菜单键呼出收藏/加歌单窗口」这类与实现不符的说法。
-                                        text = if (currentPlatformMode == PlatformMode.CAR) {
-                                            "• 全局浏览：直接点按界面即可，无需移动光标\n" +
-                                                "• 歌曲列表：点按歌曲立即播放；点按行尾的同步状态按钮可下载或查看下载进度\n" +
-                                                "• 播放页与全屏歌词：点按任意功能按钮操作，拖动进度条跳转\n" +
-                                                "• 方向盘 / 中控的 [上一首] [下一首] [播放暂停] 与音量键始终有效，不受平台模式影响"
-                                        } else {
-                                            "• 全局浏览：支持车机触控直点或使用电视遥控器 [▲ ▼ ◀ ▶] 移动高对比度焦点光环\n" +
-                                                "• 歌曲列表：选中歌曲按 [OK/确定键] 立即播放；按遥控器 [☰ 菜单键] 呼出收藏/下载/加歌单窗口\n" +
-                                                "• 全屏歌词页：遥控器 [▲ ▼ ◀ ▶] 自由选中任意功能按钮并按 [OK键] 操作 ｜ 长按 [◀ / ▶] 快速切换上一首/下一首 ｜ [☰ 菜单键] 展开待播队列"
-                                        },
-                                        fontSize = dimensions.captionSize,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        lineHeight = (dimensions.captionSize.value * 1.45f).sp
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    item {
-                        SettingsCard(title = "界面外观与字体规格", icon = Icons.Default.Palette) {
+                        SettingsCard(title = "外观", icon = Icons.Default.Palette) {
                             // 全局字体与视距规格：50% ~ 150% 连续调节 (默认 100%)，单条进度条适配所有分辨率
                             // 注意：◀ 与 ▶ 各自独立获得焦点与点击事件，OK 键按下「减少」必定减小、
                             // 按下「放大」必定增大（此前整行共用一个 onClick，导致按减少按钮反而增大）。
@@ -1646,7 +1465,7 @@ fun SettingsScreen(
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        text = "TV 车机版全局字体与视距规格 (${uiScalePercent}%)",
+                                        text = "界面大小（${uiScalePercent}%）",
                                         fontSize = dimensions.itemTitleSize,
                                         fontWeight = FontWeight.Medium,
                                         color = MaterialTheme.colorScheme.onSurface,
@@ -1655,7 +1474,7 @@ fun SettingsScreen(
                                     )
                                     Spacer(modifier = Modifier.height(2.dp))
                                     Text(
-                                        text = "统一控制电视与车机端 7 级标题、列表、正文、角标与卡片窗口的尺寸比例，适配各类分辨率屏幕；点「默认 100%」一键还原",
+                                        text = "整体放大或缩小文字和卡片；点「默认 100%」还原",
                                         fontSize = dimensions.captionSize,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         maxLines = 2,
@@ -1796,7 +1615,7 @@ fun SettingsScreen(
 
                             SettingDropdownRow(
                                 title = "主题外观",
-                                subtitle = "选择系统全局视觉色彩风格",
+                                subtitle = "浅色、深色或跟随系统",
                                 icon = Icons.Default.Brightness6,
                                 selectedValue = themeMode,
                                 options = listOf(AppThemeMode.FOLLOW_SYSTEM, AppThemeMode.DARK, AppThemeMode.LIGHT),
@@ -1854,20 +1673,6 @@ fun SettingsScreen(
                                 getLabel = { it.label },
                                 onSelect = { page ->
                                     com.lm.player.core.designsystem.theme.AppUiPrefs.updateStartPage(context, page)
-                                }
-                            )
-
-                            // 2026-11-23：启动后直接进入播放页
-                            Spacer(modifier = Modifier.height(10.dp))
-                            SettingDropdownRow(
-                                title = "启动后进入播放页",
-                                subtitle = "「上次在播放页退出时」：上次关掉软件（或车辆熄火）时停在播放页，这次打开直接回到播放页；「每次打开」：只要有上次播放的歌，打开就进播放页",
-                                icon = Icons.Default.PlayCircle,
-                                selectedValue = com.lm.player.core.designsystem.theme.AppUiPrefs.playerOnLaunch,
-                                options = com.lm.player.core.designsystem.theme.PlayerOnLaunch.values().toList(),
-                                getLabel = { it.label },
-                                onSelect = { mode ->
-                                    com.lm.player.core.designsystem.theme.AppUiPrefs.updatePlayerOnLaunch(context, mode)
                                 }
                             )
 
@@ -1938,6 +1743,291 @@ fun SettingsScreen(
                                     com.lm.player.core.designsystem.theme.AppUiPrefs.updateKeepPagesAlive(context, enabled)
                                 }
                             )
+
+                            // 平台模式切换入口：与首次启动向导写同一份偏好，切换后即时生效、无需重启。
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SettingDropdownRow(
+                                title = "使用平台模式",
+                                subtitle = if (currentPlatformMode == PlatformMode.CAR) {
+                                    "车机 / 中控：以触控为主，已停用遥控器焦点光环与方向键操作。\n无触屏设备如需切回电视模式：长按遥控器「返回键」2 秒。"
+                                } else {
+                                    "电视 / 机顶盒：完整启用遥控器焦点光环、方向键导航与菜单键快捷键"
+                                },
+                                icon = if (currentPlatformMode == PlatformMode.CAR) Icons.Default.DirectionsCar else Icons.Default.Tv,
+                                selectedValue = currentPlatformMode,
+                                options = PlatformMode.entries.toList(),
+                                getLabel = { it.displayName },
+                                // 关键：平台模式绝不能被左右方向键「顺手」改掉。
+                                // 车机模式会停用整套遥控焦点体系（tvFocusable 的 canFocus=false）
+                                // 并在 Activity 层吞掉全部 D-Pad 事件，无触屏电视/盒子一旦误切就
+                                // 再也进不了设置页 —— 此前遥控器扫过这一行按一次左右键即触发。
+                                allowHorizontalKeyChange = false,
+                                onSelect = onPlatformModeChange
+                            )
+                        }
+                    }
+                }
+
+                // ==================== 7. 语音控制 ====================
+                SettingsTab.VOICE -> {
+                    item { VoiceControlSettingsContent() }
+                }
+
+                // ==================== 8. 关于与诊断 ====================
+                SettingsTab.ABOUT -> {
+                    // 3. 软件版本与在线更新 (更新源: 用户仓库 zyhub/LMplayer)
+                    item {
+                        SettingsCard(title = "版本与更新", icon = Icons.Default.SystemUpdate) {
+                            val curVerName = AppUpdateManager.getAppVersionName(context)
+                            val curVerCode = AppUpdateManager.getAppVersionCode(context)
+                            SettingInfoRow(
+                                label = "软件版本",
+                                value = "LMPlayer TV车机版" +
+                                    " v$curVerName (Build $curVerCode)"
+                            )
+                            SettingInfoRow(label = "适用平台", value = "智能电视 / 电视盒子 / 车载横屏中控")
+                            SettingInfoRow(label = "更新来源", value = AppUpdateManager.DEFAULT_GITHUB_REPO)
+                            SettingInfoRow(label = "开源地址", value = "https://github.com/${AppUpdateManager.DEFAULT_GITHUB_REPO}")
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = AppUpdateManager.APP_DESCRIPTION,
+                                fontSize = dimensions.captionSize,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                lineHeight = (dimensions.captionSize.value * 1.4f).sp
+                            )
+
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Button(
+                                    onClick = {
+                                        isCheckingUpdate = true
+                                        coroutineScope.launch {
+                                            AppUpdateManager.resetUpdateIgnore(context)
+                                            val res = AppUpdateManager.checkForUpdates(context)
+                                            isCheckingUpdate = false
+                                            if (res.isSuccess) {
+                                                val info = res.getOrThrow()
+                                                activeUpdateInfo = info
+                                                if (info.hasUpdate) {
+                                                    showUpdateDialog = true
+                                                } else {
+                                                    showVersionNotesDialog = true
+                                                }
+                                            } else {
+                                                com.lm.player.core.designsystem.component.AppToast.makeText(context, "检测更新失败: ${res.exceptionOrNull()?.message ?: "网络异常"}", Toast.LENGTH_LONG).show()
+                                            }
+                                        }
+                                    },
+                                    enabled = !isCheckingUpdate,
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = AppleRed),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .tvButtonFocusable(
+                                            shape = RoundedCornerShape(12.dp),
+                                            focusedBorderColor = Color(0xFFFFD60A)
+                                        )
+                                ) {
+                                    if (isCheckingUpdate) {
+                                        CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("检测中...", fontSize = dimensions.bodySize)
+                                    } else {
+                                        Icon(Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("检查新版本", fontSize = dimensions.bodySize, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+
+                                OutlinedButton(
+                                    onClick = {
+                                        activeUpdateInfo = UpdateInfo(
+                                            hasUpdate = false,
+                                            latestVersion = curVerName,
+                                            latestVersionCode = curVerCode.toInt(),
+                                            releaseNotes = "【v${curVerName} TV车机版 专属更新日志】\n\n" +
+                                                "1. 我喜欢的音乐：改为以柠檬服务器收藏为准加载，本地模式按「服务器收藏 ∩ 已下载」枚举，下载过的才显示\n" +
+                                                "2. 试听与下载音质修复：选最高音质无法播放的问题已解决，本平台无该音质时先跨平台同名曲同档补源，仍拿不到才逐档降级；批量下载同样生效，本地文件不受影响\n" +
+                                                "3. 搜索结果翻页：在线结果新增上一页/下一页，TV 车机版每页 12 首，翻页按钮带焦点围栏，遥控器左右键在「上一页/下一页」之间切换",
+                                            downloadUrl = ""
+                                        )
+                                        showVersionNotesDialog = true
+                                    },
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .tvButtonFocusable(shape = RoundedCornerShape(12.dp)),
+                                    border = BorderStroke(1.dp, borderColor)
+                                ) {
+                                    Icon(Icons.Default.Notes, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("更新日志", fontSize = dimensions.bodySize)
+                                }
+                            }
+                        }
+                    }
+
+                    // 运行诊断（2026-11-13 从「本地存储」挪到这里，紧跟软件更新）：车机没有 adb，直接在这里看 / 复制
+                    item {
+                        SettingsCard(title = "运行诊断", icon = Icons.Default.Info) {
+                            // 安装包构建时间（2026-11-16）：版本号锁定后每次出包都叫 1.10.33，用它核对装的是哪一次的包
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SettingActionRow(
+                                title = "安装包构建时间",
+                                subtitle = "${com.lm.player.BuildConfig.VERSION_NAME} · 构建于 ${com.lm.player.BuildConfig.BUILD_TIME}（北京时间）",
+                                actionText = "复制",
+                                onAction = {
+                                    val text = "${com.lm.player.BuildConfig.VERSION_NAME} 构建 ${com.lm.player.BuildConfig.BUILD_TIME}"
+                                    runCatching {
+                                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                        cm.setPrimaryClip(android.content.ClipData.newPlainText("构建时间", text))
+                                    }
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已复制：$text", Toast.LENGTH_SHORT).show()
+                                }
+                            )
+
+                            // 2026-11-24：开发排查用的统计默认收起，平时不占地方
+                            var showPerfStats by remember { mutableStateOf(false) }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SettingActionRow(
+                                title = "性能统计",
+                                subtitle = "启动、切歌耗时，封面加载，界面流畅度（开发排查用）",
+                                actionText = if (showPerfStats) "收起" else "展开",
+                                onAction = { showPerfStats = !showPerfStats }
+                            )
+                            if (showPerfStats) {
+
+                            // 启动提速：最近一次冷启动各节点耗时（距进程启动），用于在车机上直接对比优化前后
+                            Spacer(modifier = Modifier.height(8.dp))
+                            val startupSummary = remember { com.lm.player.core.startup.StartupTrace.lastSummary(context) }
+                            SettingActionRow(
+                                title = "启动耗时",
+                                subtitle = startupSummary?.let { "最近一次冷启动：$it" }
+                                    ?: "暂无记录：冷启动后约 20 秒会记录一次",
+                                actionText = "复制",
+                                onAction = {
+                                    val text = startupSummary ?: "暂无启动耗时记录"
+                                    runCatching {
+                                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                        cm.setPrimaryClip(android.content.ClipData.newPlainText("启动耗时", text))
+                                    }
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已复制：$text", Toast.LENGTH_SHORT).show()
+                                }
+                            )
+
+                            // 切歌耗时（2026-11-13）：每次切歌从收到指令到出声用了多久，分前台 / 后台和来源，取地址与缓冲分开
+                            Spacer(modifier = Modifier.height(8.dp))
+                            var skipStatsText by remember { mutableStateOf(com.lm.player.core.media.SkipLatencyStats.summary()) }
+                            SettingActionRow(
+                                title = "切歌耗时",
+                                subtitle = skipStatsText.replace("\n", "；"),
+                                actionText = "复制",
+                                onAction = {
+                                    val text = com.lm.player.core.media.SkipLatencyStats.summary()
+                                    skipStatsText = text
+                                    runCatching {
+                                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                        cm.setPrimaryClip(android.content.ClipData.newPlainText("切歌耗时", text))
+                                    }
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已复制切歌耗时记录", Toast.LENGTH_SHORT).show()
+                                }
+                            )
+
+                            // 封面加载统计（本次运行）：封面不显示时用来判断是加载失败、解码异常还是请求没结束
+                            Spacer(modifier = Modifier.height(8.dp))
+                            val imageStats = remember { com.lm.player.core.startup.ImageLoadStats.summary() }
+                            SettingActionRow(
+                                title = "封面加载统计",
+                                subtitle = "本次运行：$imageStats",
+                                actionText = "复制",
+                                onAction = {
+                                    val text = com.lm.player.core.startup.ImageLoadStats.summary()
+                                    runCatching {
+                                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                        cm.setPrimaryClip(android.content.ClipData.newPlainText("封面加载统计", text))
+                                    }
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已复制：$text", Toast.LENGTH_LONG).show()
+                                }
+                            )
+
+                            // 界面流畅度（性能优化第 0 项）：按界面统计的卡顿比例 / 平均帧耗时，用来对比优化前后
+                            Spacer(modifier = Modifier.height(8.dp))
+                            var frameStatsText by remember { mutableStateOf(com.lm.player.core.startup.FrameStats.summary()) }
+                            SettingActionRow(
+                                title = "界面流畅度",
+                                subtitle = frameStatsText.replace("\n", "；"),
+                                actionText = "复制",
+                                onAction = {
+                                    val text = com.lm.player.core.startup.FrameStats.summary()
+                                    frameStatsText = text
+                                    runCatching {
+                                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                        cm.setPrimaryClip(android.content.ClipData.newPlainText("界面流畅度", text))
+                                    }
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已复制界面流畅度统计", Toast.LENGTH_SHORT).show()
+                                }
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SettingActionRow(
+                                title = "重新统计流畅度",
+                                subtitle = "清零后到要测的界面停留一两分钟，再回来复制；每批优化前后各测一次对比",
+                                actionText = "清零",
+                                onAction = {
+                                    com.lm.player.core.startup.FrameStats.reset()
+                                    frameStatsText = com.lm.player.core.startup.FrameStats.summary()
+                                    com.lm.player.core.designsystem.component.AppToast.makeText(context, "已清零，开始重新统计", Toast.LENGTH_SHORT).show()
+                                }
+                            )
+                            }
+                        }
+                    }
+
+                    // 遥控器 / 触控操作说明
+                    item {
+                        SettingsCard(title = "操作说明", icon = Icons.Default.Tv) {
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = AppleRed.copy(alpha = 0.12f),
+                                border = BorderStroke(1.dp, AppleRed.copy(alpha = 0.30f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = if (currentPlatformMode == PlatformMode.CAR) {
+                                            "LMPlayer TV车机版 当前为「车机 / 中控」模式：围绕横向大屏与触控优化，已停用遥控器焦点光环与方向键操作以降低车机端资源占用"
+                                        } else {
+                                            "LMPlayer TV车机版 已开启客厅 10 英尺大屏、车载中控横屏与物理遥控器 (D-Pad) 深度适配"
+                                        },
+                                        fontSize = dimensions.bodySize,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Text(
+                                        // 车机文案只陈述**实际存在**的触控路径，逐条与实现核对过；
+                                        // 不照搬电视侧「菜单键呼出收藏/加歌单窗口」这类与实现不符的说法。
+                                        text = if (currentPlatformMode == PlatformMode.CAR) {
+                                            "• 全局浏览：直接点按界面即可，无需移动光标\n" +
+                                                "• 歌曲列表：点按歌曲立即播放；点按行尾的同步状态按钮可下载或查看下载进度\n" +
+                                                "• 播放页与全屏歌词：点按任意功能按钮操作，拖动进度条跳转\n" +
+                                                "• 方向盘 / 中控的 [上一首] [下一首] [播放暂停] 与音量键始终有效，不受平台模式影响"
+                                        } else {
+                                            "• 全局浏览：支持车机触控直点或使用电视遥控器 [▲ ▼ ◀ ▶] 移动高对比度焦点光环\n" +
+                                                "• 歌曲列表：选中歌曲按 [OK/确定键] 立即播放；按遥控器 [☰ 菜单键] 呼出收藏/下载/加歌单窗口\n" +
+                                                "• 全屏歌词页：遥控器 [▲ ▼ ◀ ▶] 自由选中任意功能按钮并按 [OK键] 操作 ｜ 长按 [◀ / ▶] 快速切换上一首/下一首 ｜ [☰ 菜单键] 展开待播队列"
+                                        },
+                                        fontSize = dimensions.captionSize,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        lineHeight = (dimensions.captionSize.value * 1.45f).sp
+                                    )
+                                }
+                            }
                         }
                     }
 
@@ -1962,6 +2052,7 @@ fun SettingsScreen(
                     }
                 }
             }
+        }
         }
     }
 
@@ -3046,10 +3137,11 @@ fun SettingsScreen(
 }
 
 /**
- * 设置卡片容器
+ * 设置分组（2026-11-24 方案 A 改样式）：组名是卡片上方一行浅色小标题，下面一块圆角底板装这一组的设置行。
+ * 以前组名在卡片里、强调色大标题，一页好几张卡片时显得很挤。
  */
 @Composable
-private fun SettingsCard(
+internal fun SettingsCard(
     title: String,
     icon: ImageVector,
     content: @Composable ColumnScope.() -> Unit
@@ -3059,31 +3151,35 @@ private fun SettingsCard(
     val cardColor = if (isDark) Color(0xFF24242C) else Color.White
     val borderCol = if (isDark) Color.White.copy(alpha = 0.10f) else Color.Black.copy(alpha = 0.06f)
 
-    Surface(
-        shape = RoundedCornerShape(18.dp),
-        color = cardColor,
-        contentColor = MaterialTheme.colorScheme.onSurface,
-        border = BorderStroke(1.dp, borderCol),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Column(modifier = Modifier.padding(18.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    imageVector = icon,
-                    contentDescription = null,
-                    tint = AppleRed,
-                    modifier = Modifier.size(20.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = title,
-                    fontSize = dimensions.cardHeaderSize,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(start = 8.dp, bottom = 8.dp)
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(dimensions.scale(16.dp))
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = title,
+                fontSize = dimensions.bodySize,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = cardColor,
+            contentColor = MaterialTheme.colorScheme.onSurface,
+            border = BorderStroke(1.dp, borderCol),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                content()
             }
-            Spacer(modifier = Modifier.height(14.dp))
-            content()
         }
     }
 }
@@ -3092,7 +3188,7 @@ private fun SettingsCard(
  * 信息行
  */
 @Composable
-private fun SettingInfoRow(label: String, value: String) {
+internal fun SettingInfoRow(label: String, value: String) {
     val dimensions = LocalAppDimensions.current
     Row(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
@@ -3125,7 +3221,7 @@ private fun SettingInfoRow(label: String, value: String) {
  * 开关行（由外层 Row 统一接管 TV 焦点与双环光标，内部 Switch 不重复抢占焦点）
  */
 @Composable
-private fun SettingSwitchRow(
+internal fun SettingSwitchRow(
     title: String,
     subtitle: String,
     checked: Boolean,
@@ -3178,7 +3274,7 @@ private fun SettingSwitchRow(
  * 动作行（由外层 Row 统一接管 TV 焦点与双环光标，右侧按钮作为视觉徽标不重复抢占焦点）
  */
 @Composable
-private fun SettingActionRow(
+internal fun SettingActionRow(
     title: String,
     subtitle: String,
     actionText: String,

@@ -58,7 +58,15 @@ object SkipLatencyStats {
         c.prefetched = prefetched
     }
 
+    /** 最近一次出声的歌与时间（elapsedRealtime）；语音日志据此算「从收到指令到出声」用了多久 */
+    @Volatile var lastSoundSongId: String? = null
+        private set
+    @Volatile var lastSoundAt = 0L
+        private set
+
     fun onPlaying(songId: String?) {
+        lastSoundSongId = songId
+        lastSoundAt = SystemClock.elapsedRealtime()
         val c = current ?: return
         if (c.songId != songId) return
         current = null

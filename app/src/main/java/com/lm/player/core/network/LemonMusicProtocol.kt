@@ -99,6 +99,19 @@ class LemonMusicProtocol(
         }
     }
 
+    /**
+     * 2026-11-25：[fetchExistingPlaylistsRaw] 读到的歌单原样（深拷贝）与 user-data revision。
+     * 歌单写操作都是「持写锁 → fetchExistingPlaylistsRaw → 原地修改 → saveCustomPlaylists」，
+     * 保存时用它带 baseRevision，冲突时作三方合并的基准（见 [UserDataSync]）。
+     */
+    private var playlistsBase: JSONArray? = null
+    private var playlistsBaseRevision: Long? = null
+
+    /** [getPlaylists] 本次读到的 user-data revision：歌单同步记下它，之后用轻量检查判断服务器有没有变 */
+    @Volatile
+    var lastPlaylistsRevision: Long? = null
+        private set
+
     companion object {
         private const val TAG = "LemonMusicProtocol"
         /** getSongList 只合并这个时间窗内完成的服务端下载任务 */
@@ -111,6 +124,25 @@ class LemonMusicProtocol(
          * 注意：Mutex 不可重入，持锁期间不得再调用任何会加锁的方法。
          */
         private val userDataWriteMutex = kotlinx.coroutines.sync.Mutex()
+
+        /**
+         * 2026-11-25：本机刚在服务器上新建的歌单 id → 新建时间。
+         * 歌单同步会把「服务器上已经没有」的云端歌单从本机删掉（任何一端删的都要同步过来）；
+         * 刚建好、恰好碰上一次用旧列表的同步时，靠这里留 2 分钟，免得刚建的歌单闪一下就没了。
+         */
+        private val recentlyCreatedPlaylists = ConcurrentHashMap<String, Long>()
+        private const val RECENTLY_CREATED_GRACE_MS = 2 * 60_000L
+
+        fun markPlaylistCreated(playlistId: String) {
+            if (playlistId.isNotBlank()) recentlyCreatedPlaylists[playlistId] = System.currentTimeMillis()
+        }
+
+        fun isRecentlyCreatedPlaylist(playlistId: String): Boolean {
+            val at = recentlyCreatedPlaylists[playlistId] ?: return false
+            if (System.currentTimeMillis() - at < RECENTLY_CREATED_GRACE_MS) return true
+            recentlyCreatedPlaylists.remove(playlistId)
+            return false
+        }
 
         // ==================== 服务器曲目流畅转码 (C-08) ====================
 
@@ -1356,6 +1388,93 @@ class LemonMusicProtocol(
     }
 
     /**
+     * 2026-11-25：服务器「最近播放」原样（服务器顺序、最多 [limit] 首）。读取失败返回 failure，
+     * 调用方据此保持本机列表不动（旧的 [getServerRecentPlays] 读取失败也返回空列表）。
+     */
+    suspend fun fetchRecentPlaysFromServer(limit: Int = UserDataMirror.RECENT_LIMIT): Result<List<UnifiedSong>> =
+        withContext(Dispatchers.IO) {
+            try {
+                val userData = getLibraryUserData().getOrElse { return@withContext Result.failure(it) }
+                Result.success(parseRecentPlays(userData.optJSONArray("recentPlays") ?: JSONArray(), limit))
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                Result.failure(e)
+            }
+        }
+
+    private fun parseRecentPlays(arr: JSONArray, limit: Int): List<UnifiedSong> {
+        val list = ArrayList<UnifiedSong>(minOf(arr.length(), limit))
+        val seenIds = HashSet<String>()
+        for (i in 0 until arr.length()) {
+            if (list.size >= limit) break
+            val song = parseUserDataTrack(arr.opt(i)) ?: continue
+            if (seenIds.add(song.id)) list.add(song)
+        }
+        return list
+    }
+
+    /**
+     * 2026-11-25：把本机的播放写进服务器「最近播放」（[played] 新→旧）：置顶、去掉同一首的旧记录、最多 [limit] 首，
+     * 带 baseRevision（别的设备同时写了就按最新数据重算）。纯本地文件（没有服务器路径、也不是在线曲目）不写。
+     * 返回写入后的服务器列表（已映射为歌曲）。
+     */
+    suspend fun pushRecentPlays(played: List<UnifiedSong>, limit: Int = UserDataMirror.RECENT_LIMIT): Result<List<UnifiedSong>> =
+        withContext(Dispatchers.IO) {
+            val entries = played.mapNotNull { song ->
+                val (key, snap) = buildTrackKeyAndSnapshot(song)
+                val isServerFile = key.startsWith("local:")
+                val isOnline = song.id.startsWith("lemon_online_") || song.serverId == "lemon_online"
+                if (isServerFile || isOnline) Triple(key, snap, isServerFile) else null
+            }.distinctBy { it.first }
+            if (entries.isEmpty()) return@withContext Result.success(emptyList())
+            withUserDataWriteLock {
+                try {
+                    ensureAuthenticatedOrThrow()
+                    val userData = getLibraryUserData().getOrElse { return@withUserDataWriteLock Result.failure(it) }
+                    var saved = JSONArray()
+                    val res = putUserDataWithRevision(userData) { current ->
+                        val old = current.optJSONArray("recentPlays") ?: JSONArray()
+                        val out = JSONArray()
+                        for ((_, snap, _) in entries) out.put(snap)
+                        for (i in 0 until old.length()) {
+                            if (out.length() >= limit) break
+                            val item = old.opt(i) ?: continue
+                            if (entries.none { (key, snap, isServerFile) -> recentEntryMatches(item, key, snap, isServerFile) }) {
+                                out.put(item)
+                            }
+                        }
+                        saved = out
+                        JSONObject().put("recentPlays", out)
+                    }
+                    res.map { parseRecentPlays(saved, limit) }
+                } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
+                    Result.failure(e)
+                }
+            }
+        }
+
+    /** 服务器最近播放里的一条是不是 [key] 这首（安卓写的 local:路径 / 平台:id，iOS 写的 local:trackId 带 filePath、online:平台:id） */
+    private fun recentEntryMatches(item: Any?, key: String, snap: JSONObject, isServerFile: Boolean): Boolean {
+        val path = if (isServerFile) key.removePrefix("local:").trim() else ""
+        val songId = snap.optString("songId").trim()
+        val source = snap.optString("source").trim()
+        return when (item) {
+            is String -> item == key || (path.isNotBlank() && item.removePrefix("local:").trim() == path)
+            is JSONObject -> {
+                val k = item.optString("key").trim()
+                val p = item.optString("localPath").ifBlank { item.optString("filePath") }.removePrefix("local:").trim()
+                val sid = item.optString("songId").trim()
+                val src = item.optString("source").ifBlank { item.optString("platform") }.trim()
+                k == key ||
+                    (path.isNotBlank() && (p == path || k.removePrefix("local:").trim() == path)) ||
+                    (!isServerFile && songId.isNotBlank() && sid == songId && (src.isBlank() || src == source))
+            }
+            else -> false
+        }
+    }
+
+    /**
      * 将 /api/library/user-data 中的单条曲目记录 (favorites / recentPlays 通用结构) 映射为 UnifiedSong。
      * 同时兼容「服务端本地文件路径」与「全网在线音源」两种记录形态，无法识别时返回 null。
      */
@@ -1373,6 +1492,7 @@ class LemonMusicProtocol(
         if (sPic.isNotBlank() && !sPic.startsWith("http") && !sPic.startsWith("data:")) {
             sPic = "$cleanBase$sPic"
         }
+        sPic = localizeServerImageUrl(sPic)
 
         if (sLocalPath.isNotBlank() || key.startsWith("local:")) {
             val cleanPath = (if (sLocalPath.isNotBlank()) sLocalPath else key.removePrefix("local:")).trim()
@@ -1624,31 +1744,73 @@ class LemonMusicProtocol(
     override suspend fun getPlaylists(): Result<List<UnifiedPlaylist>> = getPlaylists("lemon_music")
 
     /** 将服务端返回的相对封面路径补全为可直接加载的绝对地址 */
-    private fun resolveCoverUrl(raw: String, cleanBase: String): String =
-        if (raw.startsWith("http://") || raw.startsWith("https://") || raw.startsWith("data:")) raw
-        else "$cleanBase$raw"
+    /**
+     * 服务器图片地址统一到本机连接的服务器（2026-11-25）：
+     * - 以 / 开头的相对地址补全为本服务器地址；
+     * - 别的设备写进歌单 / 收藏快照的 `/api/tag/cover` 绝对地址，主机是那台设备连服务器用的地址（内网 IP / 外网域名），
+     *   车机未必连得上；而且图片客户端只给本服务器主机带登录凭证，别的主机一律 401 → 封面空白。
+     *   换成本机的服务器地址，并去掉对方会话的 token 参数（由图片拦截器带本机凭证）。
+     * 其他地址原样返回（平台 CDN 等由界面层的封面规范化处理）。
+     */
+    fun localizeServerImageUrl(raw: String?): String {
+        val url = raw?.trim().orEmpty()
+        if (url.isEmpty() || url.equals("null", ignoreCase = true) || url.equals("undefined", ignoreCase = true)) return ""
+        if (url.startsWith("/") && !url.startsWith("//")) return "$cleanBase$url"
+        val lower = url.lowercase()
+        if (!lower.startsWith("http://") && !lower.startsWith("https://")) return url
+        val idx = url.indexOf("/api/tag/cover")
+        if (idx <= 0) return url
+        val foreign = url.toHttpUrlOrNull() ?: return url
+        val own = cleanBase.toHttpUrlOrNull() ?: return url
+        if (foreign.host.equals(own.host, ignoreCase = true) && foreign.port == own.port) return url
+        val rebased = "$cleanBase${url.substring(idx)}".toHttpUrlOrNull() ?: return url
+        return rebased.newBuilder().removeAllQueryParameters("token").build().toString()
+    }
+
+    /** 一条曲目快照 / 收藏条目的封面：有封面字段用封面字段；服务器本地曲目没写封面的按文件路径取内嵌封面 */
+    private fun snapshotCover(item: JSONObject?, key: String): String {
+        val raw = item?.let { s ->
+            listOf("picUrl", "img", "cover", "coverUrl", "pic", "albumPic")
+                .map { s.optString(it).trim() }
+                .firstOrNull { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+        }.orEmpty()
+        if (raw.isNotBlank()) return localizeServerImageUrl(raw)
+        // iOS 端写入的服务器曲目快照只有 filePath / localPath（iOS 显示时按路径现取内嵌封面），
+        // 安卓按 songKeys 追加的只有 local:路径 —— 与手机端一致，按路径拼 /api/tag/cover
+        val fromSnapshot = item?.optString("localPath")?.ifBlank { item.optString("filePath") }.orEmpty().trim()
+        val fromKey = key.trim().removePrefix("local:").trim().takeIf { it.contains('/') || it.contains('\\') }.orEmpty()
+        val path = fromSnapshot.ifBlank { fromKey }.removePrefix("local:")
+        return if (path.isNotBlank()) getCoverArtUrlForPath(path) else ""
+    }
 
     /**
-     * 从歌单的 trackSnapshots 中提取最多 [limit] 张曲目封面，供「我的」页面歌单卡片做四宫格展示。
-     * 服务端在 user-data 中已随歌单下发每首曲目的 picUrl/img，因此无需额外网络请求。
+     * 歌单卡片四宫格封面（2026-11-25 重写）：按歌单曲目顺序取前 [limit] 首的封面。
+     * 原实现只认快照里的 picUrl / img —— iOS 端新建的歌单（快照没有封面字段）和别的设备写的服务器封面地址
+     * 在车机上都显示不出来。
      */
-    private fun collectSnapshotCovers(
-        snapshots: JSONObject?,
-        fallbackCover: String,
-        cleanBase: String,
-        limit: Int = 4
-    ): List<String> {
+    private fun playlistPreviewCovers(pl: JSONObject, limit: Int = 4): List<String> {
         val covers = LinkedHashSet<String>()
-        if (snapshots != null) {
-            val keys = snapshots.keys()
-            while (keys.hasNext() && covers.size < limit) {
-                val snapshot = snapshots.optJSONObject(keys.next()) ?: continue
-                val raw = snapshot.optString("picUrl").ifBlank { snapshot.optString("img") }
-                if (raw.isNotBlank()) covers.add(resolveCoverUrl(raw, cleanBase))
+        val keys = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("tracks") ?: pl.optJSONArray("paths") ?: JSONArray()
+        val snapshots = pl.optJSONObject("trackSnapshots")
+        for (i in 0 until keys.length()) {
+            if (covers.size >= limit) break
+            val cover = when (val item = keys.opt(i)) {
+                is String -> snapshotCover(snapshots?.optJSONObject(item) ?: snapshots?.optJSONObject(item.removePrefix("local:")), item)
+                is JSONObject -> snapshotCover(item, item.optString("key"))
+                else -> ""
+            }
+            if (cover.isNotBlank()) covers.add(cover)
+        }
+        // 旧数据：曲目键为空、只有快照
+        if (covers.size < limit && snapshots != null && keys.length() == 0) {
+            val it = snapshots.keys()
+            while (it.hasNext() && covers.size < limit) {
+                val k = it.next()
+                val cover = snapshotCover(snapshots.optJSONObject(k), k)
+                if (cover.isNotBlank()) covers.add(cover)
             }
         }
-        if (covers.size < limit && fallbackCover.isNotBlank()) covers.add(fallbackCover)
-        return covers.take(limit)
+        return covers.toList()
     }
 
     /** 「我的收藏」智能歌单的四宫格封面 */
@@ -1657,16 +1819,35 @@ class LemonMusicProtocol(
         if (arr == null) return emptyList()
         var i = 0
         while (i < arr.length() && covers.size < limit) {
-            val item = arr.optJSONObject(i)
+            val item = arr.opt(i)
             i++
-            if (item == null) continue
-            val raw = item.optString("picUrl")
-                .ifBlank { item.optString("img") }
-                .ifBlank { item.optString("coverUrl") }
-                .ifBlank { item.optString("pic") }
-            if (raw.isNotBlank()) covers.add(resolveCoverUrl(raw, cleanBase))
+            val cover = when (item) {
+                is JSONObject -> snapshotCover(item, item.optString("key"))
+                is String -> snapshotCover(null, item)
+                else -> ""
+            }
+            if (cover.isNotBlank()) covers.add(cover)
         }
         return covers.take(limit)
+    }
+
+    /** user-data / 旧歌单接口里的一个歌单 → 列表项（两处共用） */
+    private fun parseServerPlaylist(pl: JSONObject, index: Int, targetServerId: String): UnifiedPlaylist {
+        val id = pl.optString("id", "lemon_pl_$index")
+        val tracks = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("tracks") ?: pl.optJSONArray("paths") ?: JSONArray()
+        val previews = playlistPreviewCovers(pl)
+        // 用户自定义封面优先；没有就用第一首的封面
+        val coverUrl = localizeServerImageUrl(pl.optString("coverUrl")).ifBlank { previews.firstOrNull().orEmpty() }
+        return UnifiedPlaylist(
+            id = id,
+            name = pl.optString("name", "未命名歌单"),
+            coverUrl = coverUrl,
+            songCount = tracks.length(),
+            isOnline = true,
+            serverId = targetServerId,
+            previewCovers = previews.ifEmpty { listOfNotNull(coverUrl.takeIf { it.isNotBlank() }) },
+            isDiscover = false
+        )
     }
 
     suspend fun getPlaylists(targetServerId: String): Result<List<UnifiedPlaylist>> = withContext(Dispatchers.IO) {
@@ -1676,10 +1857,12 @@ class LemonMusicProtocol(
             val seenIds = HashSet<String>()
 
             // 1. 优先拉取 /api/library/user-data (包含用户全量歌单、收藏与配置)
+            var sourceOk = false
             try {
                 val userDataRes = getLibraryUserData()
                 if (userDataRes.isSuccess) {
                     val userData = userDataRes.getOrNull()
+                    lastPlaylistsRevision = UserDataSync.revisionOf(userData)
                     // A. 服务端「我的收藏」智能歌单 (放置在置顶首位)
                     val favArr = userData?.optJSONArray("favorites")
                     if (favArr != null && favArr.length() > 0) {
@@ -1703,90 +1886,35 @@ class LemonMusicProtocol(
                     if (plArr != null) {
                         for (i in 0 until plArr.length()) {
                             val pl = plArr.optJSONObject(i) ?: continue
-                            val id = pl.optString("id", "lemon_pl_$i")
-                            if (seenIds.add(id)) {
-                                val name = pl.optString("name", "未命名歌单")
-                                var coverUrl = pl.optString("coverUrl")
-                                val tracks = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("tracks") ?: pl.optJSONArray("paths") ?: JSONArray()
-                                val snapshots = pl.optJSONObject("trackSnapshots")
-                                if (coverUrl.isBlank() && snapshots != null) {
-                                    val it = snapshots.keys()
-                                    while (it.hasNext()) {
-                                        val k = it.next()
-                                        val sn = snapshots.optJSONObject(k)
-                                        val p = sn?.optString("picUrl")?.ifBlank { sn.optString("img") } ?: ""
-                                        if (p.isNotBlank()) {
-                                            coverUrl = if (p.startsWith("http://") || p.startsWith("https://") || p.startsWith("data:")) p else "$cleanBase$p"
-                                            break
-                                        }
-                                    }
-                                } else if (coverUrl.isNotBlank() && !coverUrl.startsWith("http") && !coverUrl.startsWith("data:")) {
-                                    coverUrl = "$cleanBase$coverUrl"
-                                }
-                                playlists.add(
-                                    UnifiedPlaylist(
-                                        id = id,
-                                        name = name,
-                                        coverUrl = coverUrl,
-                                        songCount = tracks.length(),
-                                        isOnline = true,
-                                        serverId = targetServerId,
-                                        previewCovers = collectSnapshotCovers(snapshots, coverUrl, cleanBase),
-                                        isDiscover = false
-                                    )
-                                )
-                            }
+                            val item = parseServerPlaylist(pl, i, targetServerId)
+                            if (seenIds.add(item.id)) playlists.add(item)
                         }
                     }
+                    // 整份解析完才算读到（中途出错不能拿半份列表去对齐本机，否则会误删歌单）
+                    sourceOk = true
                 }
             } catch (e: Exception) {
                 if (e is kotlinx.coroutines.CancellationException) throw e
                 Log.w(TAG, "Fetching /api/library/user-data for playlists error", e)
             }
+            if (!sourceOk) {
+                playlists.clear()
+                seenIds.clear()
+            }
 
-            // 2. 兼容拉取 /api/library/playlists (旧版或特定端歌单接口)
-            try {
+            // 2. user-data 读不到时才退回旧歌单接口（新版服务器两者是同一份数据，不必重复拉）
+            if (!sourceOk) try {
                 val customReq = newAuthRequest("$cleanBase/api/library/playlists").get().build()
                 client.newCall(customReq).execute().use { resp ->
                     if (resp.isSuccessful) {
                         val body = resp.body?.string() ?: ""
                         val json = JSONObject(body)
                         val list = json.optJSONArray("data") ?: JSONArray()
+                        sourceOk = true
                         for (i in 0 until list.length()) {
                             val pl = list.optJSONObject(i) ?: continue
-                            val id = pl.optString("id", "lemon_pl_$i")
-                            if (seenIds.add(id)) {
-                                val name = pl.optString("name", "未命名歌单")
-                                var coverUrl = pl.optString("coverUrl")
-                                val tracks = pl.optJSONArray("trackKeys") ?: pl.optJSONArray("tracks") ?: pl.optJSONArray("paths") ?: JSONArray()
-                                val snapshots = pl.optJSONObject("trackSnapshots")
-                                if (coverUrl.isBlank() && snapshots != null) {
-                                    val it = snapshots.keys()
-                                    while (it.hasNext()) {
-                                        val k = it.next()
-                                        val sn = snapshots.optJSONObject(k)
-                                        val p = sn?.optString("picUrl")?.ifBlank { sn.optString("img") } ?: ""
-                                        if (p.isNotBlank()) {
-                                            coverUrl = if (p.startsWith("http://") || p.startsWith("https://") || p.startsWith("data:")) p else "$cleanBase$p"
-                                            break
-                                        }
-                                    }
-                                } else if (coverUrl.isNotBlank() && !coverUrl.startsWith("http") && !coverUrl.startsWith("data:")) {
-                                    coverUrl = "$cleanBase$coverUrl"
-                                }
-                                playlists.add(
-                                    UnifiedPlaylist(
-                                        id = id,
-                                        name = name,
-                                        coverUrl = coverUrl,
-                                        songCount = tracks.length(),
-                                        isOnline = true,
-                                        serverId = targetServerId,
-                                        previewCovers = collectSnapshotCovers(snapshots, coverUrl, cleanBase),
-                                        isDiscover = false
-                                    )
-                                )
-                            }
+                            val item = parseServerPlaylist(pl, i, targetServerId)
+                            if (seenIds.add(item.id)) playlists.add(item)
                         }
                     }
                 }
@@ -1795,6 +1923,8 @@ class LemonMusicProtocol(
                 Log.w(TAG, "Fetching /api/library/playlists fallback error", e)
             }
 
+            // 两个来源都没读到：返回失败。此前返回空列表，同步方会据此把本机的云端歌单全部删掉
+            if (!sourceOk) return@withContext Result.failure(Exception("读取服务器歌单失败"))
             Result.success(playlists)
         } catch (e: Exception) {
             if (e is kotlinx.coroutines.CancellationException) throw e
@@ -2301,7 +2431,8 @@ class LemonMusicProtocol(
             if (playlistId == "lemon_favorites") {
                 try {
                     val userDataRes = getLibraryUserData()
-                    val userData = userDataRes.getOrNull()
+                    // 2026-11-25：读不到就返回失败，不能当成「服务器没有收藏」（调用方会据此清掉本机红心）
+                    val userData = userDataRes.getOrElse { return@withContext Result.failure(it) }
                     val favArr = userData?.optJSONArray("favorites")
                     if (favArr != null) {
                         for (j in 0 until favArr.length()) {
@@ -2319,6 +2450,7 @@ class LemonMusicProtocol(
                                 if (sPic.isNotBlank() && !sPic.startsWith("http") && !sPic.startsWith("data:")) {
                                     sPic = "$cleanBase$sPic"
                                 }
+                                sPic = localizeServerImageUrl(sPic)
 
                                 if (sLocalPath.isNotBlank() || item.optString("key").startsWith("local:")) {
                                     val cleanPath = (if (sLocalPath.isNotBlank()) sLocalPath else item.optString("key").removePrefix("local:")).trim()
@@ -2383,6 +2515,8 @@ class LemonMusicProtocol(
                 } catch (e: Exception) {
                     if (e is kotlinx.coroutines.CancellationException) throw e
                     Log.w(TAG, "Failed to get favorites from user-data", e)
+                    // 解析到一半出错同样返回失败：半份收藏拿去对齐会误清红心
+                    return@withContext Result.failure(e)
                 }
             } else {
                 // D. 用户自建与云端歌单：优先查 user-data 中的 playlists
@@ -2459,6 +2593,7 @@ class LemonMusicProtocol(
                             if (sPic.isNotBlank() && !sPic.startsWith("http") && !sPic.startsWith("data:")) {
                                 sPic = "$cleanBase$sPic"
                             }
+                            sPic = localizeServerImageUrl(sPic)
 
                             if (sLocalPath.isNotBlank() || rawKey.startsWith("local:")) {
                                 val cleanLocalPath = (if (sLocalPath.isNotBlank()) sLocalPath else rawKey.removePrefix("local:")).trim()
@@ -2564,11 +2699,15 @@ class LemonMusicProtocol(
                                 songIdToSongMap[songId] = song
                                 songs.add(song)
                             }
+                        } else if (playlistId == "lemon_favorites") {
+                            return@withContext Result.failure(Exception("补全收藏曲目失败 (HTTP ${resp.code})"))
                         }
                     }
                 } catch (e: Exception) {
                     if (e is kotlinx.coroutines.CancellationException) throw e
                     Log.w(TAG, "Failed to query tracks by paths fallback", e)
+                    // 收藏少了几首会被当成「别的设备取消了」而清掉红心：宁可这次不对齐
+                    if (playlistId == "lemon_favorites") return@withContext Result.failure(e)
                 }
             }
 
@@ -4717,7 +4856,11 @@ class LemonMusicProtocol(
     suspend fun getLibraryUserData(): Result<JSONObject> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticatedOrThrow()
-            val req = newAuthRequest("$cleanBase/api/library/user-data").get().build()
+            // 2026-11-25：绕过 HTTP 缓存。服务器 ETag 只跟 revision 走，旧版安卓保存不推进 revision，
+            // 走缓存协商会拿到 304 + 本地旧数据（看不到别的设备的改动，读改写时还会把旧数据整表盖回去）。
+            val req = newAuthRequest("$cleanBase/api/library/user-data")
+                .cacheControl(okhttp3.CacheControl.FORCE_NETWORK)
+                .get().build()
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""
                 if (!resp.isSuccessful) return@withContext Result.failure(Exception("获取用户数据失败 (HTTP ${resp.code})"))
@@ -4741,8 +4884,12 @@ class LemonMusicProtocol(
     private suspend fun fetchExistingPlaylistsRaw(): Result<ArrayList<JSONObject>> {
         val existingPlaylists = ArrayList<JSONObject>()
         val userDataRes = getLibraryUserData()
+        // 保存时带 baseRevision、冲突时三方合并用（调用方会原地改返回的对象，基准存深拷贝）
+        playlistsBaseRevision = UserDataSync.revisionOf(userDataRes.getOrNull())
+        playlistsBase = null
         val userPlaylists = userDataRes.getOrNull()?.optJSONArray("playlists")
         if (userPlaylists != null && userPlaylists.length() > 0) {
+            playlistsBase = UserDataSync.copyOf(userPlaylists)
             for (i in 0 until userPlaylists.length()) {
                 userPlaylists.optJSONObject(i)?.let { existingPlaylists.add(it) }
             }
@@ -4761,10 +4908,16 @@ class LemonMusicProtocol(
                 true
             }
         }.getOrDefault(false)
-        if (legacyOk) return Result.success(existingPlaylists)
+        if (legacyOk) {
+            playlistsBase = UserDataSync.copyOf(JSONArray().also { arr -> existingPlaylists.forEach { arr.put(it) } })
+            return Result.success(existingPlaylists)
+        }
         existingPlaylists.clear()
         // user-data 读取成功、只是确实没有歌单：空列表是可信的
-        if (userDataRes.isSuccess) return Result.success(existingPlaylists)
+        if (userDataRes.isSuccess) {
+            playlistsBase = JSONArray()
+            return Result.success(existingPlaylists)
+        }
         return Result.failure(
             Exception("读取服务器歌单失败，已取消本次修改以免覆盖服务器数据：${userDataRes.exceptionOrNull()?.message ?: "未知错误"}")
         )
@@ -4867,28 +5020,84 @@ class LemonMusicProtocol(
     suspend fun saveCustomPlaylists(playlists: JSONArray): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
             ensureAuthenticatedOrThrow()
-            val payload = JSONObject().apply {
-                put("playlists", playlists)
+            // 2026-11-25：只写 user-data（旧接口 /api/library/playlists 与它是服务器同一份数据，但不推进 revision），
+            // 并带上读取时的 baseRevision：服务器保存后 revision + 1，iOS / 网页端 / 另一台安卓才知道这边改过。
+            // 读取之后别的设备又改了（409）→ 以读取时那份为基准，把本机这次的改动叠到服务器最新数据上再存。
+            val base = playlistsBase
+            val initial = JSONObject().apply {
+                playlistsBaseRevision?.let { put("revision", it) }
             }
-            var saved = false
-            runCatching {
-                val body = payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+            playlistsBase = null
+            playlistsBaseRevision = null
+            val res = putUserDataWithRevision(initial) { current ->
+                val toSave = if (current === initial) playlists
+                else UserDataSync.mergePlaylists(base, playlists, current.optJSONArray("playlists") ?: JSONArray())
+                JSONObject().put("playlists", toSave)
+            }
+            if (res.isSuccess) return@withContext res
+            // 很旧的服务器没有 user-data 写接口：退回旧歌单接口
+            if ((res.exceptionOrNull() as? UserDataHttpException)?.code == 404) {
+                val body = JSONObject().put("playlists", playlists).toString().toRequestBody(JSON_MEDIA_TYPE)
                 val req = newAuthRequest("$cleanBase/api/library/playlists").put(body).build()
-                client.newCall(req).execute().use { resp ->
-                    if (resp.isSuccessful) saved = true
+                return@withContext client.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) Result.success(true)
+                    else Result.failure(Exception("保存歌单失败 (HTTP ${resp.code})"))
                 }
             }
-            runCatching {
-                val body = payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
-                val req = newAuthRequest("$cleanBase/api/library/user-data").put(body).build()
-                client.newCall(req).execute().use { resp ->
-                    if (resp.isSuccessful) saved = true
-                }
+            Result.failure(Exception("保存歌单失败：${res.exceptionOrNull()?.message ?: "未知错误"}"))
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Result.failure(e)
+        }
+    }
+
+    private class UserDataHttpException(val code: Int, message: String) : Exception(message)
+
+    /**
+     * 2026-11-25：带 revision 的 user-data 写入（见 [UserDataSync]）。
+     * [build] 根据服务器当前数据算出要保存的字段；首次传入 [initial]（读改写时读到的那份，revision 字段即 baseRevision）。
+     * 服务器回 409（读取之后别的设备改过）→ 用 409 响应里的最新数据（没有就重新 GET）再算一次，最多重试 3 次。
+     * 调用方必须已持有 user-data 写锁。
+     */
+    private suspend fun putUserDataWithRevision(
+        initial: JSONObject,
+        build: (current: JSONObject) -> JSONObject
+    ): Result<Boolean> {
+        var current = initial
+        var conflicts = 0
+        while (true) {
+            val payload = build(current)
+            UserDataSync.revisionOf(current)?.let { payload.put("baseRevision", it) }
+            val body = payload.toString().toRequestBody(JSON_MEDIA_TYPE)
+            val req = newAuthRequest("$cleanBase/api/library/user-data").put(body).build()
+            val (code, text) = client.newCall(req).execute().use { resp -> resp.code to (resp.body?.string().orEmpty()) }
+            if (code in 200..299) return Result.success(true)
+            if (UserDataSync.isConflict(code, text) && conflicts < UserDataSync.MAX_CONFLICT_RETRIES) {
+                conflicts++
+                Log.i(TAG, "user-data revision conflict, merging with server copy (retry $conflicts)")
+                current = UserDataSync.conflictData(text) ?: getLibraryUserData().getOrElse { return Result.failure(it) }
+                continue
             }
-            if (saved) {
-                Result.success(true)
-            } else {
-                Result.failure(Exception("保存歌单失败"))
+            return Result.failure(UserDataHttpException(code, "HTTP $code"))
+        }
+    }
+
+    /**
+     * 2026-11-25：服务器 user-data 自 [revision] 以来有没有变。服务器对 `?sinceRevision=` 相同时只回 `unchanged:true`，
+     * 歌单同步拿它做前台定时 / 回到前台时的轻量检查，不必每次整份拉取。
+     */
+    suspend fun hasUserDataChangedSince(revision: Long): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            ensureAuthenticatedOrThrow()
+            val req = newAuthRequest("$cleanBase/api/library/user-data?sinceRevision=$revision")
+                .cacheControl(okhttp3.CacheControl.FORCE_NETWORK)
+                .get().build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext Result.failure(Exception("HTTP ${resp.code}"))
+                val json = JSONObject(resp.body?.string().orEmpty())
+                if (json.optBoolean("unchanged", false)) return@withContext Result.success(false)
+                val rev = UserDataSync.revisionOf(json.optJSONObject("data") ?: json)
+                Result.success(rev == null || rev != revision)
             }
         } catch (e: Exception) {
             if (e is kotlinx.coroutines.CancellationException) throw e
@@ -4925,6 +5134,7 @@ class LemonMusicProtocol(
 
                 val saveRes = saveCustomPlaylists(saveArr)
                 if (saveRes.isSuccess) {
+                    markPlaylistCreated(newId)
                     Result.success(
                         UnifiedPlaylist(
                             id = newId,
@@ -5374,7 +5584,9 @@ class LemonMusicProtocol(
                     Exception("读取服务器收藏失败，已取消本次修改以免覆盖服务器数据：${it.message}")
                 )
             }
-            val favArr = userData.optJSONArray("favorites") ?: JSONArray()
+            // 2026-11-25：带 baseRevision 保存；读取后别的设备改过（409）就按服务器最新收藏重算一次
+            putUserDataWithRevision(userData) { current ->
+            val favArr = current.optJSONArray("favorites") ?: JSONArray()
             val keptItems = ArrayList<Any>()
 
             for (i in 0 until favArr.length()) {
@@ -5410,18 +5622,13 @@ class LemonMusicProtocol(
             val newFavArr = JSONArray()
             keptItems.forEach { newFavArr.put(it) }
 
-            val payload = JSONObject().apply {
+            JSONObject().apply {
                 put("favorites", newFavArr)
             }
-            val body = payload.toString().toRequestBody(JSON_MEDIA_TYPE)
-            val req = newAuthRequest("$cleanBase/api/library/user-data").put(body).build()
-            client.newCall(req).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    Result.success(true)
-                } else {
-                    Result.failure(Exception("保存收藏失败 (HTTP ${resp.code})"))
-                }
-            }
+            }.fold(
+                onSuccess = { Result.success(true) },
+                onFailure = { Result.failure(Exception("保存收藏失败 (${it.message})")) }
+            )
         } catch (e: Exception) {
             if (e is kotlinx.coroutines.CancellationException) throw e
             Log.w(TAG, "toggleFavoriteSongOnServer failed", e)
@@ -5468,9 +5675,11 @@ class LemonMusicProtocol(
                     Exception("读取服务器收藏失败，已取消本次修改以免覆盖服务器数据：${it.message}")
                 )
             }
-            val favArr = userData.optJSONArray("favorites") ?: JSONArray()
-            val keptItems = ArrayList<Any>()
             val serverKey = "local:$cleanPath"
+            // 2026-11-25：带 baseRevision 保存；读取后别的设备改过（409）就按服务器最新收藏重算一次
+            putUserDataWithRevision(userData) { current ->
+            val favArr = current.optJSONArray("favorites") ?: JSONArray()
+            val keptItems = ArrayList<Any>()
 
             for (i in 0 until favArr.length()) {
                 val item = favArr.opt(i) ?: continue
@@ -5504,18 +5713,13 @@ class LemonMusicProtocol(
             val newFavArr = JSONArray()
             keptItems.forEach { newFavArr.put(it) }
 
-            val payload = JSONObject().apply {
+            JSONObject().apply {
                 put("favorites", newFavArr)
             }
-            val body = payload.toString().toRequestBody(JSON_MEDIA_TYPE)
-            val req = newAuthRequest("$cleanBase/api/library/user-data").put(body).build()
-            client.newCall(req).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    Result.success(true)
-                } else {
-                    Result.failure(Exception("保存收藏失败 (HTTP ${resp.code})"))
-                }
-            }
+            }.fold(
+                onSuccess = { Result.success(true) },
+                onFailure = { Result.failure(Exception("保存收藏失败 (${it.message})")) }
+            )
         } catch (e: Exception) {
             if (e is kotlinx.coroutines.CancellationException) throw e
             Log.w(TAG, "toggleFavoriteOnServer failed", e)
